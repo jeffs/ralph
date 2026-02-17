@@ -91,7 +91,7 @@ pub async fn run_loop(
         let stagnant: Vec<&str> = tasks
             .iter()
             .filter(|t| {
-                state.tasks.get(&t.id).map_or(false, |e| {
+                state.tasks.get(&t.id).is_some_and(|e| {
                     e.attempts >= config.max_attempts
                         && e.phase != Phase::Done
                 })

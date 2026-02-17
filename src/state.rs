@@ -74,7 +74,7 @@ impl ExecutionState {
         task_ids.iter().all(|id| {
             self.tasks
                 .get(id)
-                .map_or(false, |e| e.phase == Phase::Done)
+                .is_some_and(|e| e.phase == Phase::Done)
         })
     }
 }
