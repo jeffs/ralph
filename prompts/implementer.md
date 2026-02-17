@@ -19,7 +19,7 @@ and make the minimal code changes to complete it.
 4. If the project has an obvious test command (go test,
    cargo test, npm test, etc.), run it to validate your
    changes compile and don't break existing tests.
-5. Do not commit. Ralph handles commits.
+5. Do not commit (no `jj commit` or `jj new`). Ralph handles commits.
 
 ## Output Contract
 

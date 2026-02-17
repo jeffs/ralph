@@ -264,34 +264,20 @@ fn parse_agent_status(text: &str) -> AgentStatus {
     }
 }
 
-/// Get all dirty files: tracked files that differ from HEAD
-/// plus untracked (new) files. This is the complete picture
-/// of what has changed in the working tree.
-pub async fn git_changed_files() -> Result<Vec<PathBuf>> {
-    // Modified/deleted tracked files
-    let diff = TokioCommand::new("git")
-        .args(["diff", "--name-only", "HEAD"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await?;
-    // New untracked files (respects .gitignore)
-    let untracked = TokioCommand::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
+/// Get all files changed in the working-copy commit relative
+/// to its parent. Covers modifications, additions, and
+/// deletions in a single `jj diff --summary` call.
+pub async fn jj_changed_files() -> Result<Vec<PathBuf>> {
+    let output = TokioCommand::new("jj")
+        .args(["diff", "--summary"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
         .await?;
 
-    let mut files: Vec<PathBuf> = [&diff.stdout, &untracked.stdout]
-        .into_iter()
-        .flat_map(|out| {
-            String::from_utf8_lossy(out)
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(PathBuf::from)
-                .collect::<Vec<_>>()
-        })
+    let mut files: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(_, path)| PathBuf::from(path.trim())))
         .collect();
     files.sort();
     files.dedup();

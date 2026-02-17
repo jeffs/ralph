@@ -13,7 +13,7 @@ project conventions.
 ## Instructions
 
 1. Read the task description carefully.
-2. Review the changes made (use `git diff` to see them).
+2. Review the changes made (use `jj diff --git` to see them).
 3. Check:
    - Does the implementation match the requirements?
    - Are there correctness issues, edge cases, or bugs?

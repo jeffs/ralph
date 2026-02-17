@@ -28,7 +28,7 @@ fn reset_or_fail(exec: &mut TaskExecution, config: &Config) {
 /// (max attempts exceeded), or iteration cap.
 pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config) -> Result<()> {
     let state_path = PathBuf::from(STATE_PATH);
-    warn_dirty_tree().await;
+    isolate_dirty_tree().await;
 
     for iteration in 1..=max_iterations {
         eprintln!("\n[ralph] === iteration {iteration} ===");
@@ -126,7 +126,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
         for group in groups {
             // Snapshot working tree before the group runs
-            let pre_files = agent::git_changed_files().await.unwrap_or_default();
+            let pre_files = agent::jj_changed_files().await.unwrap_or_default();
             let group_ids: Vec<String> = group.iter().map(|t| t.id.clone()).collect();
 
             // Fan out: parallel implementers
@@ -181,7 +181,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             // Snapshot after group completes — attribute
             // the new files to all tasks in the group.
             if any_success {
-                let post_files = agent::git_changed_files().await.unwrap_or_default();
+                let post_files = agent::jj_changed_files().await.unwrap_or_default();
                 let new_files: Vec<PathBuf> = post_files
                     .into_iter()
                     .filter(|f| !pre_files.contains(f))
@@ -200,14 +200,13 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             resume_inflight(&tasks, &mut state, config).await?;
             state.save(&state_path).await?;
 
-            // Commit only files we know agents changed
-            let all_changed: Vec<PathBuf> = state
-                .tasks
-                .values()
-                .flat_map(|e| e.files_changed.iter().cloned())
-                .collect();
-            if let Err(e) = git_commit_files(&all_changed).await {
-                eprintln!("[ralph] git commit skipped: {e}");
+            // Checkpoint: seal the current working-copy change
+            // and start a fresh one for the next group.
+            let has_changes = state.tasks.values().any(|e| !e.files_changed.is_empty());
+            if has_changes {
+                if let Err(e) = jj_checkpoint().await {
+                    eprintln!("[ralph] jj commit skipped: {e}");
+                }
             }
         }
     }
@@ -322,42 +321,34 @@ async fn resume_inflight(
     Ok(progressed)
 }
 
-/// Stage only the given files and commit. Does nothing
-/// if the file list is empty.
-async fn git_commit_files(files: &[PathBuf]) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-
-    let paths: Vec<&str> = files.iter().filter_map(|p| p.to_str()).collect();
-    if paths.is_empty() {
-        return Ok(());
-    }
-
-    let mut cmd = TokioCommand::new("git");
-    cmd.arg("add").arg("--").args(&paths);
-    cmd.status().await.context("git add")?;
-
-    TokioCommand::new("git")
+/// Seal the current working-copy change and start a fresh
+/// one. All modifications agents made are captured
+/// automatically — no selective staging needed.
+async fn jj_checkpoint() -> Result<()> {
+    TokioCommand::new("jj")
         .args(["commit", "-m", "ralph: checkpoint progress"])
         .status()
         .await
-        .context("git commit")?;
-
+        .context("jj commit")?;
     Ok(())
 }
 
-/// Warn if the working tree has pre-existing dirty files
-/// that ralph didn't create. Called once before the loop.
-async fn warn_dirty_tree() {
-    if let Ok(files) = agent::git_changed_files().await
+/// If the working copy has pre-existing changes, isolate
+/// them by creating a new empty change on top. This keeps
+/// ralph's work separate without disturbing the user's
+/// in-progress modifications.
+async fn isolate_dirty_tree() {
+    if let Ok(files) = agent::jj_changed_files().await
         && !files.is_empty()
     {
         eprintln!(
-            "[ralph] warning: {} pre-existing dirty \
-             file(s) in working tree — ralph will not \
-             touch them",
+            "[ralph] {} pre-existing dirty file(s) — \
+             isolating with `jj new`",
             files.len()
         );
+        let _ = TokioCommand::new("jj")
+            .arg("new")
+            .status()
+            .await;
     }
 }
