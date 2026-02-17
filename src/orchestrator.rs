@@ -4,9 +4,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use tokio::process::Command as TokioCommand;
 
-use crate::agent::{
-    self, AgentContext, AgentRole, AgentStatus,
-};
+use crate::agent::{self, AgentContext, AgentRole, AgentStatus};
 use crate::config::Config;
 use crate::scheduler;
 use crate::state::{ExecutionState, Phase};
@@ -17,36 +15,27 @@ const STATE_PATH: &str = ".ralph/state.json";
 /// Main orchestration loop. Iterates until convergence
 /// (all tasks done + reviewer approves), stagnation
 /// (max attempts exceeded), or iteration cap.
-pub async fn run_loop(
-    tasks_path: &Path,
-    max_iterations: usize,
-    config: &Config,
-) -> Result<()> {
+pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config) -> Result<()> {
     let state_path = PathBuf::from(STATE_PATH);
 
     for iteration in 1..=max_iterations {
         eprintln!("\n[ralph] === iteration {iteration} ===");
 
         let tasks = task::load_tasks(tasks_path).await?;
-        let mut state =
-            ExecutionState::load(&state_path).await?;
-        let task_ids: Vec<String> =
-            tasks.iter().map(|t| t.id.clone()).collect();
+        let mut state = ExecutionState::load(&state_path).await?;
+        let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
 
         // Check convergence: all done → final review
         if state.all_done(&task_ids) {
-            eprintln!(
-                "[ralph] all tasks done, final review..."
-            );
+            eprintln!("[ralph] all tasks done, final review...");
             let review = agent::invoke_agent(
                 AgentRole::Reviewer,
                 &AgentContext::Review {
                     task_id: "final".to_string(),
                     task_title: "Final review".to_string(),
-                    task_description:
-                        "Review the full project for \
+                    task_description: "Review the full project for \
                          correctness."
-                            .to_string(),
+                        .to_string(),
                 },
                 config,
             )
@@ -60,8 +49,7 @@ pub async fn run_loop(
                     );
                     return Ok(());
                 }
-                AgentStatus::Failure { reason }
-                | AgentStatus::NeedsRetry { reason } => {
+                AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
                     eprintln!(
                         "[ralph] reviewer found issues: \
                          {reason}"
@@ -77,9 +65,7 @@ pub async fn run_loop(
 
         // Resume interrupted in-flight tasks before
         // scheduling new work.
-        let made_progress =
-            resume_inflight(&tasks, &mut state, config)
-                .await?;
+        let made_progress = resume_inflight(&tasks, &mut state, config).await?;
         if made_progress {
             state.save(&state_path).await?;
             // Re-evaluate from the top — deps may have
@@ -91,10 +77,10 @@ pub async fn run_loop(
         let stagnant: Vec<&str> = tasks
             .iter()
             .filter(|t| {
-                state.tasks.get(&t.id).is_some_and(|e| {
-                    e.attempts >= config.max_attempts
-                        && e.phase != Phase::Done
-                })
+                state
+                    .tasks
+                    .get(&t.id)
+                    .is_some_and(|e| e.attempts >= config.max_attempts && e.phase != Phase::Done)
             })
             .map(|t| t.id.as_str())
             .collect();
@@ -107,8 +93,7 @@ pub async fn run_loop(
         }
 
         // Find ready tasks (Pending phase only)
-        let ready =
-            scheduler::ready_tasks(&tasks, &state, config);
+        let ready = scheduler::ready_tasks(&tasks, &state, config);
         if ready.is_empty() {
             if stagnant.is_empty() {
                 eprintln!(
@@ -124,8 +109,7 @@ pub async fn run_loop(
         eprintln!("[ralph] {} task(s) ready", ready.len());
 
         // Partition into parallelizable groups
-        let groups =
-            scheduler::partition_independent(&ready, &state);
+        let groups = scheduler::partition_independent(&ready, &state);
 
         for group in groups {
             // Fan out: parallel implementers
@@ -137,15 +121,8 @@ pub async fn run_loop(
                     let desc = t.description.clone();
                     let cfg = config.clone();
                     tokio::spawn(async move {
-                        let ctx = AgentContext::implement(
-                            &id, &title, &desc,
-                        );
-                        let result = agent::invoke_agent(
-                            AgentRole::Implementer,
-                            &ctx,
-                            &cfg,
-                        )
-                        .await;
+                        let ctx = AgentContext::implement(&id, &title, &desc);
+                        let result = agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg).await;
                         (id, result)
                     })
                 })
@@ -158,9 +135,7 @@ pub async fn run_loop(
                 exec.attempts += 1;
                 match result {
                     Ok(r) => {
-                        exec.files_changed.extend(
-                            r.files_changed.iter().cloned(),
-                        );
+                        exec.files_changed.extend(r.files_changed.iter().cloned());
                         exec.files_changed.sort();
                         exec.files_changed.dedup();
                         match &r.status {
@@ -169,12 +144,9 @@ pub async fn run_loop(
                                 exec.last_error = None;
                             }
                             AgentStatus::Failure { reason }
-                            | AgentStatus::NeedsRetry {
-                                reason,
-                            } => {
+                            | AgentStatus::NeedsRetry { reason } => {
                                 exec.phase = Phase::Pending;
-                                exec.last_error =
-                                    Some(reason.clone());
+                                exec.last_error = Some(reason.clone());
                                 eprintln!(
                                     "[ralph] {id} implement \
                                      failed: {reason}"
@@ -183,8 +155,7 @@ pub async fn run_loop(
                         }
                     }
                     Err(e) => {
-                        exec.last_error =
-                            Some(e.to_string());
+                        exec.last_error = Some(e.to_string());
                         eprintln!(
                             "[ralph] agent error for \
                              {id}: {e}"
@@ -196,15 +167,12 @@ pub async fn run_loop(
             state.save(&state_path).await?;
 
             // Advance any tasks now at Testing/Reviewing
-            resume_inflight(&tasks, &mut state, config)
-                .await?;
+            resume_inflight(&tasks, &mut state, config).await?;
             state.save(&state_path).await?;
 
             // Commit progress if working tree is dirty
             if let Err(e) = git_commit_progress().await {
-                eprintln!(
-                    "[ralph] git commit skipped: {e}"
-                );
+                eprintln!("[ralph] git commit skipped: {e}");
             }
         }
     }
@@ -239,13 +207,7 @@ async fn resume_inflight(
             .unwrap_or_default();
 
         let ctx = AgentContext::test(id, files);
-        match agent::invoke_agent(
-            AgentRole::Tester,
-            &ctx,
-            config,
-        )
-        .await
-        {
+        match agent::invoke_agent(AgentRole::Tester, &ctx, config).await {
             Ok(r) => {
                 let exec = state.entry(id);
                 match r.status {
@@ -254,11 +216,9 @@ async fn resume_inflight(
                         exec.last_error = None;
                         progressed = true;
                     }
-                    AgentStatus::Failure { reason }
-                    | AgentStatus::NeedsRetry { reason } => {
+                    AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
                         exec.phase = Phase::Pending;
-                        exec.last_error =
-                            Some(reason.clone());
+                        exec.last_error = Some(reason.clone());
                         progressed = true;
                         eprintln!(
                             "[ralph] {id} tests failed: \
@@ -272,9 +232,7 @@ async fn resume_inflight(
                 exec.phase = Phase::Pending;
                 exec.last_error = Some(e.to_string());
                 progressed = true;
-                eprintln!(
-                    "[ralph] tester error for {id}: {e}"
-                );
+                eprintln!("[ralph] tester error for {id}: {e}");
             }
         }
     }
@@ -295,13 +253,7 @@ async fn resume_inflight(
             .unwrap_or(("unknown", ""));
 
         let ctx = AgentContext::review(id, title, desc);
-        match agent::invoke_agent(
-            AgentRole::Reviewer,
-            &ctx,
-            config,
-        )
-        .await
-        {
+        match agent::invoke_agent(AgentRole::Reviewer, &ctx, config).await {
             Ok(r) => {
                 let exec = state.entry(id);
                 match r.status {
@@ -309,15 +261,11 @@ async fn resume_inflight(
                         exec.phase = Phase::Done;
                         exec.last_error = None;
                         progressed = true;
-                        eprintln!(
-                            "[ralph] {id} — done!"
-                        );
+                        eprintln!("[ralph] {id} — done!");
                     }
-                    AgentStatus::Failure { reason }
-                    | AgentStatus::NeedsRetry { reason } => {
+                    AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
                         exec.phase = Phase::Pending;
-                        exec.last_error =
-                            Some(reason.clone());
+                        exec.last_error = Some(reason.clone());
                         progressed = true;
                         eprintln!(
                             "[ralph] {id} review issues: \
@@ -327,9 +275,7 @@ async fn resume_inflight(
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "[ralph] reviewer error for {id}: {e}"
-                );
+                eprintln!("[ralph] reviewer error for {id}: {e}");
             }
         }
     }
@@ -356,10 +302,7 @@ async fn git_commit_progress() -> Result<()> {
         .context("git add")?;
 
     TokioCommand::new("git")
-        .args([
-            "commit", "-m",
-            "ralph: checkpoint progress",
-        ])
+        .args(["commit", "-m", "ralph: checkpoint progress"])
         .status()
         .await
         .context("git commit")?;

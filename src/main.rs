@@ -83,11 +83,7 @@ async fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_plan(
-    description: Option<String>,
-    spec: Option<PathBuf>,
-    stdin: bool,
-) -> Result<()> {
+async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: bool) -> Result<()> {
     let input = if stdin {
         use tokio::io::AsyncReadExt;
         let mut buf = String::new();
@@ -98,9 +94,7 @@ async fn cmd_plan(
     } else if let Some(desc) = description {
         desc
     } else {
-        anyhow::bail!(
-            "Provide a description, --spec <file>, or --stdin"
-        );
+        anyhow::bail!("Provide a description, --spec <file>, or --stdin");
     };
 
     let config = config::Config::load().await?;
@@ -119,9 +113,10 @@ async fn cmd_plan(
     // file access. But we also extract any JSONL from the
     // result as a fallback.
     if !tasks_path.exists()
-        && let Some(jsonl) = result.extract_jsonl() {
-            tokio::fs::write(&tasks_path, jsonl).await?;
-        }
+        && let Some(jsonl) = result.extract_jsonl()
+    {
+        tokio::fs::write(&tasks_path, jsonl).await?;
+    }
 
     // Validate the output
     let tasks = task::load_tasks(&tasks_path).await?;
@@ -132,12 +127,8 @@ async fn cmd_plan(
     Ok(())
 }
 
-async fn cmd_run(
-    tasks_path: Option<PathBuf>,
-    max_iterations: usize,
-) -> Result<()> {
-    let tasks_path =
-        tasks_path.unwrap_or_else(|| PathBuf::from(".ralph/tasks.jsonl"));
+async fn cmd_run(tasks_path: Option<PathBuf>, max_iterations: usize) -> Result<()> {
+    let tasks_path = tasks_path.unwrap_or_else(|| PathBuf::from(".ralph/tasks.jsonl"));
     let config = config::Config::load().await?;
     orchestrator::run_loop(&tasks_path, max_iterations, &config).await
 }

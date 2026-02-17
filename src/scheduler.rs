@@ -22,8 +22,7 @@ pub fn ready_tasks<'a>(
         .iter()
         .filter(|t| {
             let exec = state.tasks.get(&t.id);
-            let phase =
-                exec.map_or(Phase::Pending, |e| e.phase);
+            let phase = exec.map_or(Phase::Pending, |e| e.phase);
             let attempts = exec.map_or(0, |e| e.attempts);
 
             // Must be pending (not in-progress, done, or failed)
@@ -50,10 +49,7 @@ pub fn ready_tasks<'a>(
 /// overlap must be serialized. Tasks with no file history
 /// (first attempt) are placed in their own singleton group
 /// to establish their footprint.
-pub fn partition_independent<'a>(
-    ready: &[&'a Task],
-    state: &ExecutionState,
-) -> Vec<Vec<&'a Task>> {
+pub fn partition_independent<'a>(ready: &[&'a Task], state: &ExecutionState) -> Vec<Vec<&'a Task>> {
     let mut groups: Vec<Vec<&'a Task>> = Vec::new();
 
     for &task in ready {
@@ -108,20 +104,13 @@ mod tests {
     use super::*;
     use crate::state::TaskExecution;
 
-    fn task(
-        id: &str,
-        priority: u32,
-        blocked_by: Vec<&str>,
-    ) -> Task {
+    fn task(id: &str, priority: u32, blocked_by: Vec<&str>) -> Task {
         Task {
             id: id.to_string(),
             title: format!("Task {}", id),
             description: String::new(),
             priority,
-            blocked_by: blocked_by
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            blocked_by: blocked_by.into_iter().map(String::from).collect(),
         }
     }
 
@@ -134,10 +123,7 @@ mod tests {
 
     #[test]
     fn ready_excludes_blocked() {
-        let tasks = vec![
-            task("A", 1, vec![]),
-            task("B", 2, vec!["A"]),
-        ];
+        let tasks = vec![task("A", 1, vec![]), task("B", 2, vec!["A"])];
         let state = ExecutionState::default();
         let ready = ready_tasks(&tasks, &state, &default_config());
         assert_eq!(ready.len(), 1);
@@ -146,10 +132,7 @@ mod tests {
 
     #[test]
     fn ready_includes_unblocked_after_dep_done() {
-        let tasks = vec![
-            task("A", 1, vec![]),
-            task("B", 2, vec!["A"]),
-        ];
+        let tasks = vec![task("A", 1, vec![]), task("B", 2, vec!["A"])];
         let mut state = ExecutionState::default();
         state.entry("A").phase = Phase::Done;
         let ready = ready_tasks(&tasks, &state, &default_config());
@@ -184,8 +167,7 @@ mod tests {
         ];
         let state = ExecutionState::default();
         let ready = ready_tasks(&tasks, &state, &default_config());
-        let ids: Vec<&str> =
-            ready.iter().map(|t| t.id.as_str()).collect();
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["A", "C", "B"]);
     }
 

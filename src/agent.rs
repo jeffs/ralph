@@ -66,11 +66,7 @@ impl AgentContext {
         }
     }
 
-    pub fn implement(
-        id: &str,
-        title: &str,
-        description: &str,
-    ) -> Self {
+    pub fn implement(id: &str, title: &str, description: &str) -> Self {
         Self::Implement {
             task_id: id.to_string(),
             task_title: title.to_string(),
@@ -96,8 +92,7 @@ impl AgentContext {
     /// Render the context variables into the prompt template.
     fn interpolate(&self, template: &str) -> String {
         match self {
-            Self::Plan { input } => template
-                .replace("{{INPUT}}", input),
+            Self::Plan { input } => template.replace("{{INPUT}}", input),
             Self::Implement {
                 task_id,
                 task_title,
@@ -159,8 +154,7 @@ impl AgentResult {
             .filter(|line| {
                 let trimmed = line.trim();
                 trimmed.starts_with('{')
-                    && serde_json::from_str::<serde_json::Value>(trimmed)
-                        .is_ok()
+                    && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
             })
             .collect();
         if lines.is_empty() {
@@ -187,16 +181,10 @@ pub async fn invoke_agent(
     let pre_diff = git_changed_files().await.unwrap_or_default();
 
     // Load and interpolate prompt
-    let prompt_path =
-        config.prompts_dir.join(role.prompt_filename());
+    let prompt_path = config.prompts_dir.join(role.prompt_filename());
     let template = tokio::fs::read_to_string(&prompt_path)
         .await
-        .with_context(|| {
-            format!(
-                "reading prompt template: {}",
-                prompt_path.display()
-            )
-        })?;
+        .with_context(|| format!("reading prompt template: {}", prompt_path.display()))?;
     let prompt = context.interpolate(&template);
 
     eprintln!("[ralph] invoking {} agent...", role.label());
@@ -230,10 +218,7 @@ pub async fn invoke_agent(
         return Ok(AgentResult {
             text: String::new(),
             status: AgentStatus::Failure {
-                reason: format!(
-                    "claude exited with {}",
-                    output.status
-                ),
+                reason: format!("claude exited with {}", output.status),
             },
             files_changed: Vec::new(),
         });
@@ -242,8 +227,7 @@ pub async fn invoke_agent(
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Parse the JSON envelope
-    let text = match serde_json::from_str::<ClaudeJsonOutput>(&stdout)
-    {
+    let text = match serde_json::from_str::<ClaudeJsonOutput>(&stdout) {
         Ok(parsed) => parsed.result.unwrap_or_default(),
         Err(_) => {
             // Fall back to raw stdout if JSON parsing fails
@@ -280,15 +264,11 @@ fn parse_agent_status(text: &str) -> AgentStatus {
             let rest = rest.trim();
             if rest.starts_with("SUCCESS") {
                 return AgentStatus::Success;
-            } else if let Some(reason) =
-                rest.strip_prefix("FAILURE:")
-            {
+            } else if let Some(reason) = rest.strip_prefix("FAILURE:") {
                 return AgentStatus::Failure {
                     reason: reason.trim().to_string(),
                 };
-            } else if let Some(reason) =
-                rest.strip_prefix("NEEDS_RETRY:")
-            {
+            } else if let Some(reason) = rest.strip_prefix("NEEDS_RETRY:") {
                 return AgentStatus::NeedsRetry {
                     reason: reason.trim().to_string(),
                 };
@@ -380,9 +360,7 @@ Done!"#
     #[test]
     fn interpolate_implement() {
         let ctx = AgentContext::implement("T1", "Fix bug", "desc");
-        let result = ctx.interpolate(
-            "Task {{TASK_ID}}: {{TASK_TITLE}} — {{TASK_DESCRIPTION}}",
-        );
+        let result = ctx.interpolate("Task {{TASK_ID}}: {{TASK_TITLE}} — {{TASK_DESCRIPTION}}");
         assert_eq!(result, "Task T1: Fix bug — desc");
     }
 }

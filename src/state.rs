@@ -64,18 +64,14 @@ impl ExecutionState {
 
     /// Get or insert default execution entry for a task.
     pub fn entry(&mut self, task_id: &str) -> &mut TaskExecution {
-        self.tasks
-            .entry(task_id.to_string())
-            .or_default()
+        self.tasks.entry(task_id.to_string()).or_default()
     }
 
     /// True when every task_id has reached Done.
     pub fn all_done(&self, task_ids: &[String]) -> bool {
-        task_ids.iter().all(|id| {
-            self.tasks
-                .get(id)
-                .is_some_and(|e| e.phase == Phase::Done)
-        })
+        task_ids
+            .iter()
+            .all(|id| self.tasks.get(id).is_some_and(|e| e.phase == Phase::Done))
     }
 }
 
@@ -121,14 +117,11 @@ mod tests {
         let mut state = ExecutionState::default();
         state.entry("T1").phase = Phase::Done;
         state.entry("T1").attempts = 2;
-        state.entry("T1").files_changed =
-            vec![PathBuf::from("src/main.rs")];
-        state.entry("T2").last_error =
-            Some("compile error".into());
+        state.entry("T1").files_changed = vec![PathBuf::from("src/main.rs")];
+        state.entry("T2").last_error = Some("compile error".into());
 
         let json = serde_json::to_string(&state).unwrap();
-        let loaded: ExecutionState =
-            serde_json::from_str(&json).unwrap();
+        let loaded: ExecutionState = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.tasks["T1"].phase, Phase::Done);
         assert_eq!(loaded.tasks["T1"].attempts, 2);
         assert_eq!(
