@@ -27,8 +27,8 @@ fn default_max_attempts() -> u32 {
 fn default_prompts_dir() -> PathBuf {
     // Resolve relative to the ralph binary's location,
     // falling back to a compile-time default.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             let candidate = dir.join("prompts");
             if candidate.is_dir() {
                 return candidate;
@@ -44,7 +44,6 @@ fn default_prompts_dir() -> PathBuf {
                 return p;
             }
         }
-    }
     PathBuf::from("prompts")
 }
 

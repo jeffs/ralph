@@ -118,11 +118,10 @@ async fn cmd_plan(
     // The planner writes tasks.jsonl directly via claude's
     // file access. But we also extract any JSONL from the
     // result as a fallback.
-    if !tasks_path.exists() {
-        if let Some(jsonl) = result.extract_jsonl() {
+    if !tasks_path.exists()
+        && let Some(jsonl) = result.extract_jsonl() {
             tokio::fs::write(&tasks_path, jsonl).await?;
         }
-    }
 
     // Validate the output
     let tasks = task::load_tasks(&tasks_path).await?;
