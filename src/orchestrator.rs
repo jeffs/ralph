@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use tokio::process::Command as TokioCommand;
@@ -10,18 +9,32 @@ use crate::scheduler;
 use crate::state::{ExecutionState, Phase};
 use crate::task::{self, Task};
 
+use crate::state::TaskExecution;
+
 const STATE_PATH: &str = ".ralph/state.json";
+
+/// Set a task back to Pending, or to Failed if it has
+/// exhausted its attempt budget.
+fn reset_or_fail(exec: &mut TaskExecution, config: &Config) {
+    if exec.attempts >= config.max_attempts {
+        exec.phase = Phase::Failed;
+    } else {
+        exec.phase = Phase::Pending;
+    }
+}
 
 /// Main orchestration loop. Iterates until convergence
 /// (all tasks done + reviewer approves), stagnation
 /// (max attempts exceeded), or iteration cap.
 pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config) -> Result<()> {
     let state_path = PathBuf::from(STATE_PATH);
+    warn_dirty_tree().await;
 
     for iteration in 1..=max_iterations {
         eprintln!("\n[ralph] === iteration {iteration} ===");
 
         let tasks = task::load_tasks(tasks_path).await?;
+        task::validate_deps(&tasks)?;
         let mut state = ExecutionState::load(&state_path).await?;
         let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
 
@@ -80,7 +93,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                 state
                     .tasks
                     .get(&t.id)
-                    .is_some_and(|e| e.attempts >= config.max_attempts && e.phase != Phase::Done)
+                    .is_some_and(|e| e.phase == Phase::Failed)
             })
             .map(|t| t.id.as_str())
             .collect();
@@ -112,6 +125,10 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         let groups = scheduler::partition_independent(&ready, &state);
 
         for group in groups {
+            // Snapshot working tree before the group runs
+            let pre_files = agent::git_changed_files().await.unwrap_or_default();
+            let group_ids: Vec<String> = group.iter().map(|t| t.id.clone()).collect();
+
             // Fan out: parallel implementers
             let implement_handles: Vec<_> = group
                 .iter()
@@ -129,32 +146,29 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                 .collect();
 
             // Collect results
+            let mut any_success = false;
             for handle in implement_handles {
                 let (id, result) = handle.await?;
                 let exec = state.entry(&id);
                 exec.attempts += 1;
                 match result {
-                    Ok(r) => {
-                        exec.files_changed.extend(r.files_changed.iter().cloned());
-                        exec.files_changed.sort();
-                        exec.files_changed.dedup();
-                        match &r.status {
-                            AgentStatus::Success => {
-                                exec.phase = Phase::Testing;
-                                exec.last_error = None;
-                            }
-                            AgentStatus::Failure { reason }
-                            | AgentStatus::NeedsRetry { reason } => {
-                                exec.phase = Phase::Pending;
-                                exec.last_error = Some(reason.clone());
-                                eprintln!(
-                                    "[ralph] {id} implement \
-                                     failed: {reason}"
-                                );
-                            }
+                    Ok(r) => match &r.status {
+                        AgentStatus::Success => {
+                            exec.phase = Phase::Testing;
+                            exec.last_error = None;
+                            any_success = true;
                         }
-                    }
+                        AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                            reset_or_fail(exec, config);
+                            exec.last_error = Some(reason.clone());
+                            eprintln!(
+                                "[ralph] {id} implement \
+                                 failed: {reason}"
+                            );
+                        }
+                    },
                     Err(e) => {
+                        reset_or_fail(exec, config);
                         exec.last_error = Some(e.to_string());
                         eprintln!(
                             "[ralph] agent error for \
@@ -164,14 +178,35 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                 }
             }
 
+            // Snapshot after group completes — attribute
+            // the new files to all tasks in the group.
+            if any_success {
+                let post_files = agent::git_changed_files().await.unwrap_or_default();
+                let new_files: Vec<PathBuf> = post_files
+                    .into_iter()
+                    .filter(|f| !pre_files.contains(f))
+                    .collect();
+                for id in &group_ids {
+                    let exec = state.entry(id);
+                    exec.files_changed.extend(new_files.iter().cloned());
+                    exec.files_changed.sort();
+                    exec.files_changed.dedup();
+                }
+            }
+
             state.save(&state_path).await?;
 
             // Advance any tasks now at Testing/Reviewing
             resume_inflight(&tasks, &mut state, config).await?;
             state.save(&state_path).await?;
 
-            // Commit progress if working tree is dirty
-            if let Err(e) = git_commit_progress().await {
+            // Commit only files we know agents changed
+            let all_changed: Vec<PathBuf> = state
+                .tasks
+                .values()
+                .flat_map(|e| e.files_changed.iter().cloned())
+                .collect();
+            if let Err(e) = git_commit_files(&all_changed).await {
                 eprintln!("[ralph] git commit skipped: {e}");
             }
         }
@@ -217,7 +252,7 @@ async fn resume_inflight(
                         progressed = true;
                     }
                     AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                        exec.phase = Phase::Pending;
+                        reset_or_fail(exec, config);
                         exec.last_error = Some(reason.clone());
                         progressed = true;
                         eprintln!(
@@ -229,7 +264,7 @@ async fn resume_inflight(
             }
             Err(e) => {
                 let exec = state.entry(id);
-                exec.phase = Phase::Pending;
+                reset_or_fail(exec, config);
                 exec.last_error = Some(e.to_string());
                 progressed = true;
                 eprintln!("[ralph] tester error for {id}: {e}");
@@ -264,7 +299,7 @@ async fn resume_inflight(
                         eprintln!("[ralph] {id} — done!");
                     }
                     AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                        exec.phase = Phase::Pending;
+                        reset_or_fail(exec, config);
                         exec.last_error = Some(reason.clone());
                         progressed = true;
                         eprintln!(
@@ -275,6 +310,10 @@ async fn resume_inflight(
                 }
             }
             Err(e) => {
+                let exec = state.entry(id);
+                reset_or_fail(exec, config);
+                exec.last_error = Some(e.to_string());
+                progressed = true;
                 eprintln!("[ralph] reviewer error for {id}: {e}");
             }
         }
@@ -283,23 +322,21 @@ async fn resume_inflight(
     Ok(progressed)
 }
 
-/// Stage and commit any changes made during this iteration.
-async fn git_commit_progress() -> Result<()> {
-    let status = TokioCommand::new("git")
-        .args(["status", "--porcelain"])
-        .stdout(Stdio::piped())
-        .output()
-        .await?;
-    let stdout = String::from_utf8_lossy(&status.stdout);
-    if stdout.trim().is_empty() {
+/// Stage only the given files and commit. Does nothing
+/// if the file list is empty.
+async fn git_commit_files(files: &[PathBuf]) -> Result<()> {
+    if files.is_empty() {
         return Ok(());
     }
 
-    TokioCommand::new("git")
-        .args(["add", "-A"])
-        .status()
-        .await
-        .context("git add")?;
+    let paths: Vec<&str> = files.iter().filter_map(|p| p.to_str()).collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut cmd = TokioCommand::new("git");
+    cmd.arg("add").arg("--").args(&paths);
+    cmd.status().await.context("git add")?;
 
     TokioCommand::new("git")
         .args(["commit", "-m", "ralph: checkpoint progress"])
@@ -308,4 +345,19 @@ async fn git_commit_progress() -> Result<()> {
         .context("git commit")?;
 
     Ok(())
+}
+
+/// Warn if the working tree has pre-existing dirty files
+/// that ralph didn't create. Called once before the loop.
+async fn warn_dirty_tree() {
+    if let Ok(files) = agent::git_changed_files().await
+        && !files.is_empty()
+    {
+        eprintln!(
+            "[ralph] warning: {} pre-existing dirty \
+             file(s) in working tree — ralph will not \
+             touch them",
+            files.len()
+        );
+    }
 }

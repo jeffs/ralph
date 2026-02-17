@@ -120,6 +120,7 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
 
     // Validate the output
     let tasks = task::load_tasks(&tasks_path).await?;
+    task::validate_deps(&tasks)?;
     eprintln!("Planned {} tasks → {}", tasks.len(), tasks_path.display());
     for t in &tasks {
         eprintln!("  [{}] {} (pri={})", t.id, t.title, t.priority);

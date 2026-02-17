@@ -39,6 +39,26 @@ pub fn parse_tasks(contents: &str) -> Result<Vec<Task>> {
         .collect()
 }
 
+/// Validate that every `blocked_by` ID references an
+/// actual task. Returns an error listing the dangling
+/// references, preventing silent deadlocks.
+pub fn validate_deps(tasks: &[Task]) -> Result<()> {
+    let ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    let mut bad = Vec::new();
+    for t in tasks {
+        for dep in &t.blocked_by {
+            if !ids.contains(dep.as_str()) {
+                bad.push(format!("{} blocked_by unknown task {}", t.id, dep));
+            }
+        }
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("dangling dependency references:\n  {}", bad.join("\n  "));
+    }
+}
+
 /// Write tasks to a JSONL file.
 #[allow(dead_code)]
 pub async fn write_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
@@ -108,5 +128,42 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].id, "A");
         assert_eq!(loaded[1].blocked_by, vec!["A"]);
+    }
+
+    #[test]
+    fn validate_deps_ok() {
+        let tasks = vec![
+            Task {
+                id: "A".into(),
+                title: "A".into(),
+                description: String::new(),
+                priority: 1,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "B".into(),
+                title: "B".into(),
+                description: String::new(),
+                priority: 2,
+                blocked_by: vec!["A".into()],
+            },
+        ];
+        assert!(validate_deps(&tasks).is_ok());
+    }
+
+    #[test]
+    fn validate_deps_catches_dangling() {
+        let tasks = vec![Task {
+            id: "A".into(),
+            title: "A".into(),
+            description: String::new(),
+            priority: 1,
+            blocked_by: vec!["NONEXISTENT".into()],
+        }];
+        let err = validate_deps(&tasks).unwrap_err();
+        assert!(
+            err.to_string().contains("NONEXISTENT"),
+            "error should name the bad ref: {err}"
+        );
     }
 }

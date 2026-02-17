@@ -133,8 +133,6 @@ pub struct AgentResult {
     pub text: String,
     /// Self-reported status from the agent's JSON output
     pub status: AgentStatus,
-    /// Files changed according to git diff
-    pub files_changed: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,9 +175,6 @@ pub async fn invoke_agent(
     context: &AgentContext,
     config: &Config,
 ) -> Result<AgentResult> {
-    // Snapshot git state before invocation
-    let pre_diff = git_changed_files().await.unwrap_or_default();
-
     // Load and interpolate prompt
     let prompt_path = config.prompts_dir.join(role.prompt_filename());
     let template = tokio::fs::read_to_string(&prompt_path)
@@ -220,7 +215,6 @@ pub async fn invoke_agent(
             status: AgentStatus::Failure {
                 reason: format!("claude exited with {}", output.status),
             },
-            files_changed: Vec::new(),
         });
     }
 
@@ -235,21 +229,10 @@ pub async fn invoke_agent(
         }
     };
 
-    // Determine files changed by this invocation
-    let post_diff = git_changed_files().await.unwrap_or_default();
-    let files_changed: Vec<PathBuf> = post_diff
-        .into_iter()
-        .filter(|f| !pre_diff.contains(f))
-        .collect();
-
     // Parse agent's self-reported status from the text
     let status = parse_agent_status(&text);
 
-    Ok(AgentResult {
-        text,
-        status,
-        files_changed,
-    })
+    Ok(AgentResult { text, status })
 }
 
 /// Parse the agent's self-reported status. Agents are
@@ -275,24 +258,43 @@ fn parse_agent_status(text: &str) -> AgentStatus {
             }
         }
     }
-    // Default: assume success if no explicit status
-    AgentStatus::Success
+    // No status line found — don't assume success.
+    AgentStatus::NeedsRetry {
+        reason: "no STATUS line in agent output".to_string(),
+    }
 }
 
-/// Get the list of changed files from git.
-async fn git_changed_files() -> Result<Vec<PathBuf>> {
-    let output = TokioCommand::new("git")
+/// Get all dirty files: tracked files that differ from HEAD
+/// plus untracked (new) files. This is the complete picture
+/// of what has changed in the working tree.
+pub async fn git_changed_files() -> Result<Vec<PathBuf>> {
+    // Modified/deleted tracked files
+    let diff = TokioCommand::new("git")
         .args(["diff", "--name-only", "HEAD"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
         .await?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files = stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(PathBuf::from)
+    // New untracked files (respects .gitignore)
+    let untracked = TokioCommand::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await?;
+
+    let mut files: Vec<PathBuf> = [&diff.stdout, &untracked.stdout]
+        .into_iter()
+        .flat_map(|out| {
+            String::from_utf8_lossy(out)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
         .collect();
+    files.sort();
+    files.dedup();
     Ok(files)
 }
 
@@ -329,9 +331,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_status_missing_defaults_success() {
+    fn parse_status_missing_defaults_needs_retry() {
         let text = "Just some output with no status line.";
-        assert_eq!(parse_agent_status(text), AgentStatus::Success);
+        assert!(matches!(
+            parse_agent_status(text),
+            AgentStatus::NeedsRetry { .. }
+        ));
     }
 
     #[test]
@@ -343,7 +348,6 @@ mod tests {
 Done!"#
                 .to_string(),
             status: AgentStatus::Success,
-            files_changed: vec![],
         };
         let jsonl = result.extract_jsonl().unwrap();
         assert!(jsonl.contains("T1"));

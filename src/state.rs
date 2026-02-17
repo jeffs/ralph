@@ -24,7 +24,6 @@ pub struct TaskExecution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Pending,
-    Implementing,
     Testing,
     Reviewing,
     Done,
@@ -97,7 +96,7 @@ mod tests {
     fn all_done_checks_all_ids() {
         let mut state = ExecutionState::default();
         state.entry("T1").phase = Phase::Done;
-        state.entry("T2").phase = Phase::Implementing;
+        state.entry("T2").phase = Phase::Testing;
 
         let ids = vec!["T1".into(), "T2".into()];
         assert!(!state.all_done(&ids));
