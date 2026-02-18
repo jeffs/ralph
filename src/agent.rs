@@ -241,32 +241,107 @@ pub async fn invoke_agent(
     Ok(AgentResult { text, status })
 }
 
+/// Maximum length for captured reason text.
+const REASON_MAX_LEN: usize = 2000;
+
 /// Parse the agent's self-reported status. Agents are
 /// instructed to include a status line like:
 ///   STATUS: SUCCESS
 ///   STATUS: FAILURE: reason
 ///   STATUS: NEEDS_RETRY: reason
+///
+/// When the reason after FAILURE:/NEEDS_RETRY: is empty,
+/// subsequent non-empty lines are captured as the reason.
 fn parse_agent_status(text: &str) -> AgentStatus {
-    for line in text.lines().rev() {
+    let lines: Vec<&str> = text.lines().collect();
+
+    // Scan from the end to find the last STATUS line.
+    for (idx, line) in lines.iter().enumerate().rev() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("STATUS:") {
-            let rest = rest.trim();
-            if rest.starts_with("SUCCESS") {
-                return AgentStatus::Success;
-            } else if let Some(reason) = rest.strip_prefix("FAILURE:") {
-                return AgentStatus::Failure {
-                    reason: reason.trim().to_string(),
-                };
-            } else if let Some(reason) = rest.strip_prefix("NEEDS_RETRY:") {
-                return AgentStatus::NeedsRetry {
-                    reason: reason.trim().to_string(),
-                };
-            }
+        let Some(rest) = trimmed.strip_prefix("STATUS:") else {
+            continue;
+        };
+        let rest = rest.trim();
+
+        if rest.starts_with("SUCCESS") {
+            return AgentStatus::Success;
         }
+
+        // Try to match FAILURE: or NEEDS_RETRY: and collect the reason.
+        let (prefix, make_status): (&str, fn(String) -> AgentStatus) =
+            if let Some(r) = rest.strip_prefix("FAILURE:") {
+                (r, |reason| AgentStatus::Failure { reason })
+            } else if let Some(r) = rest.strip_prefix("NEEDS_RETRY:") {
+                (r, |reason| AgentStatus::NeedsRetry { reason })
+            } else {
+                continue;
+            };
+
+        let reason = collect_reason(prefix, &lines[idx + 1..]);
+        return make_status(reason);
     }
+
     // No status line found — don't assume success.
     AgentStatus::NeedsRetry {
         reason: "no STATUS line in agent output".to_string(),
+    }
+}
+
+/// Build a reason string from the inline text after the status prefix
+/// and, if that's empty, from subsequent non-empty lines.
+fn collect_reason(inline: &str, trailing_lines: &[&str]) -> String {
+    let inline = inline.trim();
+
+    if !inline.is_empty() {
+        // Inline reason present — append any trailing lines too.
+        let mut reason = inline.to_string();
+        for line in trailing_lines {
+            let t = line.trim();
+            if t.is_empty() {
+                break;
+            }
+            reason.push('\n');
+            reason.push_str(t);
+            if reason.len() >= REASON_MAX_LEN {
+                break;
+            }
+        }
+        truncate_reason(reason)
+    } else {
+        // No inline reason — gather trailing lines.
+        let mut parts: Vec<&str> = Vec::new();
+        let mut len = 0;
+        for line in trailing_lines {
+            let t = line.trim();
+            if t.is_empty() {
+                break;
+            }
+            parts.push(t);
+            len += t.len() + 1; // +1 for newline
+            if len >= REASON_MAX_LEN {
+                break;
+            }
+        }
+        if parts.is_empty() {
+            "no reason provided".to_string()
+        } else {
+            truncate_reason(parts.join("\n"))
+        }
+    }
+}
+
+fn truncate_reason(s: String) -> String {
+    if s.len() <= REASON_MAX_LEN {
+        s
+    } else {
+        // Truncate at a char boundary.
+        let mut end = REASON_MAX_LEN;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut truncated = s[..end].to_string();
+        truncated.push_str("...");
+        truncated
     }
 }
 
@@ -275,7 +350,10 @@ fn parse_agent_status(text: &str) -> AgentStatus {
 fn parse_diff_summary(output: &str) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = output
         .lines()
-        .filter_map(|l| l.split_once(' ').map(|(_, path)| PathBuf::from(path.trim())))
+        .filter_map(|l| {
+            l.split_once(' ')
+                .map(|(_, path)| PathBuf::from(path.trim()))
+        })
         .collect();
     files.sort();
     files.dedup();
@@ -345,10 +423,84 @@ mod tests {
     #[test]
     fn parse_status_missing_defaults_needs_retry() {
         let text = "Just some output with no status line.";
-        assert!(matches!(
-            parse_agent_status(text),
-            AgentStatus::NeedsRetry { .. }
-        ));
+        match parse_agent_status(text) {
+            AgentStatus::NeedsRetry { reason } => {
+                assert_eq!(reason, "no STATUS line in agent output");
+            }
+            other => panic!("expected NeedsRetry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_status_failure_multiline() {
+        let text = "Review complete.\nSTATUS: FAILURE:\n1. Missing error handling\n2. No tests\n3. Unused import\n";
+        match parse_agent_status(text) {
+            AgentStatus::Failure { reason } => {
+                assert_eq!(
+                    reason,
+                    "1. Missing error handling\n2. No tests\n3. Unused import"
+                );
+            }
+            other => panic!("expected Failure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_status_failure_multiline_with_inline_preamble() {
+        let text = "STATUS: FAILURE: issues found\n1. Thing one\n2. Thing two\n";
+        match parse_agent_status(text) {
+            AgentStatus::Failure { reason } => {
+                assert_eq!(reason, "issues found\n1. Thing one\n2. Thing two");
+            }
+            other => panic!("expected Failure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_status_failure_empty_no_trailing_lines() {
+        let text = "STATUS: FAILURE:";
+        match parse_agent_status(text) {
+            AgentStatus::Failure { reason } => {
+                assert_eq!(reason, "no reason provided");
+            }
+            other => panic!("expected Failure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_status_failure_empty_only_blank_trailing() {
+        let text = "STATUS: FAILURE:\n\n\n";
+        match parse_agent_status(text) {
+            AgentStatus::Failure { reason } => {
+                assert_eq!(reason, "no reason provided");
+            }
+            other => panic!("expected Failure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_status_reason_truncated() {
+        // Build a reason that exceeds REASON_MAX_LEN
+        let long_line = "x".repeat(REASON_MAX_LEN + 500);
+        let text = format!("STATUS: FAILURE: {}", long_line);
+        match parse_agent_status(&text) {
+            AgentStatus::Failure { reason } => {
+                assert!(reason.len() <= REASON_MAX_LEN + 3); // +3 for "..."
+                assert!(reason.ends_with("..."));
+            }
+            other => panic!("expected Failure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_status_needs_retry_multiline() {
+        let text = "STATUS: NEEDS_RETRY:\nflaky network\ntimeout on port 443\n";
+        match parse_agent_status(text) {
+            AgentStatus::NeedsRetry { reason } => {
+                assert_eq!(reason, "flaky network\ntimeout on port 443");
+            }
+            other => panic!("expected NeedsRetry, got {:?}", other),
+        }
     }
 
     #[test]

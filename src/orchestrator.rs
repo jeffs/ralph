@@ -146,10 +146,10 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             // Checkpoint: seal the current working-copy change
             // and start a fresh one for the next group.
             let has_changes = state.tasks.values().any(|e| !e.files_changed.is_empty());
-            if has_changes {
-                if let Err(e) = jj_checkpoint().await {
-                    eprintln!("[ralph] jj commit skipped: {e}");
-                }
+            if has_changes
+                && let Err(e) = jj_checkpoint().await
+            {
+                eprintln!("[ralph] jj commit skipped: {e}");
             }
         }
     }
@@ -289,10 +289,7 @@ async fn isolate_dirty_tree() {
              isolating with `jj new`",
             files.len()
         );
-        let _ = TokioCommand::new("jj")
-            .arg("new")
-            .status()
-            .await;
+        let _ = TokioCommand::new("jj").arg("new").status().await;
     }
 }
 
@@ -339,7 +336,13 @@ async fn create_workspace(task_id: &str, config: &Config) -> Result<PathBuf> {
     let ws_dir = PathBuf::from(WS_DIR).join(format!("ws-{task_id}"));
 
     let status = TokioCommand::new("jj")
-        .args(["workspace", "add", &ws_dir.to_string_lossy(), "--name", &ws_name])
+        .args([
+            "workspace",
+            "add",
+            &ws_dir.to_string_lossy(),
+            "--name",
+            &ws_name,
+        ])
         .status()
         .await
         .context("jj workspace add")?;
@@ -429,13 +432,8 @@ async fn run_group_with_workspaces(
         let cfg = config.clone();
         handles.push(tokio::spawn(async move {
             let ctx = AgentContext::implement(&id, &title, &desc);
-            let result = agent::invoke_agent(
-                AgentRole::Implementer,
-                &ctx,
-                &cfg,
-                Some(&ws_path),
-            )
-            .await;
+            let result =
+                agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg, Some(&ws_path)).await;
             (id, result)
         }));
     }
@@ -483,9 +481,7 @@ async fn run_group_with_workspaces(
         if outcome.success {
             // Attribute files precisely from workspace
             let rev = format!("ralph-{}@", outcome.id);
-            let files = agent::jj_changed_files_for(&rev)
-                .await
-                .unwrap_or_default();
+            let files = agent::jj_changed_files_for(&rev).await.unwrap_or_default();
             let exec = state.entry(&outcome.id);
             exec.files_changed.extend(files);
             exec.files_changed.sort();
@@ -497,10 +493,7 @@ async fn run_group_with_workspaces(
                 .status()
                 .await;
             if let Err(e) = squash_status {
-                eprintln!(
-                    "[ralph] squash failed for {}: {e}",
-                    outcome.id
-                );
+                eprintln!("[ralph] squash failed for {}: {e}", outcome.id);
             }
             teardown_workspace(&outcome.id, false).await;
         } else {
