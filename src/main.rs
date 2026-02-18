@@ -140,21 +140,21 @@ async fn cmd_status() -> Result<()> {
     let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
 
     if !tasks_path.exists() {
-        eprintln!("No tasks found. Run `ralph plan` first.");
+        println!("No tasks found. Run `ralph plan` first.");
         return Ok(());
     }
 
     let tasks = task::load_tasks(&tasks_path).await?;
     let exec_state = state::ExecutionState::load(&state_path).await?;
 
-    eprintln!("Tasks: {}", tasks.len());
+    println!("Tasks: {}", tasks.len());
     for t in &tasks {
         let phase = exec_state
             .tasks
             .get(&t.id)
             .map(|e| format!("{:?} (attempts: {})", e.phase, e.attempts))
             .unwrap_or_else(|| "Pending".to_string());
-        eprintln!("  [{}] {} — {}", t.id, t.title, phase);
+        println!("  [{}] {} — {}", t.id, t.title, phase);
     }
     Ok(())
 }
