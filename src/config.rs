@@ -4,11 +4,28 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     /// Paths to symlink from project root into each workspace
     #[serde(default)]
     pub shared: Vec<String>,
+    /// When true, each workspace gets its own CARGO_TARGET_DIR
+    /// to avoid cargo lock contention. Increases disk usage.
+    #[serde(default = "default_isolate_target_dir")]
+    pub isolate_target_dir: bool,
+}
+
+fn default_isolate_target_dir() -> bool {
+    true
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            shared: Vec::new(),
+            isolate_target_dir: default_isolate_target_dir(),
+        }
+    }
 }
 
 /// Per-role model overrides. Any omitted role falls back to the
@@ -61,6 +78,12 @@ pub struct Config {
     /// Environment variable forwarding and override configuration
     #[serde(default)]
     pub env: EnvConfig,
+    /// Grace period between SIGTERM and SIGKILL in seconds
+    #[serde(default = "default_kill_grace_secs")]
+    pub kill_grace_secs: u64,
+    /// Maximum cumulative cost (USD) before stopping the run
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
 }
 
 fn default_model() -> String {
@@ -77,6 +100,10 @@ fn default_agent_timeout_secs() -> u64 {
 
 fn default_agent_idle_timeout_secs() -> u64 {
     180
+}
+
+fn default_kill_grace_secs() -> u64 {
+    5
 }
 
 fn default_prompts_dir() -> PathBuf {
@@ -112,6 +139,8 @@ impl Default for Config {
             prompts_dir: default_prompts_dir(),
             workspace: WorkspaceConfig::default(),
             env: EnvConfig::default(),
+            kill_grace_secs: default_kill_grace_secs(),
+            max_cost_usd: None,
         }
     }
 }
@@ -217,6 +246,36 @@ reviewer = "opus"
     }
 
     #[test]
+    fn deserialize_kill_grace_secs() {
+        let toml_str = r#"kill_grace_secs = 10"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.kill_grace_secs, 10);
+    }
+
+    #[test]
+    fn kill_grace_secs_defaults_to_5() {
+        let toml_str = r#"model = "sonnet""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.kill_grace_secs, 5);
+    }
+
+    #[test]
+    fn isolate_target_dir_defaults_to_true() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.workspace.isolate_target_dir);
+    }
+
+    #[test]
+    fn isolate_target_dir_can_be_disabled() {
+        let toml_str = r#"
+[workspace]
+isolate_target_dir = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.workspace.isolate_target_dir);
+    }
+
+    #[test]
     fn deserialize_env_config() {
         let toml_str = r#"
 [env]
@@ -230,5 +289,18 @@ BAZ = "qux"
         assert_eq!(config.env.passthrough, vec!["MY_TOKEN", "CUSTOM_VAR"]);
         assert_eq!(config.env.set.get("FOO").map(|s| s.as_str()), Some("bar"));
         assert_eq!(config.env.set.get("BAZ").map(|s| s.as_str()), Some("qux"));
+    }
+
+    #[test]
+    fn deserialize_max_cost_usd() {
+        let toml_str = r#"max_cost_usd = 5.0"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_cost_usd, Some(5.0));
+    }
+
+    #[test]
+    fn max_cost_usd_defaults_to_none() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.max_cost_usd, None);
     }
 }

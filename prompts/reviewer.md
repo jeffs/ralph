@@ -10,10 +10,20 @@ project conventions.
 - **Title**: {{TASK_TITLE}}
 - **Description**: {{TASK_DESCRIPTION}}
 
+## Changed Files
+
+{{DIFF_SUMMARY}}
+
+## Diff
+
+```
+{{DIFF}}
+```
+
 ## Instructions
 
 1. Read the task description carefully.
-2. Review the changes made (use `jj diff --git` to see them).
+2. Review the diff above (and use `jj diff --git` for more context if needed).
 3. Check:
    - Does the implementation match the requirements?
    - Are there correctness issues, edge cases, or bugs?
@@ -29,7 +39,13 @@ If the implementation is acceptable:
 STATUS: SUCCESS
 ```
 
-If there are issues:
+If the implementation is acceptable but has minor suggestions (style, naming, optional improvements) that should not block progress:
+
+```
+STATUS: APPROVED_WITH_NITS: <suggestions>
+```
+
+If there are correctness issues, missing requirements, or bugs:
 
 ```
 STATUS: FAILURE: <list of issues>

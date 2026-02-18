@@ -43,6 +43,21 @@ enum Command {
     Init,
     /// Show current execution state
     Status,
+    /// Mark a task as Done without running it
+    Skip {
+        /// Task ID to skip (e.g. "T3")
+        task_id: String,
+    },
+    /// Mark a task as Failed immediately
+    Fail {
+        /// Task ID to fail (e.g. "T3")
+        task_id: String,
+    },
+    /// Reset a task to Pending (clear attempts)
+    Reset {
+        /// Task ID to reset (e.g. "T3")
+        task_id: String,
+    },
 }
 
 #[tokio::main]
@@ -60,6 +75,9 @@ async fn main() -> Result<()> {
             max_iterations,
         } => cmd_run(tasks, max_iterations).await,
         Command::Status => cmd_status().await,
+        Command::Skip { task_id } => cmd_override_task(&task_id, "skip").await,
+        Command::Fail { task_id } => cmd_override_task(&task_id, "fail").await,
+        Command::Reset { task_id } => cmd_override_task(&task_id, "reset").await,
     }
 }
 
@@ -101,7 +119,7 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
     let ralph_dir = PathBuf::from(".ralph");
     tokio::fs::create_dir_all(&ralph_dir).await?;
 
-    let registry = agent::ProcessRegistry::default();
+    let registry = agent::ProcessRegistry::new(config.kill_grace_secs);
     orchestrator::spawn_signal_handler(registry.clone());
 
     let tasks_path = ralph_dir.join("tasks.jsonl");
@@ -144,6 +162,51 @@ async fn cmd_run(tasks_path: Option<PathBuf>, max_iterations: usize) -> Result<(
     orchestrator::run_loop(&tasks_path, max_iterations, &config).await
 }
 
+async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
+    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
+    let state_path = PathBuf::from(".ralph/state.json");
+
+    if !tasks_path.exists() {
+        anyhow::bail!("No tasks found. Run `ralph plan` first.");
+    }
+
+    let tasks = task::load_tasks(&tasks_path).await?;
+    if !tasks.iter().any(|t| t.id == task_id) {
+        let valid_ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        anyhow::bail!(
+            "Unknown task ID '{}'. Valid IDs: {}",
+            task_id,
+            valid_ids.join(", ")
+        );
+    }
+
+    let mut exec_state = state::ExecutionState::load(&state_path).await?;
+    let exec = exec_state.entry(task_id);
+
+    match action {
+        "skip" => {
+            exec.phase = state::Phase::Done;
+            eprintln!("Marked {} as Done (skipped)", task_id);
+        }
+        "fail" => {
+            exec.phase = state::Phase::Failed;
+            exec.last_error = Some("manually failed via `ralph fail`".to_string());
+            eprintln!("Marked {} as Failed", task_id);
+        }
+        "reset" => {
+            exec.phase = state::Phase::Pending;
+            exec.attempts = 0;
+            exec.last_error = None;
+            exec.feedback.clear();
+            eprintln!("Reset {} to Pending (attempts cleared)", task_id);
+        }
+        _ => unreachable!(),
+    }
+
+    exec_state.save(&state_path).await?;
+    Ok(())
+}
+
 async fn cmd_status() -> Result<()> {
     let state_path = PathBuf::from(".ralph/state.json");
     let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
@@ -155,15 +218,48 @@ async fn cmd_status() -> Result<()> {
 
     let tasks = task::load_tasks(&tasks_path).await?;
     let exec_state = state::ExecutionState::load(&state_path).await?;
+    let now = state::unix_now();
+
+    let mut done = 0u32;
+    let mut failed = 0u32;
+    let mut in_progress = 0u32;
+    let mut pending = 0u32;
 
     println!("Tasks: {}", tasks.len());
     for t in &tasks {
-        let phase = exec_state
-            .tasks
-            .get(&t.id)
-            .map(|e| format!("{:?} (attempts: {})", e.phase, e.attempts))
-            .unwrap_or_else(|| "Pending".to_string());
-        println!("  [{}] {} — {}", t.id, t.title, phase);
+        let info = if let Some(e) = exec_state.tasks.get(&t.id) {
+            match e.phase {
+                state::Phase::Done => done += 1,
+                state::Phase::Failed => failed += 1,
+                state::Phase::Pending => pending += 1,
+                _ => in_progress += 1,
+            }
+            let duration = match (e.started_at, e.completed_at) {
+                (Some(s), Some(c)) => format!(" ({}s)", c.saturating_sub(s)),
+                (Some(s), None) => format!(" ({}s elapsed)", now.saturating_sub(s)),
+                _ => String::new(),
+            };
+            let error = e
+                .last_error
+                .as_deref()
+                .map(|e| {
+                    let truncated = if e.len() > 80 { &e[..80] } else { e };
+                    format!(" err={truncated}")
+                })
+                .unwrap_or_default();
+            format!(
+                "{:?} attempts={}{duration}{error}",
+                e.phase, e.attempts
+            )
+        } else {
+            pending += 1;
+            "Pending".to_string()
+        };
+        println!("  [{}] {} — {}", t.id, t.title, info);
     }
+    println!(
+        "Summary: {} done, {} failed, {} in-progress, {} pending",
+        done, failed, in_progress, pending
+    );
     Ok(())
 }

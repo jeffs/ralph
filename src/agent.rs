@@ -17,14 +17,30 @@ const STUCK_PATTERNS: &[&str] = &["Blocking waiting for file lock", "waiting for
 
 /// Tracks active child process group IDs so a centralized signal
 /// handler can clean them all up on SIGINT / SIGTERM.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ProcessRegistry {
     pgids: Arc<Mutex<HashSet<u32>>>,
     historical_pgids: Arc<Mutex<HashSet<u32>>>,
     shutdown: Arc<AtomicBool>,
+    kill_grace_secs: u64,
+}
+
+impl Default for ProcessRegistry {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl ProcessRegistry {
+    pub fn new(kill_grace_secs: u64) -> Self {
+        Self {
+            pgids: Arc::default(),
+            historical_pgids: Arc::default(),
+            shutdown: Arc::default(),
+            kill_grace_secs,
+        }
+    }
+
     pub fn register(&self, pgid: u32) {
         self.pgids.lock().expect("pgid lock").insert(pgid);
         self.historical_pgids
@@ -40,7 +56,7 @@ impl ProcessRegistry {
     pub async fn kill_all(&self) {
         let pgids: Vec<u32> = self.pgids.lock().expect("pgid lock").drain().collect();
         for pgid in pgids {
-            kill_process_group(pgid).await;
+            kill_process_group(pgid, self.kill_grace_secs).await;
         }
     }
 
@@ -76,7 +92,7 @@ impl ProcessRegistry {
                 eprintln!(
                     "[ralph] WARNING: orphan process group {pgid} still alive, sending SIGTERM"
                 );
-                kill_process_group(pgid).await;
+                kill_process_group(pgid, self.kill_grace_secs).await;
                 // Keep in historical set — next audit will re-check.
             } else {
                 self.historical_pgids
@@ -146,6 +162,8 @@ pub enum AgentContext {
         task_id: String,
         task_title: String,
         task_description: String,
+        diff_summary: String,
+        diff: String,
     },
 }
 
@@ -172,11 +190,19 @@ impl AgentContext {
         }
     }
 
-    pub fn review(id: &str, title: &str, description: &str) -> Self {
+    pub fn review(
+        id: &str,
+        title: &str,
+        description: &str,
+        diff_summary: String,
+        diff: String,
+    ) -> Self {
         Self::Review {
             task_id: id.to_string(),
             task_title: title.to_string(),
             task_description: description.to_string(),
+            diff_summary,
+            diff,
         }
     }
 
@@ -221,10 +247,14 @@ impl AgentContext {
                 task_id,
                 task_title,
                 task_description,
+                diff_summary,
+                diff,
             } => template
                 .replace("{{TASK_ID}}", task_id)
                 .replace("{{TASK_TITLE}}", task_title)
-                .replace("{{TASK_DESCRIPTION}}", task_description),
+                .replace("{{TASK_DESCRIPTION}}", task_description)
+                .replace("{{DIFF_SUMMARY}}", diff_summary)
+                .replace("{{DIFF}}", diff),
         }
     }
 }
@@ -236,11 +266,14 @@ pub struct AgentResult {
     pub text: String,
     /// Self-reported status from the agent's JSON output
     pub status: AgentStatus,
+    /// Cost reported by the claude CLI for this invocation
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStatus {
     Success,
+    ApprovedWithNits { suggestions: String },
     Failure { reason: String },
     NeedsRetry { reason: String },
 }
@@ -270,6 +303,46 @@ impl AgentResult {
 #[derive(Deserialize)]
 struct ClaudeJsonOutput {
     result: Option<String>,
+    total_cost_usd: Option<f64>,
+}
+
+/// Classification of failure types for smarter retry decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Agent exceeded wall-clock or idle timeout.
+    Timeout,
+    /// Compilation or build error in the output.
+    BuildError,
+    /// Tests failed.
+    TestFailure,
+    /// Reviewer rejected the implementation.
+    ReviewRejection,
+    /// Unclassified failure.
+    Unknown,
+}
+
+/// Classify a failure reason into a FailureKind for retry decisions.
+pub fn classify_failure(reason: &str) -> FailureKind {
+    let lower = reason.to_lowercase();
+    if lower.contains("timed out") || lower.contains("idle for") || lower.contains("stuck on") {
+        FailureKind::Timeout
+    } else if lower.contains("compile error")
+        || lower.contains("build failed")
+        || lower.contains("error[e")
+        || lower.contains("cannot find")
+    {
+        FailureKind::BuildError
+    } else if lower.contains("test failed")
+        || lower.contains("tests failed")
+        || lower.contains("assertion failed")
+        || lower.contains("test failure")
+    {
+        FailureKind::TestFailure
+    } else if lower.contains("review") || lower.contains("issues found") {
+        FailureKind::ReviewRejection
+    } else {
+        FailureKind::Unknown
+    }
 }
 
 /// Sample total CPU% for all processes in a process group via `ps`.
@@ -303,9 +376,10 @@ fn parse_pcpu_output(output: &str) -> f64 {
         .sum()
 }
 
-/// Send SIGTERM to all processes in the given process group.
-/// Ignores errors (the group may have already exited).
-pub(crate) async fn kill_process_group(pgid: u32) {
+/// Send SIGTERM to a process group, wait up to `grace_secs`,
+/// then escalate to SIGKILL if still alive.
+pub(crate) async fn kill_process_group(pgid: u32, grace_secs: u64) {
+    // Send SIGTERM first.
     let _ = TokioCommand::new("kill")
         .args(["-TERM", &format!("-{pgid}")])
         .stdin(Stdio::null())
@@ -313,6 +387,44 @@ pub(crate) async fn kill_process_group(pgid: u32) {
         .stderr(Stdio::null())
         .status()
         .await;
+
+    if grace_secs == 0 {
+        // Immediate SIGKILL.
+        let _ = TokioCommand::new("kill")
+            .args(["-KILL", &format!("-{pgid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        return;
+    }
+
+    // Wait for grace period, then SIGKILL if still alive.
+    tokio::time::sleep(Duration::from_secs(grace_secs)).await;
+    let alive = TokioCommand::new("kill")
+        .args(["-0", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if alive {
+        eprintln!(
+            "[ralph] process group {pgid} still alive after \
+             {grace_secs}s grace, sending SIGKILL"
+        );
+        let _ = TokioCommand::new("kill")
+            .args(["-KILL", &format!("-{pgid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
 }
 
 /// Poll interval for the idle-monitoring loop.
@@ -351,7 +463,7 @@ async fn monitor_agent(
     loop {
         let elapsed = started.elapsed();
         if elapsed >= hard_limit {
-            kill_process_group(pgid).await;
+            kill_process_group(pgid, 0).await;
             return Err(AgentStatus::Failure {
                 reason: format!("agent timed out after {agent_timeout_secs}s"),
             });
@@ -361,7 +473,7 @@ async fn monitor_agent(
         if stuck_flag.load(Ordering::Acquire) {
             let since = stuck_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= stuck_grace {
-                kill_process_group(pgid).await;
+                kill_process_group(pgid, 0).await;
                 return Err(AgentStatus::Failure {
                     reason: format!(
                         "agent stuck on file lock for {}s",
@@ -379,7 +491,7 @@ async fn monitor_agent(
             Ok(Ok(status)) => return Ok(status),
             Ok(Err(e)) => {
                 // IO error waiting for child
-                kill_process_group(pgid).await;
+                kill_process_group(pgid, 0).await;
                 return Err(AgentStatus::Failure {
                     reason: format!("error waiting for agent process: {e}"),
                 });
@@ -390,7 +502,7 @@ async fn monitor_agent(
                 if cpu < IDLE_CPU_THRESHOLD {
                     idle_duration += poll_timeout;
                     if idle_duration >= idle_limit {
-                        kill_process_group(pgid).await;
+                        kill_process_group(pgid, 0).await;
                         return Err(AgentStatus::Failure {
                             reason: format!(
                                 "agent idle for {}s (possible deadlock)",
@@ -531,10 +643,11 @@ pub async fn invoke_agent(
             return Ok(AgentResult {
                 text: String::new(),
                 status,
+                cost_usd: None,
             });
         }
     };
-    kill_process_group(child_pid).await;
+    kill_process_group(child_pid, 0).await;
     registry.deregister(child_pid);
 
     // Join the concurrent stdout drain task.
@@ -555,24 +668,33 @@ pub async fn invoke_agent(
             status: AgentStatus::Failure {
                 reason: format!("claude exited with {}", exit_status),
             },
+            cost_usd: None,
         });
     }
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
 
     // Parse the JSON envelope
-    let text = match serde_json::from_str::<ClaudeJsonOutput>(&stdout) {
-        Ok(parsed) => parsed.result.unwrap_or_default(),
+    let (text, cost_usd) = match serde_json::from_str::<ClaudeJsonOutput>(&stdout) {
+        Ok(parsed) => (parsed.result.unwrap_or_default(), parsed.total_cost_usd),
         Err(_) => {
             // Fall back to raw stdout if JSON parsing fails
-            stdout.to_string()
+            (stdout.to_string(), None)
         }
     };
+
+    if let Some(cost) = cost_usd {
+        eprintln!("[ralph] {} agent cost: ${cost:.4}", role.label());
+    }
 
     // Parse agent's self-reported status from the text
     let status = parse_agent_status(&text);
 
-    Ok(AgentResult { text, status })
+    Ok(AgentResult {
+        text,
+        status,
+        cost_usd,
+    })
 }
 
 /// Maximum length for captured reason text.
@@ -601,9 +723,11 @@ fn parse_agent_status(text: &str) -> AgentStatus {
             return AgentStatus::Success;
         }
 
-        // Try to match FAILURE: or NEEDS_RETRY: and collect the reason.
+        // Try to match APPROVED_WITH_NITS:, FAILURE:, or NEEDS_RETRY: and collect the reason.
         let (prefix, make_status): (&str, fn(String) -> AgentStatus) =
-            if let Some(r) = rest.strip_prefix("FAILURE:") {
+            if let Some(r) = rest.strip_prefix("APPROVED_WITH_NITS:") {
+                (r, |suggestions| AgentStatus::ApprovedWithNits { suggestions })
+            } else if let Some(r) = rest.strip_prefix("FAILURE:") {
                 (r, |reason| AgentStatus::Failure { reason })
             } else if let Some(r) = rest.strip_prefix("NEEDS_RETRY:") {
                 (r, |reason| AgentStatus::NeedsRetry { reason })
@@ -723,6 +847,18 @@ pub async fn jj_changed_files() -> Result<Vec<PathBuf>> {
         .await?;
 
     Ok(parse_diff_summary(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Get the full git-format diff of the working-copy commit.
+pub async fn jj_diff_git() -> Result<String> {
+    let output = TokioCommand::new("jj")
+        .args(["diff", "--git"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await?;
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Get files changed in a specific revision (e.g. a workspace's
@@ -893,6 +1029,7 @@ mod tests {
 Done!"#
                 .to_string(),
             status: AgentStatus::Success,
+            cost_usd: None,
         };
         let jsonl = result.extract_jsonl().unwrap();
         assert!(jsonl.contains("T1"));
@@ -975,6 +1112,100 @@ Done!"#
                 !STUCK_PATTERNS.iter().any(|pat| line.contains(pat)),
                 "unexpected pattern match for: {line}"
             );
+        }
+    }
+
+    #[test]
+    fn classify_timeout() {
+        assert_eq!(
+            classify_failure("agent timed out after 1800s"),
+            FailureKind::Timeout
+        );
+        assert_eq!(
+            classify_failure("agent idle for 180s (possible deadlock)"),
+            FailureKind::Timeout
+        );
+        assert_eq!(
+            classify_failure("agent stuck on file lock for 60s"),
+            FailureKind::Timeout
+        );
+    }
+
+    #[test]
+    fn classify_build_error() {
+        assert_eq!(
+            classify_failure("compile error in src/main.rs"),
+            FailureKind::BuildError
+        );
+        assert_eq!(
+            classify_failure("error[E0308]: mismatched types"),
+            FailureKind::BuildError
+        );
+    }
+
+    #[test]
+    fn classify_test_failure() {
+        assert_eq!(
+            classify_failure("tests failed: 2 passed, 1 failed"),
+            FailureKind::TestFailure
+        );
+        assert_eq!(
+            classify_failure("assertion failed: expected 3, got 4"),
+            FailureKind::TestFailure
+        );
+    }
+
+    #[test]
+    fn classify_review_rejection() {
+        assert_eq!(
+            classify_failure("review: issues found in implementation"),
+            FailureKind::ReviewRejection
+        );
+    }
+
+    #[test]
+    fn classify_unknown() {
+        assert_eq!(
+            classify_failure("something unexpected happened"),
+            FailureKind::Unknown
+        );
+    }
+
+    #[test]
+    fn parse_claude_json_with_cost() {
+        let json = r#"{"result":"hello","total_cost_usd":0.0042}"#;
+        let parsed: ClaudeJsonOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.result.as_deref(), Some("hello"));
+        assert!((parsed.total_cost_usd.unwrap() - 0.0042).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_claude_json_without_cost() {
+        let json = r#"{"result":"hello"}"#;
+        let parsed: ClaudeJsonOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.result.as_deref(), Some("hello"));
+        assert!(parsed.total_cost_usd.is_none());
+    }
+
+    #[test]
+    fn parse_status_approved_with_nits() {
+        let text = "Looks good overall.\nSTATUS: APPROVED_WITH_NITS: consider renaming foo to bar";
+        assert_eq!(
+            parse_agent_status(text),
+            AgentStatus::ApprovedWithNits {
+                suggestions: "consider renaming foo to bar".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_status_approved_with_nits_multiline() {
+        let text = "STATUS: APPROVED_WITH_NITS:\n1. rename foo\n2. add docstring\n";
+        match parse_agent_status(text) {
+            AgentStatus::ApprovedWithNits { suggestions } => {
+                assert_eq!(suggestions, "1. rename foo\n2. add docstring");
+            }
+            other => panic!("expected ApprovedWithNits, got {:?}", other),
         }
     }
 }

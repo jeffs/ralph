@@ -26,7 +26,25 @@ implementable tasks.
 ## Output Contract
 
 Write the tasks as JSONL to `.ralph/tasks.jsonl`. One JSON
-object per line. Example:
+object per line.
+
+### Field Schema
+
+| Field        | Type       | Required | Rules                                    |
+|-------------|------------|----------|------------------------------------------|
+| `id`        | string     | yes      | Unique, no whitespace (e.g. "AUTH-1")    |
+| `title`     | string     | yes      | Non-empty, imperative one-liner          |
+| `description`| string    | no       | What to change, where, and why           |
+| `priority`  | integer    | yes      | 1 = highest                              |
+| `blocked_by`| string[]   | no       | IDs that must complete first             |
+
+### Rules
+
+- Every `blocked_by` entry must reference an `id` in the file.
+- No duplicate `id` values.
+- `id` must not contain whitespace.
+
+### Example
 
 ```
 {"id":"T1","title":"Add foo function","description":"...","priority":1,"blocked_by":[]}

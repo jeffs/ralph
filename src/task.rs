@@ -27,16 +27,62 @@ pub async fn load_tasks(path: &Path) -> Result<Vec<Task>> {
 }
 
 /// Parse JSONL text into tasks. Blank lines are skipped.
+/// Provides clear error messages pointing at the offending line.
 pub fn parse_tasks(contents: &str) -> Result<Vec<Task>> {
-    contents
+    let tasks: Vec<Task> = contents
         .lines()
         .filter(|line| !line.trim().is_empty())
         .enumerate()
         .map(|(i, line)| {
-            serde_json::from_str::<Task>(line)
-                .with_context(|| format!("parsing task on line {}", i + 1))
+            serde_json::from_str::<Task>(line).with_context(|| {
+                let preview = if line.len() > 120 {
+                    format!("{}...", &line[..120])
+                } else {
+                    line.to_string()
+                };
+                format!("parsing task on line {} \u{2014} {}", i + 1, preview)
+            })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    validate_tasks(&tasks)?;
+    Ok(tasks)
+}
+
+/// Validate task fields beyond what serde enforces.
+fn validate_tasks(tasks: &[Task]) -> Result<()> {
+    let mut errors = Vec::new();
+
+    for (i, t) in tasks.iter().enumerate() {
+        if t.id.trim().is_empty() {
+            errors.push(format!("task {} (line {}): `id` is empty", i + 1, i + 1));
+        }
+        if t.title.trim().is_empty() {
+            errors.push(format!("task {} '{}': `title` is empty", i + 1, t.id));
+        }
+        if t.id.contains(char::is_whitespace) {
+            errors.push(format!(
+                "task {} '{}': `id` contains whitespace",
+                i + 1, t.id
+            ));
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for t in tasks {
+        if !seen.insert(&t.id) {
+            errors.push(format!("duplicate task ID '{}'", t.id));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "task validation failed:\n  {}",
+            errors.join("\n  ")
+        );
+    }
 }
 
 /// Validate that every `blocked_by` ID references an
@@ -149,6 +195,31 @@ mod tests {
             },
         ];
         assert!(validate_deps(&tasks).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_id() {
+        let input = r#"{"id":"","title":"A","priority":1}"#;
+        assert!(parse_tasks(input).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_in_id() {
+        let input = r#"{"id":"T 1","title":"A","priority":1}"#;
+        assert!(parse_tasks(input).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_title() {
+        let input = r#"{"id":"T1","title":"","priority":1}"#;
+        assert!(parse_tasks(input).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_ids() {
+        let input = r#"{"id":"T1","title":"A","priority":1}
+{"id":"T1","title":"B","priority":2}"#;
+        assert!(parse_tasks(input).is_err());
     }
 
     #[test]

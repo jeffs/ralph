@@ -48,6 +48,37 @@ fn reset_or_fail(exec: &mut TaskExecution, config: &Config) {
     }
 }
 
+/// Decide whether a failure is worth retrying based on its
+/// classification. Timeouts and unknown errors are retryable;
+/// build errors and test failures are retryable (the implementer
+/// gets feedback). Review rejections are always retryable.
+fn should_retry(kind: agent::FailureKind) -> bool {
+    match kind {
+        agent::FailureKind::Timeout => true,
+        agent::FailureKind::BuildError => true,
+        agent::FailureKind::TestFailure => true,
+        agent::FailureKind::ReviewRejection => true,
+        agent::FailureKind::Unknown => true,
+    }
+}
+
+/// Like `reset_or_fail` but consults failure classification.
+/// Non-retryable failures go straight to Failed regardless of
+/// attempt count.
+#[allow(dead_code)]
+fn reset_or_fail_classified(
+    exec: &mut TaskExecution,
+    config: &Config,
+    reason: &str,
+) {
+    let kind = agent::classify_failure(reason);
+    if !should_retry(kind) || exec.attempts >= config.max_attempts {
+        exec.phase = Phase::Failed;
+    } else {
+        exec.phase = Phase::Pending;
+    }
+}
+
 /// Record full agent response text as feedback so the
 /// implementer can see what went wrong on the next attempt.
 fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str) {
@@ -61,10 +92,11 @@ fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str) {
 /// (max attempts exceeded), or iteration cap.
 pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config) -> Result<()> {
     let state_path = PathBuf::from(STATE_PATH);
-    let registry = ProcessRegistry::default();
+    let registry = ProcessRegistry::new(config.kill_grace_secs);
     spawn_signal_handler(registry.clone());
     isolate_dirty_tree().await;
     cleanup_stale_workspaces().await;
+    let mut cumulative_cost: f64 = 0.0;
 
     for iteration in 1..=max_iterations {
         if registry.is_shutdown() {
@@ -72,7 +104,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             return Ok(());
         }
 
-        eprintln!("\n[ralph] === iteration {iteration} ===");
+        eprintln!("\n[ralph] === iteration {iteration} === (${cumulative_cost:.4} spent)");
 
         registry.audit_and_kill_orphans().await;
 
@@ -84,6 +116,14 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         // Check convergence: all done → final review
         if state.all_done(&task_ids) {
             eprintln!("[ralph] all tasks done, final review...");
+            let final_diff = agent::jj_diff_git().await.unwrap_or_default();
+            let final_summary = agent::jj_changed_files()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
             let review = agent::invoke_agent(
                 AgentRole::Reviewer,
                 &AgentContext::Review {
@@ -92,12 +132,27 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                     task_description: "Review the full project for \
                          correctness."
                         .to_string(),
+                    diff_summary: final_summary,
+                    diff: final_diff,
                 },
                 config,
                 None,
                 &registry,
             )
             .await?;
+
+            cumulative_cost += review.cost_usd.unwrap_or(0.0);
+            if config
+                .max_cost_usd
+                .is_some_and(|max| cumulative_cost > max)
+            {
+                eprintln!(
+                    "[ralph] cost budget exceeded (${cumulative_cost:.4} > ${:.4}), stopping.",
+                    config.max_cost_usd.unwrap()
+                );
+                state.save(&state_path).await?;
+                return Ok(());
+            }
 
             if registry.is_shutdown() {
                 eprintln!("[ralph] shutdown requested, saving state...");
@@ -106,7 +161,10 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             }
 
             match review.status {
-                AgentStatus::Success => {
+                AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
+                    if let AgentStatus::ApprovedWithNits { suggestions } = &review.status {
+                        eprintln!("[ralph] final review nits: {suggestions}");
+                    }
                     eprintln!(
                         "[ralph] final review passed — \
                          converged!"
@@ -129,7 +187,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
         // Resume interrupted in-flight tasks before
         // scheduling new work.
-        let made_progress = resume_inflight(&tasks, &mut state, config, &registry).await?;
+        let made_progress = resume_inflight(&tasks, &mut state, config, &registry, &mut cumulative_cost).await?;
         if registry.is_shutdown() {
             eprintln!("[ralph] shutdown requested, saving state...");
             state.save(&state_path).await?;
@@ -184,12 +242,37 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             let use_workspaces = group.len() > 1;
 
             if use_workspaces {
-                run_group_with_workspaces(&group, &mut state, config, &registry).await?;
+                run_group_with_workspaces(
+                    &group,
+                    &mut state,
+                    config,
+                    &registry,
+                    &mut cumulative_cost,
+                )
+                .await?;
             } else {
-                run_group_singleton(&group, &mut state, config, &registry).await?;
+                run_group_singleton(
+                    &group,
+                    &mut state,
+                    config,
+                    &registry,
+                    &mut cumulative_cost,
+                )
+                .await?;
             }
 
             state.save(&state_path).await?;
+
+            if config
+                .max_cost_usd
+                .is_some_and(|max| cumulative_cost > max)
+            {
+                eprintln!(
+                    "[ralph] cost budget exceeded (${cumulative_cost:.4} > ${:.4}), stopping.",
+                    config.max_cost_usd.unwrap()
+                );
+                return Ok(());
+            }
 
             if registry.is_shutdown() {
                 eprintln!("[ralph] shutdown requested, saving state...");
@@ -197,7 +280,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             }
 
             // Advance any tasks now at Testing/Reviewing
-            resume_inflight(&tasks, &mut state, config, &registry).await?;
+            resume_inflight(&tasks, &mut state, config, &registry, &mut cumulative_cost).await?;
             state.save(&state_path).await?;
 
             if registry.is_shutdown() {
@@ -218,17 +301,51 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
     Ok(())
 }
 
+/// Group Testing tasks by disjoint file sets for parallel execution.
+/// Tasks with overlapping files_changed are placed in the same group
+/// to avoid parallel testing of the same files.
+fn group_by_disjoint_files(ids: &[String], state: &ExecutionState) -> Vec<Vec<String>> {
+    let mut groups: Vec<(std::collections::HashSet<PathBuf>, Vec<String>)> = Vec::new();
+
+    for id in ids {
+        let files: std::collections::HashSet<PathBuf> = state
+            .tasks
+            .get(id)
+            .map(|e| e.files_changed.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut merged = false;
+        for (group_files, group_ids) in &mut groups {
+            if files.is_disjoint(group_files) {
+                group_files.extend(files.iter().cloned());
+                group_ids.push(id.clone());
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            groups.push((files, vec![id.clone()]));
+        }
+    }
+
+    groups.into_iter().map(|(_, ids)| ids).collect()
+}
+
 /// Advance all tasks stuck at Testing or Reviewing.
 /// Returns true if any task moved forward.
+///
+/// Testing tasks with disjoint file sets run in parallel.
+/// Reviewing tasks always run in parallel (read-only).
 async fn resume_inflight(
     tasks: &[Task],
     state: &mut ExecutionState,
     config: &Config,
     registry: &ProcessRegistry,
+    cumulative_cost: &mut f64,
 ) -> Result<bool> {
     let mut progressed = false;
 
-    // Testing phase → run tester
+    // Testing phase → run tester (parallel for disjoint file sets)
     let testing: Vec<String> = state
         .tasks
         .iter()
@@ -236,48 +353,72 @@ async fn resume_inflight(
         .map(|(id, _)| id.clone())
         .collect();
 
-    for id in &testing {
-        eprintln!("[ralph] resuming test for {id}...");
-        let files = state
-            .tasks
-            .get(id)
-            .map(|e| e.files_changed.clone())
-            .unwrap_or_default();
+    let test_groups = group_by_disjoint_files(&testing, state);
+    for group in test_groups {
+        let mut handles = Vec::new();
+        for id in &group {
+            let files = state
+                .tasks
+                .get(id)
+                .map(|e| e.files_changed.clone())
+                .unwrap_or_default();
+            let ctx = AgentContext::test(id, files);
+            let cfg = config.clone();
+            let reg = registry.clone();
+            let id_owned = id.clone();
+            handles.push(tokio::spawn(async move {
+                let result =
+                    agent::invoke_agent(AgentRole::Tester, &ctx, &cfg, None, &reg).await;
+                (id_owned, result)
+            }));
+        }
 
-        let ctx = AgentContext::test(id, files);
-        match agent::invoke_agent(AgentRole::Tester, &ctx, config, None, registry).await {
-            Ok(r) => {
-                let exec = state.entry(id);
-                match r.status {
-                    AgentStatus::Success => {
-                        exec.phase = Phase::Reviewing;
-                        exec.last_error = None;
-                        progressed = true;
-                    }
-                    AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                        push_feedback(exec, "Tester", &r.text);
-                        reset_or_fail(exec, config);
-                        exec.last_error = Some(reason.clone());
-                        progressed = true;
-                        eprintln!(
-                            "[ralph] {id} tests failed: \
-                             {reason}"
-                        );
+        for handle in handles {
+            let (id, result) = handle.await?;
+            eprintln!("[ralph] resuming test for {id}...");
+            match result {
+                Ok(r) => {
+                    *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+                    let exec = state.entry(&id);
+                    match r.status {
+                        AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
+                            exec.phase = Phase::Reviewing;
+                            exec.last_error = None;
+                            progressed = true;
+                        }
+                        AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                            push_feedback(exec, "Tester", &r.text);
+                            reset_or_fail(exec, config);
+                            exec.last_error = Some(reason.clone());
+                            progressed = true;
+                            eprintln!("[ralph] {id} tests failed: {reason}");
+                        }
                     }
                 }
+                Err(e) => {
+                    let exec = state.entry(&id);
+                    push_feedback(exec, "Tester", &e.to_string());
+                    reset_or_fail(exec, config);
+                    exec.last_error = Some(e.to_string());
+                    progressed = true;
+                    eprintln!("[ralph] tester error for {id}: {e}");
+                }
             }
-            Err(e) => {
-                let exec = state.entry(id);
-                push_feedback(exec, "Tester", &e.to_string());
-                reset_or_fail(exec, config);
-                exec.last_error = Some(e.to_string());
-                progressed = true;
-                eprintln!("[ralph] tester error for {id}: {e}");
+            if config
+                .max_cost_usd
+                .is_some_and(|max| *cumulative_cost > max)
+            {
+                eprintln!(
+                    "[ralph] cost budget exceeded (${:.4} > ${:.4}), stopping.",
+                    *cumulative_cost,
+                    config.max_cost_usd.unwrap()
+                );
+                return Ok(progressed);
             }
         }
     }
 
-    // Reviewing phase → run reviewer
+    // Reviewing phase → run reviewer (always parallel — read-only)
     let reviewing: Vec<String> = state
         .tasks
         .iter()
@@ -285,43 +426,86 @@ async fn resume_inflight(
         .map(|(id, _)| id.clone())
         .collect();
 
-    for id in &reviewing {
-        eprintln!("[ralph] resuming review for {id}...");
-        let t = tasks.iter().find(|t| t.id == *id);
-        let (title, desc) = t
-            .map(|t| (t.title.as_str(), t.description.as_str()))
-            .unwrap_or(("unknown", ""));
+    if !reviewing.is_empty() {
+        // Compute diff once for all reviewers.
+        let diff = agent::jj_diff_git().await.unwrap_or_default();
 
-        let ctx = AgentContext::review(id, title, desc);
-        match agent::invoke_agent(AgentRole::Reviewer, &ctx, config, None, registry).await {
-            Ok(r) => {
-                let exec = state.entry(id);
-                match r.status {
-                    AgentStatus::Success => {
-                        exec.phase = Phase::Done;
-                        exec.last_error = None;
-                        progressed = true;
-                        eprintln!("[ralph] {id} — done!");
-                    }
-                    AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                        push_feedback(exec, "Reviewer", &r.text);
-                        reset_or_fail(exec, config);
-                        exec.last_error = Some(reason.clone());
-                        progressed = true;
-                        eprintln!(
-                            "[ralph] {id} review issues: \
-                             {reason}"
-                        );
+        let mut handles = Vec::new();
+        for id in &reviewing {
+            let t = tasks.iter().find(|t| t.id == *id);
+            let (title, desc) = t
+                .map(|t| (t.title.as_str(), t.description.as_str()))
+                .unwrap_or(("unknown", ""));
+            let diff_summary = state
+                .tasks
+                .get(id)
+                .map(|e| {
+                    e.files_changed
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            let ctx = AgentContext::review(id, title, desc, diff_summary, diff.clone());
+            let cfg = config.clone();
+            let reg = registry.clone();
+            let id_owned = id.clone();
+            handles.push(tokio::spawn(async move {
+                let result =
+                    agent::invoke_agent(AgentRole::Reviewer, &ctx, &cfg, None, &reg).await;
+                (id_owned, result)
+            }));
+        }
+
+        for handle in handles {
+            let (id, result) = handle.await?;
+            eprintln!("[ralph] resuming review for {id}...");
+            match result {
+                Ok(r) => {
+                    *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+                    let exec = state.entry(&id);
+                    match r.status {
+                        AgentStatus::Success => {
+                            exec.phase = Phase::Done;
+                            exec.last_error = None;
+                            progressed = true;
+                            eprintln!("[ralph] {id} — done!");
+                        }
+                        AgentStatus::ApprovedWithNits { ref suggestions } => {
+                            exec.phase = Phase::Done;
+                            exec.last_error = None;
+                            progressed = true;
+                            eprintln!("[ralph] {id} — done (nits: {suggestions})");
+                        }
+                        AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                            push_feedback(exec, "Reviewer", &r.text);
+                            reset_or_fail(exec, config);
+                            exec.last_error = Some(reason.clone());
+                            progressed = true;
+                            eprintln!("[ralph] {id} review issues: {reason}");
+                        }
                     }
                 }
+                Err(e) => {
+                    let exec = state.entry(&id);
+                    push_feedback(exec, "Reviewer", &e.to_string());
+                    reset_or_fail(exec, config);
+                    exec.last_error = Some(e.to_string());
+                    progressed = true;
+                    eprintln!("[ralph] reviewer error for {id}: {e}");
+                }
             }
-            Err(e) => {
-                let exec = state.entry(id);
-                push_feedback(exec, "Reviewer", &e.to_string());
-                reset_or_fail(exec, config);
-                exec.last_error = Some(e.to_string());
-                progressed = true;
-                eprintln!("[ralph] reviewer error for {id}: {e}");
+            if config
+                .max_cost_usd
+                .is_some_and(|max| *cumulative_cost > max)
+            {
+                eprintln!(
+                    "[ralph] cost budget exceeded (${:.4} > ${:.4}), stopping.",
+                    *cumulative_cost,
+                    config.max_cost_usd.unwrap()
+                );
+                return Ok(progressed);
             }
         }
     }
@@ -499,6 +683,7 @@ async fn run_group_with_workspaces(
     state: &mut ExecutionState,
     config: &Config,
     registry: &ProcessRegistry,
+    cumulative_cost: &mut f64,
 ) -> Result<()> {
     // Create workspaces and spawn agents
     let mut handles = Vec::new();
@@ -526,7 +711,14 @@ async fn run_group_with_workspaces(
             .get(&t.id)
             .and_then(|e| e.feedback.last())
             .cloned();
-        let cfg = config.clone();
+        let mut cfg = config.clone();
+        if config.workspace.isolate_target_dir {
+            let target_dir = ws_path.join("target");
+            cfg.env.set.insert(
+                "CARGO_TARGET_DIR".to_string(),
+                target_dir.to_string_lossy().to_string(),
+            );
+        }
         let reg = registry.clone();
         handles.push(tokio::spawn(async move {
             let ctx = AgentContext::implement(&id, &title, &desc, fb.as_deref());
@@ -548,19 +740,22 @@ async fn run_group_with_workspaces(
         let exec = state.entry(&id);
         exec.attempts += 1;
         let success = match result {
-            Ok(r) => match &r.status {
-                AgentStatus::Success => {
-                    exec.phase = Phase::Testing;
-                    exec.last_error = None;
-                    true
+            Ok(r) => {
+                *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+                match &r.status {
+                    AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
+                        exec.phase = Phase::Testing;
+                        exec.last_error = None;
+                        true
+                    }
+                    AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                        reset_or_fail(exec, config);
+                        exec.last_error = Some(reason.clone());
+                        eprintln!("[ralph] {id} implement failed: {reason}");
+                        false
+                    }
                 }
-                AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                    reset_or_fail(exec, config);
-                    exec.last_error = Some(reason.clone());
-                    eprintln!("[ralph] {id} implement failed: {reason}");
-                    false
-                }
-            },
+            }
             Err(e) => {
                 reset_or_fail(exec, config);
                 exec.last_error = Some(e.to_string());
@@ -609,6 +804,7 @@ async fn run_group_singleton(
     state: &mut ExecutionState,
     config: &Config,
     registry: &ProcessRegistry,
+    cumulative_cost: &mut f64,
 ) -> Result<()> {
     let t = group[0];
     let pre_files = agent::jj_changed_files().await.unwrap_or_default();
@@ -624,17 +820,20 @@ async fn run_group_singleton(
     let exec = state.entry(&t.id);
     exec.attempts += 1;
     match result {
-        Ok(r) => match &r.status {
-            AgentStatus::Success => {
-                exec.phase = Phase::Testing;
-                exec.last_error = None;
+        Ok(r) => {
+            *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+            match &r.status {
+                AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
+                    exec.phase = Phase::Testing;
+                    exec.last_error = None;
+                }
+                AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                    reset_or_fail(exec, config);
+                    exec.last_error = Some(reason.clone());
+                    eprintln!("[ralph] {} implement failed: {reason}", t.id);
+                }
             }
-            AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                reset_or_fail(exec, config);
-                exec.last_error = Some(reason.clone());
-                eprintln!("[ralph] {} implement failed: {reason}", t.id);
-            }
-        },
+        }
         Err(e) => {
             reset_or_fail(exec, config);
             exec.last_error = Some(e.to_string());
