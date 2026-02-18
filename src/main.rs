@@ -106,6 +106,7 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
         agent::AgentRole::Planner,
         &agent::AgentContext::plan(&input),
         &config,
+        None,
     )
     .await?;
 

@@ -3,6 +3,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkspaceConfig {
+    /// Paths to symlink from project root into each workspace
+    #[serde(default)]
+    pub shared: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Model to use for agent invocations
@@ -14,6 +21,9 @@ pub struct Config {
     /// Directory containing prompt templates
     #[serde(default = "default_prompts_dir")]
     pub prompts_dir: PathBuf,
+    /// Workspace isolation settings
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
 }
 
 fn default_model() -> String {
@@ -52,6 +62,7 @@ impl Default for Config {
             model: default_model(),
             max_attempts: default_max_attempts(),
             prompts_dir: default_prompts_dir(),
+            workspace: WorkspaceConfig::default(),
         }
     }
 }

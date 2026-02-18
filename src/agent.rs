@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -170,10 +170,12 @@ struct ClaudeJsonOutput {
 }
 
 /// Invoke a claude agent with the given role and context.
+/// When `working_dir` is `Some`, the subprocess runs in that directory.
 pub async fn invoke_agent(
     role: AgentRole,
     context: &AgentContext,
     config: &Config,
+    working_dir: Option<&Path>,
 ) -> Result<AgentResult> {
     // Load and interpolate prompt
     let prompt_path = config.prompts_dir.join(role.prompt_filename());
@@ -186,8 +188,8 @@ pub async fn invoke_agent(
 
     // Spawn claude — clear CLAUDECODE env var to allow
     // nesting when ralph is invoked from within claude.
-    let output = TokioCommand::new("claude")
-        .env_remove("CLAUDECODE")
+    let mut cmd = TokioCommand::new("claude");
+    cmd.env_remove("CLAUDECODE")
         .arg("-p")
         .arg(&prompt)
         .arg("--output-format")
@@ -197,7 +199,11 @@ pub async fn invoke_agent(
         .arg("--dangerously-skip-permissions")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+    let output = cmd
         .spawn()
         .context("spawning claude process")?
         .wait_with_output()
@@ -264,6 +270,18 @@ fn parse_agent_status(text: &str) -> AgentStatus {
     }
 }
 
+/// Parse `jj diff --summary` output into a sorted, deduped
+/// list of file paths.
+fn parse_diff_summary(output: &str) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = output
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(_, path)| PathBuf::from(path.trim())))
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
 /// Get all files changed in the working-copy commit relative
 /// to its parent. Covers modifications, additions, and
 /// deletions in a single `jj diff --summary` call.
@@ -275,13 +293,21 @@ pub async fn jj_changed_files() -> Result<Vec<PathBuf>> {
         .output()
         .await?;
 
-    let mut files: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|l| l.split_once(' ').map(|(_, path)| PathBuf::from(path.trim())))
-        .collect();
-    files.sort();
-    files.dedup();
-    Ok(files)
+    Ok(parse_diff_summary(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Get files changed in a specific revision (e.g. a workspace's
+/// working-copy commit viewed from the default workspace via
+/// `ralph-{id}@`).
+pub async fn jj_changed_files_for(revision: &str) -> Result<Vec<PathBuf>> {
+    let output = TokioCommand::new("jj")
+        .args(["diff", "--summary", "-r", revision])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await?;
+
+    Ok(parse_diff_summary(&String::from_utf8_lossy(&output.stdout)))
 }
 
 #[cfg(test)]

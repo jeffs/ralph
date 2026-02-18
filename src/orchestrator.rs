@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::process::Command as TokioCommand;
 
 use crate::agent::{self, AgentContext, AgentRole, AgentStatus};
@@ -10,6 +10,8 @@ use crate::state::{ExecutionState, Phase};
 use crate::task::{self, Task};
 
 use crate::state::TaskExecution;
+
+const WS_DIR: &str = ".ralph";
 
 const STATE_PATH: &str = ".ralph/state.json";
 
@@ -29,6 +31,7 @@ fn reset_or_fail(exec: &mut TaskExecution, config: &Config) {
 pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config) -> Result<()> {
     let state_path = PathBuf::from(STATE_PATH);
     isolate_dirty_tree().await;
+    cleanup_stale_workspaces().await;
 
     for iteration in 1..=max_iterations {
         eprintln!("\n[ralph] === iteration {iteration} ===");
@@ -51,6 +54,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                         .to_string(),
                 },
                 config,
+                None,
             )
             .await?;
 
@@ -125,73 +129,12 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         let groups = scheduler::partition_independent(&ready, &state);
 
         for group in groups {
-            // Snapshot working tree before the group runs
-            let pre_files = agent::jj_changed_files().await.unwrap_or_default();
-            let group_ids: Vec<String> = group.iter().map(|t| t.id.clone()).collect();
+            let use_workspaces = group.len() > 1;
 
-            // Fan out: parallel implementers
-            let implement_handles: Vec<_> = group
-                .iter()
-                .map(|t| {
-                    let id = t.id.clone();
-                    let title = t.title.clone();
-                    let desc = t.description.clone();
-                    let cfg = config.clone();
-                    tokio::spawn(async move {
-                        let ctx = AgentContext::implement(&id, &title, &desc);
-                        let result = agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg).await;
-                        (id, result)
-                    })
-                })
-                .collect();
-
-            // Collect results
-            let mut any_success = false;
-            for handle in implement_handles {
-                let (id, result) = handle.await?;
-                let exec = state.entry(&id);
-                exec.attempts += 1;
-                match result {
-                    Ok(r) => match &r.status {
-                        AgentStatus::Success => {
-                            exec.phase = Phase::Testing;
-                            exec.last_error = None;
-                            any_success = true;
-                        }
-                        AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                            reset_or_fail(exec, config);
-                            exec.last_error = Some(reason.clone());
-                            eprintln!(
-                                "[ralph] {id} implement \
-                                 failed: {reason}"
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        reset_or_fail(exec, config);
-                        exec.last_error = Some(e.to_string());
-                        eprintln!(
-                            "[ralph] agent error for \
-                             {id}: {e}"
-                        );
-                    }
-                }
-            }
-
-            // Snapshot after group completes — attribute
-            // the new files to all tasks in the group.
-            if any_success {
-                let post_files = agent::jj_changed_files().await.unwrap_or_default();
-                let new_files: Vec<PathBuf> = post_files
-                    .into_iter()
-                    .filter(|f| !pre_files.contains(f))
-                    .collect();
-                for id in &group_ids {
-                    let exec = state.entry(id);
-                    exec.files_changed.extend(new_files.iter().cloned());
-                    exec.files_changed.sort();
-                    exec.files_changed.dedup();
-                }
+            if use_workspaces {
+                run_group_with_workspaces(&group, &mut state, config).await?;
+            } else {
+                run_group_singleton(&group, &mut state, config).await?;
             }
 
             state.save(&state_path).await?;
@@ -241,7 +184,7 @@ async fn resume_inflight(
             .unwrap_or_default();
 
         let ctx = AgentContext::test(id, files);
-        match agent::invoke_agent(AgentRole::Tester, &ctx, config).await {
+        match agent::invoke_agent(AgentRole::Tester, &ctx, config, None).await {
             Ok(r) => {
                 let exec = state.entry(id);
                 match r.status {
@@ -287,7 +230,7 @@ async fn resume_inflight(
             .unwrap_or(("unknown", ""));
 
         let ctx = AgentContext::review(id, title, desc);
-        match agent::invoke_agent(AgentRole::Reviewer, &ctx, config).await {
+        match agent::invoke_agent(AgentRole::Reviewer, &ctx, config, None).await {
             Ok(r) => {
                 let exec = state.entry(id);
                 match r.status {
@@ -351,4 +294,269 @@ async fn isolate_dirty_tree() {
             .status()
             .await;
     }
+}
+
+// ── Workspace management ──────────────────────────────────
+
+/// Remove any `ralph-*` workspaces left over from interrupted
+/// runs. Parses `jj workspace list` and forgets/removes each.
+async fn cleanup_stale_workspaces() {
+    let Ok(output) = TokioCommand::new("jj")
+        .args(["workspace", "list"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+    else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        // Format: "workspace-name: <change-id> <description>"
+        let Some(name) = line.split(':').next().map(str::trim) else {
+            continue;
+        };
+        if !name.starts_with("ralph-") {
+            continue;
+        }
+        eprintln!("[ralph] cleaning up stale workspace {name}");
+        let _ = TokioCommand::new("jj")
+            .args(["workspace", "forget", name])
+            .status()
+            .await;
+        let ws_dir = PathBuf::from(WS_DIR).join(format!("ws-{}", &name["ralph-".len()..]));
+        if ws_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&ws_dir).await;
+        }
+    }
+}
+
+/// Create a jj workspace for a task. Returns the workspace
+/// directory path. Symlinks `config.workspace.shared` entries
+/// from the project root.
+async fn create_workspace(task_id: &str, config: &Config) -> Result<PathBuf> {
+    let ws_name = format!("ralph-{task_id}");
+    let ws_dir = PathBuf::from(WS_DIR).join(format!("ws-{task_id}"));
+
+    let status = TokioCommand::new("jj")
+        .args(["workspace", "add", &ws_dir.to_string_lossy(), "--name", &ws_name])
+        .status()
+        .await
+        .context("jj workspace add")?;
+
+    if !status.success() {
+        bail!("jj workspace add failed for {ws_name}");
+    }
+
+    // Symlink shared paths from the project root
+    let project_root = std::env::current_dir().context("getting project root")?;
+    for shared in &config.workspace.shared {
+        let src = project_root.join(shared);
+        let dst = ws_dir.join(shared);
+        if src.exists() {
+            // Ensure parent dirs exist
+            if let Some(parent) = dst.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            // Remove existing entry if any (workspace add may
+            // have checked out the file)
+            let _ = tokio::fs::remove_file(&dst).await;
+            let _ = tokio::fs::remove_dir_all(&dst).await;
+            tokio::fs::symlink(&src, &dst)
+                .await
+                .with_context(|| format!("symlinking {} → {}", src.display(), dst.display()))?;
+        }
+    }
+
+    let abs = tokio::fs::canonicalize(&ws_dir)
+        .await
+        .unwrap_or_else(|_| project_root.join(&ws_dir));
+    Ok(abs)
+}
+
+/// Tear down a workspace: forget it and optionally abandon its
+/// changes, then remove the directory.
+async fn teardown_workspace(task_id: &str, abandon: bool) {
+    let ws_name = format!("ralph-{task_id}");
+    if abandon {
+        let _ = TokioCommand::new("jj")
+            .args(["abandon", &format!("{ws_name}@")])
+            .status()
+            .await;
+    }
+    let _ = TokioCommand::new("jj")
+        .args(["workspace", "forget", &ws_name])
+        .status()
+        .await;
+    let ws_dir = PathBuf::from(WS_DIR).join(format!("ws-{task_id}"));
+    if ws_dir.exists() {
+        let _ = tokio::fs::remove_dir_all(&ws_dir).await;
+    }
+}
+
+// ── Group execution strategies ────────────────────────────
+
+/// Run a multi-task group with per-task jj workspaces for
+/// isolation. Each agent gets its own working copy; after
+/// completion, successful changes are squashed back into the
+/// default workspace.
+async fn run_group_with_workspaces(
+    group: &[&Task],
+    state: &mut ExecutionState,
+    config: &Config,
+) -> Result<()> {
+    // Create workspaces and spawn agents
+    let mut handles = Vec::new();
+    let mut created_ws: Vec<String> = Vec::new();
+
+    for &t in group {
+        let ws_path = match create_workspace(&t.id, config).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[ralph] workspace creation failed for {}: {e}", t.id);
+                let exec = state.entry(&t.id);
+                exec.attempts += 1;
+                reset_or_fail(exec, config);
+                exec.last_error = Some(format!("workspace creation: {e}"));
+                continue;
+            }
+        };
+        created_ws.push(t.id.clone());
+
+        let id = t.id.clone();
+        let title = t.title.clone();
+        let desc = t.description.clone();
+        let cfg = config.clone();
+        handles.push(tokio::spawn(async move {
+            let ctx = AgentContext::implement(&id, &title, &desc);
+            let result = agent::invoke_agent(
+                AgentRole::Implementer,
+                &ctx,
+                &cfg,
+                Some(&ws_path),
+            )
+            .await;
+            (id, result)
+        }));
+    }
+
+    // Collect results
+    struct Outcome {
+        id: String,
+        success: bool,
+    }
+    let mut outcomes = Vec::new();
+
+    for handle in handles {
+        let (id, result) = handle.await?;
+        let exec = state.entry(&id);
+        exec.attempts += 1;
+        let success = match result {
+            Ok(r) => match &r.status {
+                AgentStatus::Success => {
+                    exec.phase = Phase::Testing;
+                    exec.last_error = None;
+                    true
+                }
+                AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                    reset_or_fail(exec, config);
+                    exec.last_error = Some(reason.clone());
+                    eprintln!("[ralph] {id} implement failed: {reason}");
+                    false
+                }
+            },
+            Err(e) => {
+                reset_or_fail(exec, config);
+                exec.last_error = Some(e.to_string());
+                eprintln!("[ralph] agent error for {id}: {e}");
+                false
+            }
+        };
+        outcomes.push(Outcome { id, success });
+    }
+
+    // Merge successful workspaces, abandon failed ones
+    for outcome in &outcomes {
+        if !created_ws.contains(&outcome.id) {
+            continue;
+        }
+        if outcome.success {
+            // Attribute files precisely from workspace
+            let rev = format!("ralph-{}@", outcome.id);
+            let files = agent::jj_changed_files_for(&rev)
+                .await
+                .unwrap_or_default();
+            let exec = state.entry(&outcome.id);
+            exec.files_changed.extend(files);
+            exec.files_changed.sort();
+            exec.files_changed.dedup();
+
+            // Squash workspace changes into default working copy
+            let squash_status = TokioCommand::new("jj")
+                .args(["squash", "--from", &rev, "--into", "@"])
+                .status()
+                .await;
+            if let Err(e) = squash_status {
+                eprintln!(
+                    "[ralph] squash failed for {}: {e}",
+                    outcome.id
+                );
+            }
+            teardown_workspace(&outcome.id, false).await;
+        } else {
+            teardown_workspace(&outcome.id, true).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Run a singleton group directly in the default workspace
+/// (no workspace overhead).
+async fn run_group_singleton(
+    group: &[&Task],
+    state: &mut ExecutionState,
+    config: &Config,
+) -> Result<()> {
+    let t = group[0];
+    let pre_files = agent::jj_changed_files().await.unwrap_or_default();
+
+    let ctx = AgentContext::implement(&t.id, &t.title, &t.description);
+    let result = agent::invoke_agent(AgentRole::Implementer, &ctx, config, None).await;
+
+    let exec = state.entry(&t.id);
+    exec.attempts += 1;
+    match result {
+        Ok(r) => match &r.status {
+            AgentStatus::Success => {
+                exec.phase = Phase::Testing;
+                exec.last_error = None;
+            }
+            AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                reset_or_fail(exec, config);
+                exec.last_error = Some(reason.clone());
+                eprintln!("[ralph] {} implement failed: {reason}", t.id);
+            }
+        },
+        Err(e) => {
+            reset_or_fail(exec, config);
+            exec.last_error = Some(e.to_string());
+            eprintln!("[ralph] agent error for {}: {e}", t.id);
+        }
+    }
+
+    // Attribute files via pre/post snapshot
+    if exec.phase == Phase::Testing {
+        let post_files = agent::jj_changed_files().await.unwrap_or_default();
+        let new_files: Vec<PathBuf> = post_files
+            .into_iter()
+            .filter(|f| !pre_files.contains(f))
+            .collect();
+        let exec = state.entry(&t.id);
+        exec.files_changed.extend(new_files);
+        exec.files_changed.sort();
+        exec.files_changed.dedup();
+    }
+
+    Ok(())
 }

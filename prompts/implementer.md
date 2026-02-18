@@ -20,6 +20,7 @@ and make the minimal code changes to complete it.
    cargo test, npm test, etc.), run it to validate your
    changes compile and don't break existing tests.
 5. Do not commit (no `jj commit` or `jj new`). Ralph handles commits.
+6. Do not change directories (`cd`). Ralph manages the working directory.
 
 ## Output Contract
 
