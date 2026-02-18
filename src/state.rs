@@ -19,6 +19,10 @@ pub struct TaskExecution {
     pub phase: Phase,
     pub last_error: Option<String>,
     pub files_changed: Vec<PathBuf>,
+    /// Full agent response text from failed tester/reviewer runs,
+    /// used to give the implementer actionable feedback on retry.
+    #[serde(default)]
+    pub feedback: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +41,7 @@ impl Default for TaskExecution {
             phase: Phase::Pending,
             last_error: None,
             files_changed: Vec::new(),
+            feedback: Vec::new(),
         }
     }
 }
@@ -127,5 +132,40 @@ mod tests {
             loaded.tasks["T2"].last_error.as_deref(),
             Some("compile error")
         );
+    }
+
+    #[test]
+    fn backward_compat_deserialize_without_feedback() {
+        // Old state.json without the feedback field must still load.
+        let json = r#"{
+            "tasks": {
+                "T1": {
+                    "attempts": 1,
+                    "phase": "Pending",
+                    "last_error": null,
+                    "files_changed": []
+                }
+            }
+        }"#;
+        let state: ExecutionState = serde_json::from_str(json).unwrap();
+        assert!(state.tasks["T1"].feedback.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_json_with_feedback() {
+        let mut state = ExecutionState::default();
+        let exec = state.entry("T1");
+        exec.phase = Phase::Pending;
+        exec.attempts = 2;
+        exec.feedback = vec![
+            "[Tester · attempt 1] compile error in main.rs".into(),
+            "[Reviewer · attempt 2] missing error handling".into(),
+        ];
+
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: ExecutionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.tasks["T1"].feedback.len(), 2);
+        assert!(loaded.tasks["T1"].feedback[0].contains("Tester"));
+        assert!(loaded.tasks["T1"].feedback[1].contains("Reviewer"));
     }
 }

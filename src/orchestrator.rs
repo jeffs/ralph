@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use tokio::process::Command as TokioCommand;
 
-use crate::agent::{self, AgentContext, AgentRole, AgentStatus};
+use crate::agent::{
+    self, AgentContext, AgentRole, AgentStatus, FEEDBACK_MAX_LEN, truncate_feedback,
+};
 use crate::config::Config;
 use crate::scheduler;
 use crate::state::{ExecutionState, Phase};
@@ -23,6 +25,14 @@ fn reset_or_fail(exec: &mut TaskExecution, config: &Config) {
     } else {
         exec.phase = Phase::Pending;
     }
+}
+
+/// Record full agent response text as feedback so the
+/// implementer can see what went wrong on the next attempt.
+fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str) {
+    let prefix = format!("[{phase_label} · attempt {}]", exec.attempts);
+    let body = truncate_feedback(full_text, FEEDBACK_MAX_LEN);
+    exec.feedback.push(format!("{prefix}\n{body}"));
 }
 
 /// Main orchestration loop. Iterates until convergence
@@ -146,9 +156,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             // Checkpoint: seal the current working-copy change
             // and start a fresh one for the next group.
             let has_changes = state.tasks.values().any(|e| !e.files_changed.is_empty());
-            if has_changes
-                && let Err(e) = jj_checkpoint().await
-            {
+            if has_changes && let Err(e) = jj_checkpoint().await {
                 eprintln!("[ralph] jj commit skipped: {e}");
             }
         }
@@ -194,6 +202,7 @@ async fn resume_inflight(
                         progressed = true;
                     }
                     AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                        push_feedback(exec, "Tester", &r.text);
                         reset_or_fail(exec, config);
                         exec.last_error = Some(reason.clone());
                         progressed = true;
@@ -206,6 +215,7 @@ async fn resume_inflight(
             }
             Err(e) => {
                 let exec = state.entry(id);
+                push_feedback(exec, "Tester", &e.to_string());
                 reset_or_fail(exec, config);
                 exec.last_error = Some(e.to_string());
                 progressed = true;
@@ -241,6 +251,7 @@ async fn resume_inflight(
                         eprintln!("[ralph] {id} — done!");
                     }
                     AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                        push_feedback(exec, "Reviewer", &r.text);
                         reset_or_fail(exec, config);
                         exec.last_error = Some(reason.clone());
                         progressed = true;
@@ -253,6 +264,7 @@ async fn resume_inflight(
             }
             Err(e) => {
                 let exec = state.entry(id);
+                push_feedback(exec, "Reviewer", &e.to_string());
                 reset_or_fail(exec, config);
                 exec.last_error = Some(e.to_string());
                 progressed = true;
@@ -429,9 +441,14 @@ async fn run_group_with_workspaces(
         let id = t.id.clone();
         let title = t.title.clone();
         let desc = t.description.clone();
+        let fb = state
+            .tasks
+            .get(&t.id)
+            .and_then(|e| e.feedback.last())
+            .cloned();
         let cfg = config.clone();
         handles.push(tokio::spawn(async move {
-            let ctx = AgentContext::implement(&id, &title, &desc);
+            let ctx = AgentContext::implement(&id, &title, &desc, fb.as_deref());
             let result =
                 agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg, Some(&ws_path)).await;
             (id, result)
@@ -514,7 +531,12 @@ async fn run_group_singleton(
     let t = group[0];
     let pre_files = agent::jj_changed_files().await.unwrap_or_default();
 
-    let ctx = AgentContext::implement(&t.id, &t.title, &t.description);
+    let last_feedback = state
+        .tasks
+        .get(&t.id)
+        .and_then(|e| e.feedback.last())
+        .map(|s| s.as_str());
+    let ctx = AgentContext::implement(&t.id, &t.title, &t.description, last_feedback);
     let result = agent::invoke_agent(AgentRole::Implementer, &ctx, config, None).await;
 
     let exec = state.entry(&t.id);

@@ -45,6 +45,7 @@ pub enum AgentContext {
         task_id: String,
         task_title: String,
         task_description: String,
+        feedback: Option<String>,
     },
     /// Tester: validate recent changes
     Test {
@@ -66,11 +67,12 @@ impl AgentContext {
         }
     }
 
-    pub fn implement(id: &str, title: &str, description: &str) -> Self {
+    pub fn implement(id: &str, title: &str, description: &str, feedback: Option<&str>) -> Self {
         Self::Implement {
             task_id: id.to_string(),
             task_title: title.to_string(),
             task_description: description.to_string(),
+            feedback: feedback.map(String::from),
         }
     }
 
@@ -97,10 +99,22 @@ impl AgentContext {
                 task_id,
                 task_title,
                 task_description,
-            } => template
-                .replace("{{TASK_ID}}", task_id)
-                .replace("{{TASK_TITLE}}", task_title)
-                .replace("{{TASK_DESCRIPTION}}", task_description),
+                feedback,
+            } => {
+                let feedback_section = match feedback {
+                    Some(fb) => format!(
+                        "\n## Previous Attempt Feedback\n\n\
+                         The previous implementation attempt failed. \
+                         Address the following issues:\n\n{fb}\n"
+                    ),
+                    None => String::new(),
+                };
+                template
+                    .replace("{{TASK_ID}}", task_id)
+                    .replace("{{TASK_TITLE}}", task_title)
+                    .replace("{{TASK_DESCRIPTION}}", task_description)
+                    .replace("{{FEEDBACK}}", &feedback_section)
+            }
             Self::Test {
                 task_id,
                 files_changed,
@@ -345,6 +359,23 @@ fn truncate_reason(s: String) -> String {
     }
 }
 
+/// Maximum length for feedback text forwarded to the implementer.
+pub(crate) const FEEDBACK_MAX_LEN: usize = 8000;
+
+/// Truncate feedback text at a char boundary, appending "..." if needed.
+pub(crate) fn truncate_feedback(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+    let mut end = max_len;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = text[..end].to_string();
+    truncated.push_str("...");
+    truncated
+}
+
 /// Parse `jj diff --summary` output into a sorted, deduped
 /// list of file paths.
 fn parse_diff_summary(output: &str) -> Vec<PathBuf> {
@@ -527,8 +558,42 @@ Done!"#
 
     #[test]
     fn interpolate_implement() {
-        let ctx = AgentContext::implement("T1", "Fix bug", "desc");
-        let result = ctx.interpolate("Task {{TASK_ID}}: {{TASK_TITLE}} — {{TASK_DESCRIPTION}}");
+        let ctx = AgentContext::implement("T1", "Fix bug", "desc", None);
+        let result =
+            ctx.interpolate("Task {{TASK_ID}}: {{TASK_TITLE}} — {{TASK_DESCRIPTION}}{{FEEDBACK}}");
         assert_eq!(result, "Task T1: Fix bug — desc");
+    }
+
+    #[test]
+    fn interpolate_implement_with_feedback() {
+        let ctx = AgentContext::implement("T1", "Fix bug", "desc", Some("compile error on line 5"));
+        let result = ctx.interpolate("{{TASK_ID}}{{FEEDBACK}}## Instructions");
+        assert!(result.contains("## Previous Attempt Feedback"));
+        assert!(result.contains("compile error on line 5"));
+        assert!(result.contains("## Instructions"));
+    }
+
+    #[test]
+    fn truncate_feedback_within_limit() {
+        let text = "short";
+        assert_eq!(truncate_feedback(text, 100), "short");
+    }
+
+    #[test]
+    fn truncate_feedback_at_boundary() {
+        let text = "a".repeat(100);
+        let result = truncate_feedback(&text, 50);
+        assert_eq!(result.len(), 53); // 50 + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_feedback_respects_char_boundary() {
+        // 'é' is 2 bytes in UTF-8
+        let text = "é".repeat(100); // 200 bytes
+        let result = truncate_feedback(&text, 51); // would split 'é' at byte 51
+        assert!(result.ends_with("..."));
+        // Must not panic or produce invalid UTF-8
+        assert!(result.len() <= 54); // 50 (rounded down) + "..."
     }
 }
