@@ -183,6 +183,18 @@ struct ClaudeJsonOutput {
     result: Option<String>,
 }
 
+/// Send SIGTERM to all processes in the given process group.
+/// Ignores errors (the group may have already exited).
+async fn kill_process_group(pgid: u32) {
+    let _ = TokioCommand::new("kill")
+        .args(["-TERM", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
 /// Invoke a claude agent with the given role and context.
 /// When `working_dir` is `Some`, the subprocess runs in that directory.
 pub async fn invoke_agent(
@@ -200,10 +212,13 @@ pub async fn invoke_agent(
 
     eprintln!("[ralph] invoking {} agent...", role.label());
 
-    // Spawn claude — clear CLAUDECODE env var to allow
-    // nesting when ralph is invoked from within claude.
+    // Spawn claude in its own process group so that child
+    // processes (rust-analyzer, LSP servers, cargo) are
+    // cleaned up when the agent finishes, rather than being
+    // reparented to PID 1 as orphans.
     let mut cmd = TokioCommand::new("claude");
     cmd.env_remove("CLAUDECODE")
+        .env("CARGO_TARGET_DIR", "target/ralph")
         .arg("-p")
         .arg(&prompt)
         .arg("--output-format")
@@ -217,12 +232,22 @@ pub async fn invoke_agent(
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
-    let output = cmd
-        .spawn()
-        .context("spawning claude process")?
-        .wait_with_output()
-        .await
-        .context("waiting for claude process")?;
+    cmd.process_group(0);
+    let child = cmd.spawn().context("spawning claude process")?;
+    let child_pid = child.id().expect("child has pid immediately after spawn");
+
+    // Race the agent against Ctrl+C so we always clean up the
+    // child's process group, even if Ralph is interrupted.
+    let output: std::process::Output = tokio::select! {
+        result = child.wait_with_output() => result.context("waiting for claude process")?,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\n[ralph] interrupted, killing {} agent...", role.label());
+            kill_process_group(child_pid).await;
+            std::process::exit(130); // 128 + SIGINT
+        }
+    };
+
+    kill_process_group(child_pid).await;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.is_empty() {
