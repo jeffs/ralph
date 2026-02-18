@@ -155,7 +155,8 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
             // Checkpoint: seal the current working-copy change
             // and start a fresh one for the next group.
-            if let Err(e) = jj_checkpoint().await {
+            let detail = checkpoint_description(&group, &state);
+            if let Err(e) = jj_checkpoint(&detail).await {
                 eprintln!("[ralph] jj commit skipped: {e}");
             }
         }
@@ -275,15 +276,38 @@ async fn resume_inflight(
     Ok(progressed)
 }
 
+/// Build a checkpoint commit message summarizing what the
+/// group accomplished, e.g. "ralph: BUILD-1 (testing), UI-2 (done)".
+fn checkpoint_description(group: &[&Task], state: &ExecutionState) -> String {
+    let parts: Vec<String> = group
+        .iter()
+        .map(|t| {
+            let phase = state
+                .tasks
+                .get(&t.id)
+                .map(|e| match e.phase {
+                    Phase::Pending => "pending",
+                    Phase::Testing => "testing",
+                    Phase::Reviewing => "reviewing",
+                    Phase::Done => "done",
+                    Phase::Failed => "failed",
+                })
+                .unwrap_or("unknown");
+            format!("{} ({})", t.id, phase)
+        })
+        .collect();
+    format!("ralph: {}", parts.join(", "))
+}
+
 /// Seal the current working-copy change and start a fresh
 /// one, but only if there are actual changes to commit.
-async fn jj_checkpoint() -> Result<()> {
+async fn jj_checkpoint(description: &str) -> Result<()> {
     let files = agent::jj_changed_files().await?;
     if files.is_empty() {
         return Ok(());
     }
     TokioCommand::new("jj")
-        .args(["commit", "-m", "ralph: checkpoint progress"])
+        .args(["commit", "-m", description])
         .status()
         .await
         .context("jj commit")?;
