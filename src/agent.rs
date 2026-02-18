@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -249,7 +250,7 @@ pub async fn invoke_agent(
     // reparented to PID 1 as orphans.
     let mut cmd = TokioCommand::new("claude");
     cmd.env_remove("CLAUDECODE")
-        .env("CARGO_TARGET_DIR", "target/ralph")
+        .env_remove("CARGO_TARGET_DIR")
         .arg("-p")
         .arg(&prompt)
         .arg("--output-format")
@@ -273,10 +274,25 @@ pub async fn invoke_agent(
     let child_pid = child.id().expect("child has pid immediately after spawn");
 
     registry.register(child_pid);
-    let output = child
-        .wait_with_output()
-        .await
-        .context("waiting for claude process")?;
+    let timeout = Duration::from_secs(config.agent_timeout_secs);
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => result.context("waiting for claude process")?,
+        Err(_) => {
+            eprintln!(
+                "[ralph] {} agent timed out after {}s, killing...",
+                role.label(),
+                config.agent_timeout_secs,
+            );
+            kill_process_group(child_pid).await;
+            registry.deregister(child_pid);
+            return Ok(AgentResult {
+                text: String::new(),
+                status: AgentStatus::Failure {
+                    reason: format!("agent timed out after {}s", config.agent_timeout_secs,),
+                },
+            });
+        }
+    };
     kill_process_group(child_pid).await;
     registry.deregister(child_pid);
 

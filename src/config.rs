@@ -35,6 +35,9 @@ pub struct Config {
     /// Max attempts per task before marking failed
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
+    /// Wall-clock timeout per agent invocation in seconds
+    #[serde(default = "default_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
     /// Directory containing prompt templates
     #[serde(default = "default_prompts_dir")]
     pub prompts_dir: PathBuf,
@@ -49,6 +52,10 @@ fn default_model() -> String {
 
 fn default_max_attempts() -> u32 {
     3
+}
+
+fn default_agent_timeout_secs() -> u64 {
+    1800 // 30 minutes
 }
 
 fn default_prompts_dir() -> PathBuf {
@@ -79,6 +86,7 @@ impl Default for Config {
             model: default_model(),
             models: ModelConfig::default(),
             max_attempts: default_max_attempts(),
+            agent_timeout_secs: default_agent_timeout_secs(),
             prompts_dir: default_prompts_dir(),
             workspace: WorkspaceConfig::default(),
         }
