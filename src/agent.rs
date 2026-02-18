@@ -229,6 +229,8 @@ pub async fn invoke_agent(
         .arg("--strict-mcp-config")
         .arg("--mcp-config")
         .arg(r#"{"mcpServers":{}}"#)
+        .arg("--settings")
+        .arg(r#"{"enabledPlugins":{"rust-analyzer-lsp@claude-plugins-official":false,"typescript-lsp@claude-plugins-official":false,"pyright-lsp@claude-plugins-official":false}}"#)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
