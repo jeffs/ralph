@@ -114,6 +114,11 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
     )
     .await?;
 
+    if registry.is_shutdown() {
+        eprintln!("[ralph] shutdown requested, aborting plan.");
+        return Ok(());
+    }
+
     // The planner writes tasks.jsonl directly via claude's
     // file access. But we also extract any JSONL from the
     // result as a fallback.

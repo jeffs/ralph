@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -24,6 +25,16 @@ pub struct ModelConfig {
     pub reviewer: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EnvConfig {
+    /// Additional env var names to forward beyond the hardcoded essentials
+    #[serde(default)]
+    pub passthrough: Vec<String>,
+    /// Explicit key=value env var overrides
+    #[serde(default)]
+    pub set: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Default model for all agent roles
@@ -38,12 +49,18 @@ pub struct Config {
     /// Wall-clock timeout per agent invocation in seconds
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
+    /// Idle timeout per agent invocation in seconds
+    #[serde(default = "default_agent_idle_timeout_secs")]
+    pub agent_idle_timeout_secs: u64,
     /// Directory containing prompt templates
     #[serde(default = "default_prompts_dir")]
     pub prompts_dir: PathBuf,
     /// Workspace isolation settings
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    /// Environment variable forwarding and override configuration
+    #[serde(default)]
+    pub env: EnvConfig,
 }
 
 fn default_model() -> String {
@@ -56,6 +73,10 @@ fn default_max_attempts() -> u32 {
 
 fn default_agent_timeout_secs() -> u64 {
     1800 // 30 minutes
+}
+
+fn default_agent_idle_timeout_secs() -> u64 {
+    180
 }
 
 fn default_prompts_dir() -> PathBuf {
@@ -87,8 +108,10 @@ impl Default for Config {
             models: ModelConfig::default(),
             max_attempts: default_max_attempts(),
             agent_timeout_secs: default_agent_timeout_secs(),
+            agent_idle_timeout_secs: default_agent_idle_timeout_secs(),
             prompts_dir: default_prompts_dir(),
             workspace: WorkspaceConfig::default(),
+            env: EnvConfig::default(),
         }
     }
 }
@@ -184,5 +207,28 @@ reviewer = "opus"
         assert_eq!(config.model_for("implementer"), "sonnet");
         assert_eq!(config.model_for("tester"), "sonnet");
         assert_eq!(config.model_for("reviewer"), "opus");
+    }
+
+    #[test]
+    fn deserialize_agent_idle_timeout_secs() {
+        let toml_str = r#"agent_idle_timeout_secs = 60"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.agent_idle_timeout_secs, 60);
+    }
+
+    #[test]
+    fn deserialize_env_config() {
+        let toml_str = r#"
+[env]
+passthrough = ["MY_TOKEN", "CUSTOM_VAR"]
+
+[env.set]
+FOO = "bar"
+BAZ = "qux"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.env.passthrough, vec!["MY_TOKEN", "CUSTOM_VAR"]);
+        assert_eq!(config.env.set.get("FOO").map(|s| s.as_str()), Some("bar"));
+        assert_eq!(config.env.set.get("BAZ").map(|s| s.as_str()), Some("qux"));
     }
 }

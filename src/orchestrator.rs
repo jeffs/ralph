@@ -29,8 +29,8 @@ pub(crate) fn spawn_signal_handler(registry: ProcessRegistry) {
                 eprintln!("\n[ralph] terminated, cleaning up agents...");
             }
         }
+        registry.request_shutdown();
         registry.kill_all().await;
-        std::process::exit(130);
     });
 }
 
@@ -67,7 +67,14 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
     cleanup_stale_workspaces().await;
 
     for iteration in 1..=max_iterations {
+        if registry.is_shutdown() {
+            eprintln!("[ralph] shutdown requested, saving state...");
+            return Ok(());
+        }
+
         eprintln!("\n[ralph] === iteration {iteration} ===");
+
+        registry.audit_and_kill_orphans().await;
 
         let tasks = task::load_tasks(tasks_path).await?;
         task::validate_deps(&tasks)?;
@@ -91,6 +98,12 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                 &registry,
             )
             .await?;
+
+            if registry.is_shutdown() {
+                eprintln!("[ralph] shutdown requested, saving state...");
+                state.save(&state_path).await?;
+                return Ok(());
+            }
 
             match review.status {
                 AgentStatus::Success => {
@@ -117,6 +130,11 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         // Resume interrupted in-flight tasks before
         // scheduling new work.
         let made_progress = resume_inflight(&tasks, &mut state, config, &registry).await?;
+        if registry.is_shutdown() {
+            eprintln!("[ralph] shutdown requested, saving state...");
+            state.save(&state_path).await?;
+            return Ok(());
+        }
         if made_progress {
             state.save(&state_path).await?;
             // Re-evaluate from the top — deps may have
@@ -173,9 +191,19 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
             state.save(&state_path).await?;
 
+            if registry.is_shutdown() {
+                eprintln!("[ralph] shutdown requested, saving state...");
+                return Ok(());
+            }
+
             // Advance any tasks now at Testing/Reviewing
             resume_inflight(&tasks, &mut state, config, &registry).await?;
             state.save(&state_path).await?;
+
+            if registry.is_shutdown() {
+                eprintln!("[ralph] shutdown requested, saving state...");
+                return Ok(());
+            }
 
             // Checkpoint: seal the current working-copy change
             // and start a fresh one for the next group.
