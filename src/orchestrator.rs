@@ -155,8 +155,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
             // Checkpoint: seal the current working-copy change
             // and start a fresh one for the next group.
-            let has_changes = state.tasks.values().any(|e| !e.files_changed.is_empty());
-            if has_changes && let Err(e) = jj_checkpoint().await {
+            if let Err(e) = jj_checkpoint().await {
                 eprintln!("[ralph] jj commit skipped: {e}");
             }
         }
@@ -277,9 +276,12 @@ async fn resume_inflight(
 }
 
 /// Seal the current working-copy change and start a fresh
-/// one. All modifications agents made are captured
-/// automatically — no selective staging needed.
+/// one, but only if there are actual changes to commit.
 async fn jj_checkpoint() -> Result<()> {
+    let files = agent::jj_changed_files().await?;
+    if files.is_empty() {
+        return Ok(());
+    }
     TokioCommand::new("jj")
         .args(["commit", "-m", "ralph: checkpoint progress"])
         .status()
