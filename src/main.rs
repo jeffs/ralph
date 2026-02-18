@@ -101,12 +101,16 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
     let ralph_dir = PathBuf::from(".ralph");
     tokio::fs::create_dir_all(&ralph_dir).await?;
 
+    let registry = agent::ProcessRegistry::default();
+    orchestrator::spawn_signal_handler(registry.clone());
+
     let tasks_path = ralph_dir.join("tasks.jsonl");
     let result = agent::invoke_agent(
         agent::AgentRole::Planner,
         &agent::AgentContext::plan(&input),
         &config,
         None,
+        &registry,
     )
     .await?;
 

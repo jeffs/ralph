@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use tokio::process::Command as TokioCommand;
 
 use crate::agent::{
-    self, AgentContext, AgentRole, AgentStatus, FEEDBACK_MAX_LEN, truncate_feedback,
+    self, AgentContext, AgentRole, AgentStatus, FEEDBACK_MAX_LEN, ProcessRegistry,
+    truncate_feedback,
 };
 use crate::config::Config;
 use crate::scheduler;
@@ -12,6 +13,26 @@ use crate::state::{ExecutionState, Phase};
 use crate::task::{self, Task};
 
 use crate::state::TaskExecution;
+
+/// Install a background task that listens for SIGINT and SIGTERM,
+/// kills all registered process groups, then exits.
+pub(crate) fn spawn_signal_handler(registry: ProcessRegistry) {
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\n[ralph] interrupted, cleaning up agents...");
+            }
+            _ = sigterm.recv() => {
+                eprintln!("\n[ralph] terminated, cleaning up agents...");
+            }
+        }
+        registry.kill_all().await;
+        std::process::exit(130);
+    });
+}
 
 const WS_DIR: &str = ".ralph";
 
@@ -40,6 +61,8 @@ fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str) {
 /// (max attempts exceeded), or iteration cap.
 pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config) -> Result<()> {
     let state_path = PathBuf::from(STATE_PATH);
+    let registry = ProcessRegistry::default();
+    spawn_signal_handler(registry.clone());
     isolate_dirty_tree().await;
     cleanup_stale_workspaces().await;
 
@@ -65,6 +88,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                 },
                 config,
                 None,
+                &registry,
             )
             .await?;
 
@@ -92,7 +116,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
         // Resume interrupted in-flight tasks before
         // scheduling new work.
-        let made_progress = resume_inflight(&tasks, &mut state, config).await?;
+        let made_progress = resume_inflight(&tasks, &mut state, config, &registry).await?;
         if made_progress {
             state.save(&state_path).await?;
             // Re-evaluate from the top — deps may have
@@ -142,15 +166,15 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             let use_workspaces = group.len() > 1;
 
             if use_workspaces {
-                run_group_with_workspaces(&group, &mut state, config).await?;
+                run_group_with_workspaces(&group, &mut state, config, &registry).await?;
             } else {
-                run_group_singleton(&group, &mut state, config).await?;
+                run_group_singleton(&group, &mut state, config, &registry).await?;
             }
 
             state.save(&state_path).await?;
 
             // Advance any tasks now at Testing/Reviewing
-            resume_inflight(&tasks, &mut state, config).await?;
+            resume_inflight(&tasks, &mut state, config, &registry).await?;
             state.save(&state_path).await?;
 
             // Checkpoint: seal the current working-copy change
@@ -172,6 +196,7 @@ async fn resume_inflight(
     tasks: &[Task],
     state: &mut ExecutionState,
     config: &Config,
+    registry: &ProcessRegistry,
 ) -> Result<bool> {
     let mut progressed = false;
 
@@ -192,7 +217,7 @@ async fn resume_inflight(
             .unwrap_or_default();
 
         let ctx = AgentContext::test(id, files);
-        match agent::invoke_agent(AgentRole::Tester, &ctx, config, None).await {
+        match agent::invoke_agent(AgentRole::Tester, &ctx, config, None, registry).await {
             Ok(r) => {
                 let exec = state.entry(id);
                 match r.status {
@@ -240,7 +265,7 @@ async fn resume_inflight(
             .unwrap_or(("unknown", ""));
 
         let ctx = AgentContext::review(id, title, desc);
-        match agent::invoke_agent(AgentRole::Reviewer, &ctx, config, None).await {
+        match agent::invoke_agent(AgentRole::Reviewer, &ctx, config, None, registry).await {
             Ok(r) => {
                 let exec = state.entry(id);
                 match r.status {
@@ -445,6 +470,7 @@ async fn run_group_with_workspaces(
     group: &[&Task],
     state: &mut ExecutionState,
     config: &Config,
+    registry: &ProcessRegistry,
 ) -> Result<()> {
     // Create workspaces and spawn agents
     let mut handles = Vec::new();
@@ -473,10 +499,11 @@ async fn run_group_with_workspaces(
             .and_then(|e| e.feedback.last())
             .cloned();
         let cfg = config.clone();
+        let reg = registry.clone();
         handles.push(tokio::spawn(async move {
             let ctx = AgentContext::implement(&id, &title, &desc, fb.as_deref());
             let result =
-                agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg, Some(&ws_path)).await;
+                agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg, Some(&ws_path), &reg).await;
             (id, result)
         }));
     }
@@ -553,6 +580,7 @@ async fn run_group_singleton(
     group: &[&Task],
     state: &mut ExecutionState,
     config: &Config,
+    registry: &ProcessRegistry,
 ) -> Result<()> {
     let t = group[0];
     let pre_files = agent::jj_changed_files().await.unwrap_or_default();
@@ -563,7 +591,7 @@ async fn run_group_singleton(
         .and_then(|e| e.feedback.last())
         .map(|s| s.as_str());
     let ctx = AgentContext::implement(&t.id, &t.title, &t.description, last_feedback);
-    let result = agent::invoke_agent(AgentRole::Implementer, &ctx, config, None).await;
+    let result = agent::invoke_agent(AgentRole::Implementer, &ctx, config, None, registry).await;
 
     let exec = state.entry(&t.id);
     exec.attempts += 1;

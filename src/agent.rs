@@ -1,11 +1,37 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::process::Command as TokioCommand;
 
 use crate::config::Config;
+
+/// Tracks active child process group IDs so a centralized signal
+/// handler can clean them all up on SIGINT / SIGTERM.
+#[derive(Clone, Default)]
+pub struct ProcessRegistry {
+    pgids: Arc<Mutex<HashSet<u32>>>,
+}
+
+impl ProcessRegistry {
+    pub fn register(&self, pgid: u32) {
+        self.pgids.lock().expect("pgid lock").insert(pgid);
+    }
+
+    pub fn deregister(&self, pgid: u32) {
+        self.pgids.lock().expect("pgid lock").remove(&pgid);
+    }
+
+    pub async fn kill_all(&self) {
+        let pgids: Vec<u32> = self.pgids.lock().expect("pgid lock").drain().collect();
+        for pgid in pgids {
+            kill_process_group(pgid).await;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum AgentRole {
@@ -185,7 +211,7 @@ struct ClaudeJsonOutput {
 
 /// Send SIGTERM to all processes in the given process group.
 /// Ignores errors (the group may have already exited).
-async fn kill_process_group(pgid: u32) {
+pub(crate) async fn kill_process_group(pgid: u32) {
     let _ = TokioCommand::new("kill")
         .args(["-TERM", &format!("-{pgid}")])
         .stdin(Stdio::null())
@@ -197,11 +223,16 @@ async fn kill_process_group(pgid: u32) {
 
 /// Invoke a claude agent with the given role and context.
 /// When `working_dir` is `Some`, the subprocess runs in that directory.
+///
+/// The caller must install a centralized signal handler via
+/// [`ProcessRegistry`]; this function registers/deregisters the child
+/// process group but does not handle signals itself.
 pub async fn invoke_agent(
     role: AgentRole,
     context: &AgentContext,
     config: &Config,
     working_dir: Option<&Path>,
+    registry: &ProcessRegistry,
 ) -> Result<AgentResult> {
     // Load and interpolate prompt
     let prompt_path = config.prompts_dir.join(role.prompt_filename());
@@ -241,18 +272,13 @@ pub async fn invoke_agent(
     let child = cmd.spawn().context("spawning claude process")?;
     let child_pid = child.id().expect("child has pid immediately after spawn");
 
-    // Race the agent against Ctrl+C so we always clean up the
-    // child's process group, even if Ralph is interrupted.
-    let output: std::process::Output = tokio::select! {
-        result = child.wait_with_output() => result.context("waiting for claude process")?,
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\n[ralph] interrupted, killing {} agent...", role.label());
-            kill_process_group(child_pid).await;
-            std::process::exit(130); // 128 + SIGINT
-        }
-    };
-
+    registry.register(child_pid);
+    let output = child
+        .wait_with_output()
+        .await
+        .context("waiting for claude process")?;
     kill_process_group(child_pid).await;
+    registry.deregister(child_pid);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.is_empty() {
