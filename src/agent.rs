@@ -195,7 +195,7 @@ pub async fn invoke_agent(
         .arg("--output-format")
         .arg("json")
         .arg("--model")
-        .arg(&config.model)
+        .arg(config.model_for(role.label()))
         .arg("--dangerously-skip-permissions")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
