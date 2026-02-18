@@ -226,6 +226,9 @@ pub async fn invoke_agent(
         .arg("--model")
         .arg(config.model_for(role.label()))
         .arg("--dangerously-skip-permissions")
+        .arg("--strict-mcp-config")
+        .arg("--mcp-config")
+        .arg(r#"{"mcpServers":{}}"#)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
