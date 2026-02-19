@@ -84,6 +84,12 @@ pub struct Config {
     /// Maximum cumulative cost (USD) before stopping the run
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
+    /// Number of failed attempts before escalating to a stronger model
+    #[serde(default = "default_escalation_after")]
+    pub escalation_after: u32,
+    /// Model to escalate to (defaults to models.reviewer if unset)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_model: Option<String>,
 }
 
 fn default_model() -> String {
@@ -104,6 +110,10 @@ fn default_agent_idle_timeout_secs() -> u64 {
 
 fn default_kill_grace_secs() -> u64 {
     5
+}
+
+fn default_escalation_after() -> u32 {
+    2
 }
 
 fn default_prompts_dir() -> PathBuf {
@@ -141,6 +151,8 @@ impl Default for Config {
             env: EnvConfig::default(),
             kill_grace_secs: default_kill_grace_secs(),
             max_cost_usd: None,
+            escalation_after: default_escalation_after(),
+            escalation_model: None,
         }
     }
 }
@@ -171,6 +183,19 @@ impl Config {
     /// Checks per-role overrides first, falls back to the default `model`.
     pub fn model_for(&self, role: &str) -> &str {
         self.models.get(role).unwrap_or(&self.model)
+    }
+
+    /// Resolve the model for a given role and attempt number.
+    /// When the implementer exceeds `escalation_after` attempts, returns
+    /// `escalation_model` (or the reviewer model as fallback).
+    pub fn model_for_attempt(&self, role: &str, attempt: u32) -> &str {
+        if role == "implementer" && attempt > self.escalation_after {
+            if let Some(ref m) = self.escalation_model {
+                return m;
+            }
+            return self.model_for("reviewer");
+        }
+        self.model_for(role)
     }
 
     pub async fn load() -> Result<Self> {
@@ -302,5 +327,68 @@ BAZ = "qux"
     fn max_cost_usd_defaults_to_none() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.max_cost_usd, None);
+    }
+
+    #[test]
+    fn escalation_after_defaults_to_2() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.escalation_after, 2);
+        assert_eq!(config.escalation_model, None);
+    }
+
+    #[test]
+    fn deserialize_escalation_config() {
+        let toml_str = r#"
+escalation_after = 3
+escalation_model = "opus"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.escalation_after, 3);
+        assert_eq!(config.escalation_model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn model_for_attempt_no_escalation() {
+        let config = Config::default();
+        // Attempts 1 and 2 use the normal implementer model.
+        assert_eq!(config.model_for_attempt("implementer", 1), "sonnet");
+        assert_eq!(config.model_for_attempt("implementer", 2), "sonnet");
+    }
+
+    #[test]
+    fn model_for_attempt_escalates_after_threshold() {
+        let config = Config::default(); // escalation_after=2, no escalation_model
+        // Attempt 3 exceeds threshold → falls back to reviewer model (sonnet by default).
+        assert_eq!(config.model_for_attempt("implementer", 3), "sonnet");
+
+        // With a reviewer override, escalation uses the reviewer model.
+        let config = Config {
+            models: ModelConfig {
+                reviewer: Some("opus".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(config.model_for_attempt("implementer", 3), "opus");
+    }
+
+    #[test]
+    fn model_for_attempt_uses_explicit_escalation_model() {
+        let config: Config = toml::from_str(r#"escalation_model = "haiku""#).unwrap();
+        assert_eq!(config.model_for_attempt("implementer", 3), "haiku");
+    }
+
+    #[test]
+    fn model_for_attempt_ignores_non_implementer() {
+        let config = Config {
+            models: ModelConfig {
+                reviewer: Some("opus".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Non-implementer roles are not affected by escalation.
+        assert_eq!(config.model_for_attempt("tester", 5), "sonnet");
+        assert_eq!(config.model_for_attempt("reviewer", 5), "opus");
     }
 }

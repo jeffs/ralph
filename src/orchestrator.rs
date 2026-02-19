@@ -5,7 +5,7 @@ use tokio::process::Command as TokioCommand;
 
 use crate::agent::{
     self, AgentContext, AgentRole, AgentStatus, FEEDBACK_MAX_LEN, ProcessRegistry,
-    truncate_feedback,
+    build_feedback_history, truncate_feedback,
 };
 use crate::config::Config;
 use crate::scheduler;
@@ -157,6 +157,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                 config,
                 None,
                 &registry,
+                0,
             )
             .await?;
 
@@ -378,7 +379,8 @@ async fn resume_inflight(
             let reg = registry.clone();
             let id_owned = id.clone();
             handles.push(tokio::spawn(async move {
-                let result = agent::invoke_agent(AgentRole::Tester, &ctx, &cfg, None, &reg).await;
+                let result =
+                    agent::invoke_agent(AgentRole::Tester, &ctx, &cfg, None, &reg, 0).await;
                 (id_owned, result)
             }));
         }
@@ -468,7 +470,8 @@ async fn resume_inflight(
             let reg = registry.clone();
             let id_owned = id.clone();
             handles.push(tokio::spawn(async move {
-                let result = agent::invoke_agent(AgentRole::Reviewer, &ctx, &cfg, None, &reg).await;
+                let result =
+                    agent::invoke_agent(AgentRole::Reviewer, &ctx, &cfg, None, &reg, 0).await;
                 (id_owned, result)
             }));
         }
@@ -727,11 +730,15 @@ async fn run_group_with_workspaces(
         let id = t.id.clone();
         let title = t.title.clone();
         let desc = t.description.clone();
-        let fb = state
+        let (fb, attempt) = state
             .tasks
             .get(&t.id)
-            .and_then(|e| e.feedback.last())
-            .cloned();
+            .map(|e| {
+                let fb = build_feedback_history(&e.feedback, FEEDBACK_MAX_LEN);
+                let fb = if fb.is_empty() { None } else { Some(fb) };
+                (fb, e.attempts + 1)
+            })
+            .unwrap_or((None, 1));
         let mut cfg = config.clone();
         if config.workspace.isolate_target_dir {
             let target_dir = ws_path.join("target");
@@ -743,8 +750,15 @@ async fn run_group_with_workspaces(
         let reg = registry.clone();
         handles.push(tokio::spawn(async move {
             let ctx = AgentContext::implement(&id, &title, &desc, fb.as_deref());
-            let result =
-                agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg, Some(&ws_path), &reg).await;
+            let result = agent::invoke_agent(
+                AgentRole::Implementer,
+                &ctx,
+                &cfg,
+                Some(&ws_path),
+                &reg,
+                attempt,
+            )
+            .await;
             (id, result)
         }));
     }
@@ -840,13 +854,25 @@ async fn run_group_singleton(
     let t = group[0];
     let pre_files = agent::jj_changed_files().await.unwrap_or_default();
 
-    let last_feedback = state
+    let (feedback_history, attempt) = state
         .tasks
         .get(&t.id)
-        .and_then(|e| e.feedback.last())
-        .map(|s| s.as_str());
-    let ctx = AgentContext::implement(&t.id, &t.title, &t.description, last_feedback);
-    let result = agent::invoke_agent(AgentRole::Implementer, &ctx, config, None, registry).await;
+        .map(|e| {
+            let fb = build_feedback_history(&e.feedback, FEEDBACK_MAX_LEN);
+            let fb = if fb.is_empty() { None } else { Some(fb) };
+            (fb, e.attempts + 1)
+        })
+        .unwrap_or((None, 1));
+    let ctx = AgentContext::implement(&t.id, &t.title, &t.description, feedback_history.as_deref());
+    let result = agent::invoke_agent(
+        AgentRole::Implementer,
+        &ctx,
+        config,
+        None,
+        registry,
+        attempt,
+    )
+    .await;
 
     {
         let exec = state.entry(&t.id);

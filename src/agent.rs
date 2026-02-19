@@ -532,6 +532,7 @@ pub async fn invoke_agent(
     config: &Config,
     working_dir: Option<&Path>,
     registry: &ProcessRegistry,
+    attempt: u32,
 ) -> Result<AgentResult> {
     // Load and interpolate prompt
     let prompt_path = config.prompts_dir.join(role.prompt_filename());
@@ -540,7 +541,11 @@ pub async fn invoke_agent(
         .with_context(|| format!("reading prompt template: {}", prompt_path.display()))?;
     let prompt = context.interpolate(&template);
 
-    eprintln!("[ralph] invoking {} agent...", role.label());
+    let model = config.model_for_attempt(role.label(), attempt);
+    eprintln!(
+        "[ralph] invoking {} agent (model: {model})...",
+        role.label()
+    );
 
     // Spawn claude in its own process group so that child
     // processes (rust-analyzer, LSP servers, cargo) are
@@ -580,7 +585,7 @@ pub async fn invoke_agent(
         .arg("--output-format")
         .arg("json")
         .arg("--model")
-        .arg(config.model_for(role.label()))
+        .arg(model)
         .arg("--dangerously-skip-permissions")
         .arg("--no-session-persistence")
         .arg("--strict-mcp-config")
@@ -807,7 +812,7 @@ fn truncate_reason(s: String) -> String {
 }
 
 /// Maximum length for feedback text forwarded to the implementer.
-pub(crate) const FEEDBACK_MAX_LEN: usize = 8000;
+pub(crate) const FEEDBACK_MAX_LEN: usize = 16_000;
 
 /// Truncate feedback text at a char boundary, appending "..." if needed.
 pub(crate) fn truncate_feedback(text: &str, max_len: usize) -> String {
@@ -821,6 +826,58 @@ pub(crate) fn truncate_feedback(text: &str, max_len: usize) -> String {
     let mut truncated = text[..end].to_string();
     truncated.push_str("...");
     truncated
+}
+
+/// Build a combined feedback string from all entries, with budget-based
+/// truncation. Keeps the last 2 entries in full; older entries share the
+/// remaining budget equally and are truncated if necessary.
+pub(crate) fn build_feedback_history(entries: &[String], max_len: usize) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let sep = "\n\n";
+
+    // Fast path: everything fits.
+    let total: usize = entries.iter().map(|e| e.len()).sum::<usize>()
+        + sep.len() * entries.len().saturating_sub(1);
+    if total <= max_len {
+        return entries.join(sep);
+    }
+
+    // Preserve the last 2 entries in full; truncate older entries to fit.
+    let keep = entries.len().min(2);
+    let (older, recent) = entries.split_at(entries.len() - keep);
+    let recent_block = recent.join(sep);
+
+    if older.is_empty() {
+        return recent_block;
+    }
+
+    // Budget for older entries (one separator between older and recent blocks).
+    let fixed = recent_block.len() + sep.len();
+    if fixed >= max_len {
+        return recent_block;
+    }
+    let budget = max_len - fixed;
+
+    // Separators within the older block.
+    let older_seps = sep.len() * older.len().saturating_sub(1);
+    if budget <= older_seps {
+        return recent_block;
+    }
+    let text_budget = (budget - older_seps) / older.len();
+    // truncate_feedback appends "..." (3 chars) when it truncates, so
+    // reserve space for the suffix to stay within budget.
+    let per_entry = text_budget.saturating_sub(3);
+
+    let older_block: String = older
+        .iter()
+        .map(|e| truncate_feedback(e, per_entry))
+        .collect::<Vec<_>>()
+        .join(sep);
+
+    format!("{older_block}{sep}{recent_block}")
 }
 
 /// Parse `jj diff --summary` output into a sorted, deduped
@@ -1210,5 +1267,63 @@ Done!"#
             }
             other => panic!("expected ApprovedWithNits, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn build_feedback_history_empty() {
+        assert_eq!(build_feedback_history(&[], 1000), "");
+    }
+
+    #[test]
+    fn build_feedback_history_single_entry() {
+        let entries = vec!["[Tester · attempt 1] error".to_string()];
+        assert_eq!(
+            build_feedback_history(&entries, 1000),
+            "[Tester · attempt 1] error"
+        );
+    }
+
+    #[test]
+    fn build_feedback_history_all_fit() {
+        let entries = vec![
+            "[Tester · attempt 1] error A".to_string(),
+            "[Reviewer · attempt 2] error B".to_string(),
+        ];
+        let result = build_feedback_history(&entries, 10000);
+        assert!(result.contains("error A"));
+        assert!(result.contains("error B"));
+        assert!(result.contains("\n\n"));
+    }
+
+    #[test]
+    fn build_feedback_history_truncates_older_entries() {
+        let old = format!("[Tester · attempt 1] {}", "x".repeat(5000));
+        let recent1 = "[Tester · attempt 2] recent1".to_string();
+        let recent2 = "[Reviewer · attempt 2] recent2".to_string();
+        let entries = vec![old.clone(), recent1.clone(), recent2.clone()];
+
+        // Budget large enough for the recent entries but not the old one in full.
+        let budget = recent1.len() + recent2.len() + 200;
+        let result = build_feedback_history(&entries, budget);
+        // Last 2 entries preserved in full.
+        assert!(result.contains(&recent1));
+        assert!(result.contains(&recent2));
+        // Older entry was truncated (not present in full).
+        assert!(!result.contains(&old));
+        assert!(result.len() <= budget);
+    }
+
+    #[test]
+    fn build_feedback_history_recent_exceeds_budget() {
+        let old = "old entry".to_string();
+        let recent1 = format!("[Tester · attempt 2] {}", "x".repeat(500));
+        let recent2 = format!("[Reviewer · attempt 2] {}", "y".repeat(500));
+        let entries = vec![old.clone(), recent1.clone(), recent2.clone()];
+        // Budget smaller than recent block — older entry is dropped.
+        let result = build_feedback_history(&entries, 100);
+        assert!(!result.contains(&old));
+        // Recent entries are still returned even though they exceed budget.
+        assert!(result.contains(&recent1));
+        assert!(result.contains(&recent2));
     }
 }
