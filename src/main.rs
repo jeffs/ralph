@@ -42,7 +42,11 @@ enum Command {
     /// Initialize .ralph/ in current directory
     Init,
     /// Show current execution state
-    Status,
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Mark a task as Done without running it
     Skip {
         /// Task ID to skip (e.g. "T3")
@@ -74,7 +78,7 @@ async fn main() -> Result<()> {
             tasks,
             max_iterations,
         } => cmd_run(tasks, max_iterations).await,
-        Command::Status => cmd_status().await,
+        Command::Status { json } => cmd_status(json).await,
         Command::Skip { task_id } => cmd_override_task(&task_id, "skip").await,
         Command::Fail { task_id } => cmd_override_task(&task_id, "fail").await,
         Command::Reset { task_id } => cmd_override_task(&task_id, "reset").await,
@@ -207,17 +211,26 @@ async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status() -> Result<()> {
+async fn cmd_status(json: bool) -> Result<()> {
     let state_path = PathBuf::from(".ralph/state.json");
     let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
 
     if !tasks_path.exists() {
-        println!("No tasks found. Run `ralph plan` first.");
+        if json {
+            println!("{{\"tasks\":[]}}");
+        } else {
+            println!("No tasks found. Run `ralph plan` first.");
+        }
         return Ok(());
     }
 
     let tasks = task::load_tasks(&tasks_path).await?;
     let exec_state = state::ExecutionState::load(&state_path).await?;
+
+    if json {
+        return cmd_status_json(&tasks, &exec_state);
+    }
+
     let now = state::unix_now();
 
     let mut done = 0u32;
@@ -261,5 +274,50 @@ async fn cmd_status() -> Result<()> {
         "Summary: {} done, {} failed, {} in-progress, {} pending",
         done, failed, in_progress, pending
     );
+    Ok(())
+}
+
+fn cmd_status_json(tasks: &[task::Task], exec_state: &state::ExecutionState) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct StatusOutput<'a> {
+        tasks: Vec<TaskStatus<'a>>,
+    }
+    #[derive(serde::Serialize)]
+    struct TaskStatus<'a> {
+        id: &'a str,
+        title: &'a str,
+        description: &'a str,
+        priority: u32,
+        blocked_by: &'a [String],
+        phase: &'a state::Phase,
+        attempts: u32,
+        last_error: Option<&'a str>,
+        files_changed: &'a [std::path::PathBuf],
+        started_at: Option<u64>,
+        completed_at: Option<u64>,
+    }
+    let default_exec = state::TaskExecution::default();
+    let out = StatusOutput {
+        tasks: tasks
+            .iter()
+            .map(|t| {
+                let e = exec_state.tasks.get(&t.id).unwrap_or(&default_exec);
+                TaskStatus {
+                    id: &t.id,
+                    title: &t.title,
+                    description: &t.description,
+                    priority: t.priority,
+                    blocked_by: &t.blocked_by,
+                    phase: &e.phase,
+                    attempts: e.attempts,
+                    last_error: e.last_error.as_deref(),
+                    files_changed: &e.files_changed,
+                    started_at: e.started_at,
+                    completed_at: e.completed_at,
+                }
+            })
+            .collect(),
+    };
+    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
