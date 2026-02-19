@@ -8,6 +8,7 @@ and make the minimal code changes to complete it.
 - **ID**: {{TASK_ID}}
 - **Title**: {{TASK_TITLE}}
 - **Description**: {{TASK_DESCRIPTION}}
+{{GUIDANCE}}
 {{FEEDBACK}}
 ## Instructions
 

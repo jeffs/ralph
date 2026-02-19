@@ -63,6 +63,18 @@ enum Command {
         /// Task ID to reset (e.g. "T3")
         task_id: String,
     },
+    /// Add persistent guidance for a task's implementer
+    Hint {
+        /// Task ID (e.g. "T3")
+        task_id: String,
+        /// Guidance text (accumulated across calls)
+        text: String,
+    },
+    /// Clear all guidance for a task
+    Unhint {
+        /// Task ID (e.g. "T3")
+        task_id: String,
+    },
     /// Manage captured nits (improvement suggestions)
     Nits {
         /// Show all nits (including dismissed/promoted)
@@ -105,6 +117,8 @@ async fn main() -> Result<()> {
         Command::Skip { task_id } => cmd_override_task(&task_id, "skip").await,
         Command::Fail { task_id } => cmd_override_task(&task_id, "fail").await,
         Command::Reset { task_id } => cmd_override_task(&task_id, "reset").await,
+        Command::Hint { task_id, text } => cmd_hint(&task_id, &text).await,
+        Command::Unhint { task_id } => cmd_unhint(&task_id).await,
         Command::Nits { all, action } => match action {
             None => cmd_nits_list(all).await,
             Some(NitsAction::Promote { nit_id }) => cmd_nits_promote(&nit_id).await,
@@ -231,6 +245,7 @@ async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
             exec.attempts = 0;
             exec.last_error = None;
             exec.feedback.clear();
+            // guidance is intentionally preserved — it outlives retries.
             eprintln!("Reset {} to Pending (attempts cleared)", task_id);
         }
         _ => unreachable!(),
@@ -356,6 +371,65 @@ fn cmd_status_json(tasks: &[task::Task], exec_state: &state::ExecutionState) -> 
             .collect(),
     };
     println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+async fn cmd_hint(task_id: &str, text: &str) -> Result<()> {
+    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
+    let state_path = PathBuf::from(".ralph/state.json");
+
+    if !tasks_path.exists() {
+        anyhow::bail!("No tasks found. Run `ralph plan` first.");
+    }
+
+    let tasks = task::load_tasks(&tasks_path).await?;
+    if !tasks.iter().any(|t| t.id == task_id) {
+        let valid_ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        anyhow::bail!(
+            "Unknown task ID '{}'. Valid IDs: {}",
+            task_id,
+            valid_ids.join(", ")
+        );
+    }
+
+    let mut exec_state = state::ExecutionState::load(&state_path).await?;
+    let exec = exec_state.entry(task_id);
+    exec.guidance.push(text.to_string());
+    exec_state.save(&state_path).await?;
+
+    eprintln!(
+        "Added guidance to {} ({} total)",
+        task_id,
+        exec_state.tasks[task_id].guidance.len()
+    );
+    Ok(())
+}
+
+async fn cmd_unhint(task_id: &str) -> Result<()> {
+    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
+    let state_path = PathBuf::from(".ralph/state.json");
+
+    if !tasks_path.exists() {
+        anyhow::bail!("No tasks found. Run `ralph plan` first.");
+    }
+
+    let tasks = task::load_tasks(&tasks_path).await?;
+    if !tasks.iter().any(|t| t.id == task_id) {
+        let valid_ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        anyhow::bail!(
+            "Unknown task ID '{}'. Valid IDs: {}",
+            task_id,
+            valid_ids.join(", ")
+        );
+    }
+
+    let mut exec_state = state::ExecutionState::load(&state_path).await?;
+    let exec = exec_state.entry(task_id);
+    let count = exec.guidance.len();
+    exec.guidance.clear();
+    exec_state.save(&state_path).await?;
+
+    eprintln!("Cleared {count} guidance entries from {task_id}");
     Ok(())
 }
 

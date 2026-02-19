@@ -75,6 +75,18 @@ fn reset_or_fail_classified(exec: &mut TaskExecution, config: &Config, reason: &
     }
 }
 
+/// Format guidance entries as a bullet list for prompt injection.
+fn build_guidance(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    entries
+        .iter()
+        .map(|g| format!("- {g}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Record full agent response text as feedback so the
 /// implementer can see what went wrong on the next attempt.
 fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str) {
@@ -730,15 +742,17 @@ async fn run_group_with_workspaces(
         let id = t.id.clone();
         let title = t.title.clone();
         let desc = t.description.clone();
-        let (fb, attempt) = state
+        let (guidance, fb, attempt) = state
             .tasks
             .get(&t.id)
             .map(|e| {
+                let g = build_guidance(&e.guidance);
+                let g = if g.is_empty() { None } else { Some(g) };
                 let fb = build_feedback_history(&e.feedback, FEEDBACK_MAX_LEN);
                 let fb = if fb.is_empty() { None } else { Some(fb) };
-                (fb, e.attempts + 1)
+                (g, fb, e.attempts + 1)
             })
-            .unwrap_or((None, 1));
+            .unwrap_or((None, None, 1));
         let mut cfg = config.clone();
         if config.workspace.isolate_target_dir {
             let target_dir = ws_path.join("target");
@@ -749,7 +763,8 @@ async fn run_group_with_workspaces(
         }
         let reg = registry.clone();
         handles.push(tokio::spawn(async move {
-            let ctx = AgentContext::implement(&id, &title, &desc, fb.as_deref());
+            let ctx =
+                AgentContext::implement(&id, &title, &desc, guidance.as_deref(), fb.as_deref());
             let result = agent::invoke_agent(
                 AgentRole::Implementer,
                 &ctx,
@@ -854,16 +869,24 @@ async fn run_group_singleton(
     let t = group[0];
     let pre_files = agent::jj_changed_files().await.unwrap_or_default();
 
-    let (feedback_history, attempt) = state
+    let (guidance, feedback_history, attempt) = state
         .tasks
         .get(&t.id)
         .map(|e| {
+            let g = build_guidance(&e.guidance);
+            let g = if g.is_empty() { None } else { Some(g) };
             let fb = build_feedback_history(&e.feedback, FEEDBACK_MAX_LEN);
             let fb = if fb.is_empty() { None } else { Some(fb) };
-            (fb, e.attempts + 1)
+            (g, fb, e.attempts + 1)
         })
-        .unwrap_or((None, 1));
-    let ctx = AgentContext::implement(&t.id, &t.title, &t.description, feedback_history.as_deref());
+        .unwrap_or((None, None, 1));
+    let ctx = AgentContext::implement(
+        &t.id,
+        &t.title,
+        &t.description,
+        guidance.as_deref(),
+        feedback_history.as_deref(),
+    );
     let result = agent::invoke_agent(
         AgentRole::Implementer,
         &ctx,

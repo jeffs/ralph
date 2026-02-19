@@ -150,6 +150,7 @@ pub enum AgentContext {
         task_id: String,
         task_title: String,
         task_description: String,
+        guidance: Option<String>,
         feedback: Option<String>,
     },
     /// Tester: validate recent changes
@@ -174,11 +175,18 @@ impl AgentContext {
         }
     }
 
-    pub fn implement(id: &str, title: &str, description: &str, feedback: Option<&str>) -> Self {
+    pub fn implement(
+        id: &str,
+        title: &str,
+        description: &str,
+        guidance: Option<&str>,
+        feedback: Option<&str>,
+    ) -> Self {
         Self::Implement {
             task_id: id.to_string(),
             task_title: title.to_string(),
             task_description: description.to_string(),
+            guidance: guidance.map(String::from),
             feedback: feedback.map(String::from),
         }
     }
@@ -214,8 +222,13 @@ impl AgentContext {
                 task_id,
                 task_title,
                 task_description,
+                guidance,
                 feedback,
             } => {
+                let guidance_section = match guidance {
+                    Some(g) => format!("\n## Guidance\n\n{g}\n"),
+                    None => String::new(),
+                };
                 let feedback_section = match feedback {
                     Some(fb) => format!(
                         "\n## Previous Attempt Feedback\n\n\
@@ -228,6 +241,7 @@ impl AgentContext {
                     .replace("{{TASK_ID}}", task_id)
                     .replace("{{TASK_TITLE}}", task_title)
                     .replace("{{TASK_DESCRIPTION}}", task_description)
+                    .replace("{{GUIDANCE}}", &guidance_section)
                     .replace("{{FEEDBACK}}", &feedback_section)
             }
             Self::Test {
@@ -1105,19 +1119,57 @@ Done!"#
 
     #[test]
     fn interpolate_implement() {
-        let ctx = AgentContext::implement("T1", "Fix bug", "desc", None);
-        let result =
-            ctx.interpolate("Task {{TASK_ID}}: {{TASK_TITLE}} — {{TASK_DESCRIPTION}}{{FEEDBACK}}");
+        let ctx = AgentContext::implement("T1", "Fix bug", "desc", None, None);
+        let result = ctx.interpolate(
+            "Task {{TASK_ID}}: {{TASK_TITLE}} — {{TASK_DESCRIPTION}}{{GUIDANCE}}{{FEEDBACK}}",
+        );
         assert_eq!(result, "Task T1: Fix bug — desc");
     }
 
     #[test]
     fn interpolate_implement_with_feedback() {
-        let ctx = AgentContext::implement("T1", "Fix bug", "desc", Some("compile error on line 5"));
-        let result = ctx.interpolate("{{TASK_ID}}{{FEEDBACK}}## Instructions");
+        let ctx = AgentContext::implement(
+            "T1",
+            "Fix bug",
+            "desc",
+            None,
+            Some("compile error on line 5"),
+        );
+        let result = ctx.interpolate("{{TASK_ID}}{{GUIDANCE}}{{FEEDBACK}}## Instructions");
         assert!(result.contains("## Previous Attempt Feedback"));
         assert!(result.contains("compile error on line 5"));
         assert!(result.contains("## Instructions"));
+    }
+
+    #[test]
+    fn interpolate_implement_with_guidance() {
+        let ctx = AgentContext::implement(
+            "T1",
+            "Fix bug",
+            "desc",
+            Some("- Check the uuid feature flags"),
+            None,
+        );
+        let result = ctx.interpolate("{{TASK_ID}}{{GUIDANCE}}{{FEEDBACK}}## Instructions");
+        assert!(result.contains("## Guidance"));
+        assert!(result.contains("Check the uuid feature flags"));
+        assert!(result.contains("## Instructions"));
+    }
+
+    #[test]
+    fn interpolate_implement_with_guidance_and_feedback() {
+        let ctx = AgentContext::implement(
+            "T1",
+            "Fix bug",
+            "desc",
+            Some("- Fix the root cause"),
+            Some("compile error on line 5"),
+        );
+        let result = ctx.interpolate("{{TASK_ID}}{{GUIDANCE}}{{FEEDBACK}}## Instructions");
+        // Guidance comes before feedback
+        let guidance_pos = result.find("## Guidance").unwrap();
+        let feedback_pos = result.find("## Previous Attempt Feedback").unwrap();
+        assert!(guidance_pos < feedback_pos);
     }
 
     #[test]

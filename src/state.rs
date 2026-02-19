@@ -23,6 +23,10 @@ pub struct TaskExecution {
     /// used to give the implementer actionable feedback on retry.
     #[serde(default)]
     pub feedback: Vec<String>,
+    /// Persistent prescriptive guidance injected into the implementer
+    /// prompt on every attempt (not just retries). Survives `ralph reset`.
+    #[serde(default)]
+    pub guidance: Vec<String>,
     /// Unix timestamp (seconds) when current phase was entered.
     #[serde(default)]
     pub phase_entered_at: Option<u64>,
@@ -51,6 +55,7 @@ impl Default for TaskExecution {
             last_error: None,
             files_changed: Vec::new(),
             feedback: Vec::new(),
+            guidance: Vec::new(),
             phase_entered_at: None,
             started_at: None,
             completed_at: None,
@@ -184,6 +189,38 @@ mod tests {
         }"#;
         let state: ExecutionState = serde_json::from_str(json).unwrap();
         assert!(state.tasks["T1"].feedback.is_empty());
+    }
+
+    #[test]
+    fn backward_compat_deserialize_without_guidance() {
+        let json = r#"{
+            "tasks": {
+                "T1": {
+                    "attempts": 1,
+                    "phase": "Pending",
+                    "last_error": null,
+                    "files_changed": [],
+                    "feedback": []
+                }
+            }
+        }"#;
+        let state: ExecutionState = serde_json::from_str(json).unwrap();
+        assert!(state.tasks["T1"].guidance.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_json_with_guidance() {
+        let mut state = ExecutionState::default();
+        let exec = state.entry("T1");
+        exec.guidance = vec![
+            "Root cause is uuid's js feature".into(),
+            "Rebuild fixtures after changing features".into(),
+        ];
+
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: ExecutionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.tasks["T1"].guidance.len(), 2);
+        assert!(loaded.tasks["T1"].guidance[0].contains("uuid"));
     }
 
     #[test]
