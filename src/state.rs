@@ -248,7 +248,10 @@ mod tests {
 
         assert_eq!(loaded.tasks["T1"].phase, Phase::Done);
         assert_eq!(loaded.tasks["T1"].attempts, 3);
-        assert_eq!(loaded.tasks["T1"].files_changed, vec![PathBuf::from("lib.rs")]);
+        assert_eq!(
+            loaded.tasks["T1"].files_changed,
+            vec![PathBuf::from("lib.rs")]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

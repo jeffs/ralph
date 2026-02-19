@@ -63,7 +63,8 @@ fn validate_tasks(tasks: &[Task]) -> Result<()> {
         if t.id.contains(char::is_whitespace) {
             errors.push(format!(
                 "task {} '{}': `id` contains whitespace",
-                i + 1, t.id
+                i + 1,
+                t.id
             ));
         }
     }
@@ -78,10 +79,7 @@ fn validate_tasks(tasks: &[Task]) -> Result<()> {
     if errors.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!(
-            "task validation failed:\n  {}",
-            errors.join("\n  ")
-        );
+        anyhow::bail!("task validation failed:\n  {}", errors.join("\n  "));
     }
 }
 

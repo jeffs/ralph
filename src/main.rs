@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod nit;
 mod orchestrator;
 mod scheduler;
 mod state;
@@ -62,6 +63,28 @@ enum Command {
         /// Task ID to reset (e.g. "T3")
         task_id: String,
     },
+    /// Manage captured nits (improvement suggestions)
+    Nits {
+        /// Show all nits (including dismissed/promoted)
+        #[arg(long)]
+        all: bool,
+        #[command(subcommand)]
+        action: Option<NitsAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NitsAction {
+    /// Create a task from a nit
+    Promote {
+        /// Nit ID (e.g. "NIT-1")
+        nit_id: String,
+    },
+    /// Mark a nit as dismissed
+    Dismiss {
+        /// Nit ID (e.g. "NIT-1")
+        nit_id: String,
+    },
 }
 
 #[tokio::main]
@@ -82,6 +105,11 @@ async fn main() -> Result<()> {
         Command::Skip { task_id } => cmd_override_task(&task_id, "skip").await,
         Command::Fail { task_id } => cmd_override_task(&task_id, "fail").await,
         Command::Reset { task_id } => cmd_override_task(&task_id, "reset").await,
+        Command::Nits { all, action } => match action {
+            None => cmd_nits_list(all).await,
+            Some(NitsAction::Promote { nit_id }) => cmd_nits_promote(&nit_id).await,
+            Some(NitsAction::Dismiss { nit_id }) => cmd_nits_dismiss(&nit_id).await,
+        },
     }
 }
 
@@ -260,10 +288,7 @@ async fn cmd_status(json: bool) -> Result<()> {
                     format!(" err={truncated}")
                 })
                 .unwrap_or_default();
-            format!(
-                "{:?} attempts={}{duration}{error}",
-                e.phase, e.attempts
-            )
+            format!("{:?} attempts={}{duration}{error}", e.phase, e.attempts)
         } else {
             pending += 1;
             "Pending".to_string()
@@ -274,6 +299,17 @@ async fn cmd_status(json: bool) -> Result<()> {
         "Summary: {} done, {} failed, {} in-progress, {} pending",
         done, failed, in_progress, pending
     );
+
+    let nits_path = PathBuf::from(".ralph/nits.jsonl");
+    if let Ok(nits) = nit::load_nits(&nits_path).await {
+        let open_count = nits
+            .iter()
+            .filter(|n| n.status == nit::NitStatus::Open)
+            .count();
+        if open_count > 0 {
+            println!("Nits: {open_count} open (run `ralph nits` to see them)");
+        }
+    }
     Ok(())
 }
 
@@ -319,5 +355,144 @@ fn cmd_status_json(tasks: &[task::Task], exec_state: &state::ExecutionState) -> 
             .collect(),
     };
     println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+async fn cmd_nits_list(all: bool) -> Result<()> {
+    let path = PathBuf::from(".ralph/nits.jsonl");
+    let nits = nit::load_nits(&path).await?;
+
+    let open = nits
+        .iter()
+        .filter(|n| n.status == nit::NitStatus::Open)
+        .count();
+    let dismissed = nits
+        .iter()
+        .filter(|n| n.status == nit::NitStatus::Dismissed)
+        .count();
+    let promoted = nits
+        .iter()
+        .filter(|n| n.status == nit::NitStatus::Promoted)
+        .count();
+
+    println!("Nits: {open} open, {dismissed} dismissed, {promoted} promoted");
+
+    for n in &nits {
+        if !all && n.status != nit::NitStatus::Open {
+            continue;
+        }
+        let preview = n.content.replace('\n', " ");
+        let content_preview = if preview.len() > 80 {
+            let mut end = 80;
+            while !preview.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &preview[..end])
+        } else {
+            preview
+        };
+        let status_tag = if all && n.status != nit::NitStatus::Open {
+            match n.status {
+                nit::NitStatus::Dismissed => " [dismissed]",
+                nit::NitStatus::Promoted => " [promoted]",
+                nit::NitStatus::Open => "",
+            }
+        } else {
+            ""
+        };
+        println!(
+            "  [{}] {} ({}) — {content_preview}{status_tag}",
+            n.id, n.source_task, n.source_role
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
+    let nits_path = PathBuf::from(".ralph/nits.jsonl");
+    let mut nits = nit::load_nits(&nits_path).await?;
+
+    let nit_entry = nits
+        .iter_mut()
+        .find(|n| n.id == nit_id)
+        .ok_or_else(|| anyhow::anyhow!("nit '{nit_id}' not found"))?;
+
+    if nit_entry.status != nit::NitStatus::Open {
+        let status_name = match nit_entry.status {
+            nit::NitStatus::Promoted => "promoted",
+            nit::NitStatus::Dismissed => "dismissed",
+            nit::NitStatus::Open => "open",
+        };
+        anyhow::bail!("nit '{nit_id}' is already {status_name}");
+    }
+
+    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
+    let tasks = if tasks_path.exists() {
+        task::load_tasks(&tasks_path).await?
+    } else {
+        Vec::new()
+    };
+
+    let max_priority = tasks.iter().map(|t| t.priority).max().unwrap_or(0);
+    let task_id = nit_id.replace('-', "");
+
+    if tasks.iter().any(|t| t.id == task_id) {
+        anyhow::bail!("task ID '{task_id}' already exists");
+    }
+
+    let first_line = nit_entry
+        .content
+        .lines()
+        .next()
+        .unwrap_or(&nit_entry.content);
+    let new_task = task::Task {
+        id: task_id.clone(),
+        title: format!("Nit: {first_line}"),
+        description: nit_entry.content.clone(),
+        priority: max_priority + 1,
+        blocked_by: vec![],
+    };
+
+    // Append to tasks.jsonl
+    use tokio::io::AsyncWriteExt;
+    let mut line = serde_json::to_string(&new_task)?;
+    line.push('\n');
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&tasks_path)
+        .await?;
+    file.write_all(line.as_bytes()).await?;
+
+    nit_entry.status = nit::NitStatus::Promoted;
+    nit_entry.promoted_to = Some(task_id.clone());
+    nit::save_nits(&nits_path, &nits).await?;
+
+    eprintln!("Promoted {nit_id} → task {task_id}");
+    Ok(())
+}
+
+async fn cmd_nits_dismiss(nit_id: &str) -> Result<()> {
+    let nits_path = PathBuf::from(".ralph/nits.jsonl");
+    let mut nits = nit::load_nits(&nits_path).await?;
+
+    let nit_entry = nits
+        .iter_mut()
+        .find(|n| n.id == nit_id)
+        .ok_or_else(|| anyhow::anyhow!("nit '{nit_id}' not found"))?;
+
+    if nit_entry.status != nit::NitStatus::Open {
+        let status_name = match nit_entry.status {
+            nit::NitStatus::Promoted => "promoted",
+            nit::NitStatus::Dismissed => "dismissed",
+            nit::NitStatus::Open => "open",
+        };
+        anyhow::bail!("nit '{nit_id}' is already {status_name}");
+    }
+
+    nit_entry.status = nit::NitStatus::Dismissed;
+    nit::save_nits(&nits_path, &nits).await?;
+
+    eprintln!("Dismissed {nit_id}");
     Ok(())
 }

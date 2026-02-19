@@ -727,7 +727,9 @@ fn parse_agent_status(text: &str) -> AgentStatus {
         // Try to match APPROVED_WITH_NITS:, FAILURE:, or NEEDS_RETRY: and collect the reason.
         let (prefix, make_status): (&str, fn(String) -> AgentStatus) =
             if let Some(r) = rest.strip_prefix("APPROVED_WITH_NITS:") {
-                (r, |suggestions| AgentStatus::ApprovedWithNits { suggestions })
+                (r, |suggestions| AgentStatus::ApprovedWithNits {
+                    suggestions,
+                })
             } else if let Some(r) = rest.strip_prefix("FAILURE:") {
                 (r, |reason| AgentStatus::Failure { reason })
             } else if let Some(r) = rest.strip_prefix("NEEDS_RETRY:") {

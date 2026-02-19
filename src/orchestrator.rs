@@ -66,11 +66,7 @@ fn should_retry(kind: agent::FailureKind) -> bool {
 /// Non-retryable failures go straight to Failed regardless of
 /// attempt count.
 #[allow(dead_code)]
-fn reset_or_fail_classified(
-    exec: &mut TaskExecution,
-    config: &Config,
-    reason: &str,
-) {
+fn reset_or_fail_classified(exec: &mut TaskExecution, config: &Config, reason: &str) {
     let kind = agent::classify_failure(reason);
     if !should_retry(kind) || exec.attempts >= config.max_attempts {
         exec.phase = Phase::Failed;
@@ -85,6 +81,29 @@ fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str) {
     let prefix = format!("[{phase_label} · attempt {}]", exec.attempts);
     let body = truncate_feedback(full_text, FEEDBACK_MAX_LEN);
     exec.feedback.push(format!("{prefix}\n{body}"));
+}
+
+/// Record a nit to `.ralph/nits.jsonl`.
+async fn record_nit(
+    source_task: &str,
+    source_role: &str,
+    attempt: u32,
+    suggestions: &str,
+) -> Result<()> {
+    let path = PathBuf::from(".ralph/nits.jsonl");
+    let nits = crate::nit::load_nits(&path).await.unwrap_or_default();
+    let id = crate::nit::next_nit_id(&nits);
+    let nit = crate::nit::Nit {
+        id,
+        source_task: source_task.to_string(),
+        source_role: source_role.to_string(),
+        attempt,
+        content: suggestions.to_string(),
+        status: crate::nit::NitStatus::Open,
+        promoted_to: None,
+        created_at: crate::state::unix_now(),
+    };
+    crate::nit::append_nit(&path, &nit).await
 }
 
 /// Main orchestration loop. Iterates until convergence
@@ -142,10 +161,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             .await?;
 
             cumulative_cost += review.cost_usd.unwrap_or(0.0);
-            if config
-                .max_cost_usd
-                .is_some_and(|max| cumulative_cost > max)
-            {
+            if config.max_cost_usd.is_some_and(|max| cumulative_cost > max) {
                 eprintln!(
                     "[ralph] cost budget exceeded (${cumulative_cost:.4} > ${:.4}), stopping.",
                     config.max_cost_usd.unwrap()
@@ -164,6 +180,9 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                 AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
                     if let AgentStatus::ApprovedWithNits { suggestions } = &review.status {
                         eprintln!("[ralph] final review nits: {suggestions}");
+                        if let Err(e) = record_nit("final", "final_review", 1, suggestions).await {
+                            eprintln!("[ralph] failed to record nit: {e}");
+                        }
                     }
                     eprintln!(
                         "[ralph] final review passed — \
@@ -187,7 +206,8 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
         // Resume interrupted in-flight tasks before
         // scheduling new work.
-        let made_progress = resume_inflight(&tasks, &mut state, config, &registry, &mut cumulative_cost).await?;
+        let made_progress =
+            resume_inflight(&tasks, &mut state, config, &registry, &mut cumulative_cost).await?;
         if registry.is_shutdown() {
             eprintln!("[ralph] shutdown requested, saving state...");
             state.save(&state_path).await?;
@@ -251,22 +271,13 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                 )
                 .await?;
             } else {
-                run_group_singleton(
-                    &group,
-                    &mut state,
-                    config,
-                    &registry,
-                    &mut cumulative_cost,
-                )
-                .await?;
+                run_group_singleton(&group, &mut state, config, &registry, &mut cumulative_cost)
+                    .await?;
             }
 
             state.save(&state_path).await?;
 
-            if config
-                .max_cost_usd
-                .is_some_and(|max| cumulative_cost > max)
-            {
+            if config.max_cost_usd.is_some_and(|max| cumulative_cost > max) {
                 eprintln!(
                     "[ralph] cost budget exceeded (${cumulative_cost:.4} > ${:.4}), stopping.",
                     config.max_cost_usd.unwrap()
@@ -367,8 +378,7 @@ async fn resume_inflight(
             let reg = registry.clone();
             let id_owned = id.clone();
             handles.push(tokio::spawn(async move {
-                let result =
-                    agent::invoke_agent(AgentRole::Tester, &ctx, &cfg, None, &reg).await;
+                let result = agent::invoke_agent(AgentRole::Tester, &ctx, &cfg, None, &reg).await;
                 (id_owned, result)
             }));
         }
@@ -379,6 +389,12 @@ async fn resume_inflight(
             match result {
                 Ok(r) => {
                     *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
+                        let attempts = state.tasks.get(&id).map_or(0, |e| e.attempts);
+                        if let Err(e) = record_nit(&id, "tester", attempts, suggestions).await {
+                            eprintln!("[ralph] failed to record nit: {e}");
+                        }
+                    }
                     let exec = state.entry(&id);
                     match r.status {
                         AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
@@ -452,8 +468,7 @@ async fn resume_inflight(
             let reg = registry.clone();
             let id_owned = id.clone();
             handles.push(tokio::spawn(async move {
-                let result =
-                    agent::invoke_agent(AgentRole::Reviewer, &ctx, &cfg, None, &reg).await;
+                let result = agent::invoke_agent(AgentRole::Reviewer, &ctx, &cfg, None, &reg).await;
                 (id_owned, result)
             }));
         }
@@ -464,6 +479,12 @@ async fn resume_inflight(
             match result {
                 Ok(r) => {
                     *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
+                        let attempts = state.tasks.get(&id).map_or(0, |e| e.attempts);
+                        if let Err(e) = record_nit(&id, "reviewer", attempts, suggestions).await {
+                            eprintln!("[ralph] failed to record nit: {e}");
+                        }
+                    }
                     let exec = state.entry(&id);
                     match r.status {
                         AgentStatus::Success => {
@@ -472,11 +493,11 @@ async fn resume_inflight(
                             progressed = true;
                             eprintln!("[ralph] {id} — done!");
                         }
-                        AgentStatus::ApprovedWithNits { ref suggestions } => {
+                        AgentStatus::ApprovedWithNits { .. } => {
                             exec.phase = Phase::Done;
                             exec.last_error = None;
                             progressed = true;
-                            eprintln!("[ralph] {id} — done (nits: {suggestions})");
+                            eprintln!("[ralph] {id} — done (with nits)");
                         }
                         AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
                             push_feedback(exec, "Reviewer", &r.text);
@@ -737,11 +758,20 @@ async fn run_group_with_workspaces(
 
     for handle in handles {
         let (id, result) = handle.await?;
-        let exec = state.entry(&id);
-        exec.attempts += 1;
+        {
+            let exec = state.entry(&id);
+            exec.attempts += 1;
+        }
         let success = match result {
             Ok(r) => {
                 *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+                if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
+                    let attempts = state.tasks.get(&id).map_or(0, |e| e.attempts);
+                    if let Err(e) = record_nit(&id, "implementer", attempts, suggestions).await {
+                        eprintln!("[ralph] failed to record nit: {e}");
+                    }
+                }
+                let exec = state.entry(&id);
                 match &r.status {
                     AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
                         exec.phase = Phase::Testing;
@@ -757,6 +787,7 @@ async fn run_group_with_workspaces(
                 }
             }
             Err(e) => {
+                let exec = state.entry(&id);
                 reset_or_fail(exec, config);
                 exec.last_error = Some(e.to_string());
                 eprintln!("[ralph] agent error for {id}: {e}");
@@ -817,11 +848,20 @@ async fn run_group_singleton(
     let ctx = AgentContext::implement(&t.id, &t.title, &t.description, last_feedback);
     let result = agent::invoke_agent(AgentRole::Implementer, &ctx, config, None, registry).await;
 
-    let exec = state.entry(&t.id);
-    exec.attempts += 1;
+    {
+        let exec = state.entry(&t.id);
+        exec.attempts += 1;
+    }
     match result {
         Ok(r) => {
             *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+            if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
+                let attempts = state.tasks.get(&t.id).map_or(0, |e| e.attempts);
+                if let Err(e) = record_nit(&t.id, "implementer", attempts, suggestions).await {
+                    eprintln!("[ralph] failed to record nit: {e}");
+                }
+            }
+            let exec = state.entry(&t.id);
             match &r.status {
                 AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
                     exec.phase = Phase::Testing;
@@ -835,6 +875,7 @@ async fn run_group_singleton(
             }
         }
         Err(e) => {
+            let exec = state.entry(&t.id);
             reset_or_fail(exec, config);
             exec.last_error = Some(e.to_string());
             eprintln!("[ralph] agent error for {}: {e}", t.id);
@@ -842,7 +883,11 @@ async fn run_group_singleton(
     }
 
     // Attribute files via pre/post snapshot
-    if exec.phase == Phase::Testing {
+    if state
+        .tasks
+        .get(&t.id)
+        .is_some_and(|e| e.phase == Phase::Testing)
+    {
         let post_files = agent::jj_changed_files().await.unwrap_or_default();
         let new_files: Vec<PathBuf> = post_files
             .into_iter()
