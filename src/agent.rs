@@ -582,6 +582,7 @@ pub async fn invoke_agent(
         .arg("--model")
         .arg(config.model_for(role.label()))
         .arg("--dangerously-skip-permissions")
+        .arg("--no-session-persistence")
         .arg("--strict-mcp-config")
         .arg("--mcp-config")
         .arg(r#"{"mcpServers":{}}"#)
