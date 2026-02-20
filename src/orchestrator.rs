@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command as TokioCommand;
 
 use crate::agent::{
-    self, AgentContext, AgentRole, AgentStatus, FEEDBACK_MAX_LEN, ProcessRegistry,
+    self, AgentContext, AgentResult, AgentRole, AgentStatus, FEEDBACK_MAX_LEN, ProcessRegistry,
     build_feedback_history, truncate_feedback,
 };
 use crate::config::Config;
@@ -118,6 +119,100 @@ async fn record_nit(
     crate::nit::append_nit(&path, &nit).await
 }
 
+/// Extract proposed tasks from an agent result, assign IDs,
+/// deduplicate, and append to the task file.
+///
+/// Returns the number of tasks actually added.
+async fn ingest_new_tasks(
+    result: &AgentResult,
+    tasks_path: &Path,
+    source_label: &str,
+) -> Result<usize> {
+    let proposals = result.parse_new_tasks();
+    if proposals.is_empty() {
+        return Ok(0);
+    }
+    materialize_proposed_tasks(&proposals, tasks_path, source_label).await
+}
+
+/// Parse a numbered-list failure reason into tasks and append them.
+///
+/// Used as a fallback when the final reviewer returns a failure
+/// reason without structured `NEW_TASKS:` output.
+async fn ingest_from_failure_reason(
+    reason: &str,
+    tasks_path: &Path,
+    source_label: &str,
+) -> Result<usize> {
+    let proposals = agent::tasks_from_numbered_list(reason);
+    if proposals.is_empty() {
+        return Ok(0);
+    }
+    materialize_proposed_tasks(&proposals, tasks_path, source_label).await
+}
+
+/// Shared logic: validate, deduplicate, assign IDs, and append proposed tasks.
+async fn materialize_proposed_tasks(
+    proposals: &[agent::ProposedTask],
+    tasks_path: &Path,
+    source_label: &str,
+) -> Result<usize> {
+    let existing = task::load_tasks(tasks_path).await.unwrap_or_default();
+    let existing_ids: HashSet<&str> = existing.iter().map(|t| t.id.as_str()).collect();
+    let existing_titles: HashSet<&str> = existing.iter().map(|t| t.title.as_str()).collect();
+    let max_priority = existing.iter().map(|t| t.priority).max().unwrap_or(0);
+
+    let mut gen_counter = existing
+        .iter()
+        .filter_map(|t| t.id.strip_prefix("GEN-")?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+
+    let mut new_tasks = Vec::new();
+    let mut new_ids: HashSet<String> = HashSet::new();
+
+    for p in proposals {
+        // Deduplicate by title — skip if an identical task already exists.
+        if existing_titles.contains(p.title.as_str()) {
+            continue;
+        }
+
+        let id = match &p.id {
+            Some(id)
+                if !id.trim().is_empty()
+                    && !existing_ids.contains(id.as_str())
+                    && !new_ids.contains(id) =>
+            {
+                id.clone()
+            }
+            _ => {
+                gen_counter += 1;
+                format!("GEN-{gen_counter}")
+            }
+        };
+        new_ids.insert(id.clone());
+        new_tasks.push(Task {
+            id,
+            title: p.title.clone(),
+            description: p.description.clone(),
+            priority: p.priority.unwrap_or(max_priority + 1),
+            blocked_by: p.blocked_by.clone(),
+        });
+    }
+
+    let count = new_tasks.len();
+    if count > 0 {
+        task::append_tasks(tasks_path, &new_tasks).await?;
+        for t in &new_tasks {
+            eprintln!(
+                "[ralph] {source_label} → new task: [{}] {} (pri={})",
+                t.id, t.title, t.priority
+            );
+        }
+    }
+    Ok(count)
+}
+
 /// Main orchestration loop. Iterates until convergence
 /// (all tasks done + reviewer approves), stagnation
 /// (max attempts exceeded), or iteration cap.
@@ -203,15 +298,24 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                     );
                     return Ok(());
                 }
-                AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                    eprintln!(
-                        "[ralph] reviewer found issues: \
-                         {reason}"
-                    );
-                    eprintln!(
-                        "[ralph] issues should be added as \
-                         new tasks. Stopping."
-                    );
+                AgentStatus::Failure { ref reason } | AgentStatus::NeedsRetry { ref reason } => {
+                    eprintln!("[ralph] reviewer found issues: {reason}");
+
+                    // First, try structured NEW_TASKS from the reviewer output.
+                    let mut added = ingest_new_tasks(&review, tasks_path, "final review").await?;
+
+                    // Fallback: parse numbered items from the failure reason.
+                    if added == 0 {
+                        added =
+                            ingest_from_failure_reason(reason, tasks_path, "final review").await?;
+                    }
+
+                    if added > 0 {
+                        eprintln!("[ralph] {added} new task(s) queued from final review");
+                        continue; // Re-enter the main loop
+                    }
+
+                    eprintln!("[ralph] no tasks extracted from review, stopping.");
                     return Ok(());
                 }
             }
@@ -219,8 +323,15 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
         // Resume interrupted in-flight tasks before
         // scheduling new work.
-        let made_progress =
-            resume_inflight(&tasks, &mut state, config, &registry, &mut cumulative_cost).await?;
+        let made_progress = resume_inflight(
+            &tasks,
+            &mut state,
+            config,
+            &registry,
+            &mut cumulative_cost,
+            tasks_path,
+        )
+        .await?;
         if registry.is_shutdown() {
             eprintln!("[ralph] shutdown requested, saving state...");
             state.save(&state_path).await?;
@@ -281,11 +392,19 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                     config,
                     &registry,
                     &mut cumulative_cost,
+                    tasks_path,
                 )
                 .await?;
             } else {
-                run_group_singleton(&group, &mut state, config, &registry, &mut cumulative_cost)
-                    .await?;
+                run_group_singleton(
+                    &group,
+                    &mut state,
+                    config,
+                    &registry,
+                    &mut cumulative_cost,
+                    tasks_path,
+                )
+                .await?;
             }
 
             state.save(&state_path).await?;
@@ -304,7 +423,15 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             }
 
             // Advance any tasks now at Testing/Reviewing
-            resume_inflight(&tasks, &mut state, config, &registry, &mut cumulative_cost).await?;
+            resume_inflight(
+                &tasks,
+                &mut state,
+                config,
+                &registry,
+                &mut cumulative_cost,
+                tasks_path,
+            )
+            .await?;
             state.save(&state_path).await?;
 
             if registry.is_shutdown() {
@@ -366,6 +493,7 @@ async fn resume_inflight(
     config: &Config,
     registry: &ProcessRegistry,
     cumulative_cost: &mut f64,
+    tasks_path: &Path,
 ) -> Result<bool> {
     let mut progressed = false;
 
@@ -408,6 +536,11 @@ async fn resume_inflight(
                         if let Err(e) = record_nit(&id, "tester", attempts, suggestions).await {
                             eprintln!("[ralph] failed to record nit: {e}");
                         }
+                    }
+                    // Ingest any new tasks proposed by the tester.
+                    if let Err(e) = ingest_new_tasks(&r, tasks_path, &format!("tester/{id}")).await
+                    {
+                        eprintln!("[ralph] failed to ingest new tasks from tester: {e}");
                     }
                     let exec = state.entry(&id);
                     match r.status {
@@ -499,6 +632,12 @@ async fn resume_inflight(
                         if let Err(e) = record_nit(&id, "reviewer", attempts, suggestions).await {
                             eprintln!("[ralph] failed to record nit: {e}");
                         }
+                    }
+                    // Ingest any new tasks proposed by the reviewer.
+                    if let Err(e) =
+                        ingest_new_tasks(&r, tasks_path, &format!("reviewer/{id}")).await
+                    {
+                        eprintln!("[ralph] failed to ingest new tasks from reviewer: {e}");
                     }
                     let exec = state.entry(&id);
                     match r.status {
@@ -720,6 +859,7 @@ async fn run_group_with_workspaces(
     config: &Config,
     registry: &ProcessRegistry,
     cumulative_cost: &mut f64,
+    tasks_path: &Path,
 ) -> Result<()> {
     // Create workspaces and spawn agents
     let mut handles = Vec::new();
@@ -800,6 +940,11 @@ async fn run_group_with_workspaces(
                         eprintln!("[ralph] failed to record nit: {e}");
                     }
                 }
+                // Ingest any new tasks proposed by the implementer.
+                if let Err(e) = ingest_new_tasks(&r, tasks_path, &format!("implementer/{id}")).await
+                {
+                    eprintln!("[ralph] failed to ingest new tasks from implementer: {e}");
+                }
                 let exec = state.entry(&id);
                 match &r.status {
                     AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
@@ -865,6 +1010,7 @@ async fn run_group_singleton(
     config: &Config,
     registry: &ProcessRegistry,
     cumulative_cost: &mut f64,
+    tasks_path: &Path,
 ) -> Result<()> {
     let t = group[0];
     let pre_files = agent::jj_changed_files().await.unwrap_or_default();
@@ -909,6 +1055,11 @@ async fn run_group_singleton(
                 if let Err(e) = record_nit(&t.id, "implementer", attempts, suggestions).await {
                     eprintln!("[ralph] failed to record nit: {e}");
                 }
+            }
+            // Ingest any new tasks proposed by the implementer.
+            if let Err(e) = ingest_new_tasks(&r, tasks_path, &format!("implementer/{}", t.id)).await
+            {
+                eprintln!("[ralph] failed to ingest new tasks from implementer: {e}");
             }
             let exec = state.entry(&t.id);
             match &r.status {

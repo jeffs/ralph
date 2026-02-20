@@ -31,6 +31,22 @@ project conventions.
    - Are there security concerns (injection, XSS, etc.)?
 4. Do not modify any code. Only observe and report.
 
+## Spawning Follow-up Tasks
+
+If you discover issues that require separate work (not fixable by
+retrying the current task), emit them as structured tasks. Place
+them after a `NEW_TASKS:` line, one JSON object per line:
+
+```
+NEW_TASKS:
+{"title":"Fix widget config location","description":"Move widget config from CellManifest to notebook TOML per §7.4","priority":2}
+{"title":"Add missing NumberInput variant","description":"Add NumberInput to WidgetConfig per §7.1","priority":3}
+```
+
+Fields: `title` (required), `description` (optional), `priority`
+(optional, lower = higher), `blocked_by` (optional, list of task
+IDs). The orchestrator assigns IDs automatically.
+
 ## Output Contract
 
 If the implementation is acceptable:
@@ -45,8 +61,9 @@ If the implementation is acceptable but has minor suggestions (style, naming, op
 STATUS: APPROVED_WITH_NITS: <suggestions>
 ```
 
-If there are correctness issues, missing requirements, or bugs:
+If there are correctness issues, missing requirements, or bugs,
+emit them as NEW_TASKS (above) and then:
 
 ```
-STATUS: FAILURE: <list of issues>
+STATUS: FAILURE: <summary of issues>
 ```

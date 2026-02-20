@@ -116,6 +116,35 @@ pub async fn write_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
     Ok(())
 }
 
+/// Append tasks to a JSONL file without rewriting existing content.
+pub async fn append_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut buf = String::new();
+    for t in tasks {
+        buf.push_str(&serde_json::to_string(t)?);
+        buf.push('\n');
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(buf.as_bytes()).await?;
+    Ok(())
+}
+
+/// Generate the next auto-ID for dynamically discovered tasks.
+/// Scans existing IDs for the `GEN-N` pattern and increments.
+#[allow(dead_code)]
+pub fn next_generated_id(existing: &[Task]) -> String {
+    let max = existing
+        .iter()
+        .filter_map(|t| t.id.strip_prefix("GEN-")?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("GEN-{}", max + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +247,44 @@ mod tests {
         let input = r#"{"id":"T1","title":"A","priority":1}
 {"id":"T1","title":"B","priority":2}"#;
         assert!(parse_tasks(input).is_err());
+    }
+
+    #[test]
+    fn next_generated_id_empty() {
+        assert_eq!(next_generated_id(&[]), "GEN-1");
+    }
+
+    #[test]
+    fn next_generated_id_increments() {
+        let tasks = vec![
+            Task {
+                id: "GEN-3".into(),
+                title: "A".into(),
+                description: String::new(),
+                priority: 1,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "T1".into(),
+                title: "B".into(),
+                description: String::new(),
+                priority: 2,
+                blocked_by: vec![],
+            },
+        ];
+        assert_eq!(next_generated_id(&tasks), "GEN-4");
+    }
+
+    #[test]
+    fn next_generated_id_ignores_non_gen() {
+        let tasks = vec![Task {
+            id: "FIX-10".into(),
+            title: "A".into(),
+            description: String::new(),
+            priority: 1,
+            blocked_by: vec![],
+        }];
+        assert_eq!(next_generated_id(&tasks), "GEN-1");
     }
 
     #[test]

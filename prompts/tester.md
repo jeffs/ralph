@@ -24,6 +24,19 @@ and run the project's test suite, then report results.
 4. If tests fail, report which tests failed and why.
 5. Do not modify any code. Only observe and report.
 
+## Spawning Follow-up Tasks
+
+If you discover bugs or issues unrelated to the current task's
+scope, emit them as structured tasks:
+
+```
+NEW_TASKS:
+{"title":"Fix regression in module X","description":"Details...","priority":2}
+```
+
+Fields: `title` (required), `description` (optional), `priority`
+(optional), `blocked_by` (optional). IDs are assigned automatically.
+
 ## Output Contract
 
 End your response with exactly one of:

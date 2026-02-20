@@ -321,6 +321,68 @@ impl AgentResult {
             Some(lines.join("\n") + "\n")
         }
     }
+
+    /// Extract proposed new tasks from the agent's output.
+    /// Looks for a `NEW_TASKS:` marker followed by JSONL lines.
+    pub fn parse_new_tasks(&self) -> Vec<ProposedTask> {
+        parse_proposed_tasks(&self.text)
+    }
+}
+
+/// Parse proposed tasks from agent output text.
+///
+/// Looks for a line starting with `NEW_TASKS:`, then collects
+/// subsequent lines that parse as `ProposedTask` JSON objects.
+/// Stops at the first blank line or non-JSON line after the marker.
+fn parse_proposed_tasks(text: &str) -> Vec<ProposedTask> {
+    let mut tasks = Vec::new();
+    let mut in_section = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("NEW_TASKS:") {
+            in_section = true;
+            // Check for inline JSON after the colon
+            let after = trimmed.strip_prefix("NEW_TASKS:").unwrap_or("").trim();
+            if after.starts_with('{')
+                && let Ok(task) = serde_json::from_str::<ProposedTask>(after)
+            {
+                tasks.push(task);
+            }
+            continue;
+        }
+
+        if in_section {
+            if trimmed.is_empty() {
+                break;
+            }
+            if trimmed.starts_with('{')
+                && let Ok(task) = serde_json::from_str::<ProposedTask>(trimmed)
+            {
+                tasks.push(task);
+            }
+            // Skip non-JSON lines (markdown fencing, etc.)
+        }
+    }
+
+    tasks
+}
+
+/// A task proposed by an agent via the `NEW_TASKS:` protocol.
+/// The `id` field is optional — the orchestrator generates one
+/// if absent or colliding with an existing task.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProposedTask {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub priority: Option<u32>,
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
 }
 
 /// Response shape from `claude -p --output-format json`
@@ -731,6 +793,42 @@ pub async fn invoke_agent(
         status,
         cost_usd,
     })
+}
+
+/// Parse a numbered-list failure reason into individual proposed tasks.
+///
+/// Recognizes patterns like "1. description" or "2) description" and
+/// creates one [`ProposedTask`] per item. Used as a fallback when an
+/// agent returns a failure reason without structured `NEW_TASKS:` output.
+pub fn tasks_from_numbered_list(reason: &str) -> Vec<ProposedTask> {
+    let mut tasks = Vec::new();
+    for line in reason.lines() {
+        let trimmed = line.trim();
+        if let Some(text) = strip_numbered_prefix(trimmed)
+            && !text.is_empty()
+        {
+            tasks.push(ProposedTask {
+                id: None,
+                title: text.to_string(),
+                description: String::new(),
+                priority: None,
+                blocked_by: vec![],
+            });
+        }
+    }
+    tasks
+}
+
+/// Strip a leading numbered prefix like "1. " or "2) " from a line.
+fn strip_numbered_prefix(line: &str) -> Option<&str> {
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    if rest.len() == line.trim().len() {
+        return None; // No leading digits
+    }
+    rest.strip_prefix('.')
+        .or_else(|| rest.strip_prefix(')'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// Maximum length for captured reason text.
@@ -1297,6 +1395,91 @@ Done!"#
             classify_failure("something unexpected happened"),
             FailureKind::Unknown
         );
+    }
+
+    #[test]
+    fn parse_new_tasks_basic() {
+        let text = r#"Here are the issues.
+NEW_TASKS:
+{"title":"Fix widget config","description":"Move to TOML","priority":1}
+{"title":"Add NumberInput","priority":2}
+
+STATUS: FAILURE: issues found"#;
+        let tasks = parse_proposed_tasks(text);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].title, "Fix widget config");
+        assert_eq!(tasks[0].priority, Some(1));
+        assert_eq!(tasks[1].title, "Add NumberInput");
+        assert!(tasks[0].id.is_none());
+    }
+
+    #[test]
+    fn parse_new_tasks_with_id() {
+        let text = "NEW_TASKS:\n{\"id\":\"FIX-1\",\"title\":\"Fix it\"}\n";
+        let tasks = parse_proposed_tasks(text);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id.as_deref(), Some("FIX-1"));
+    }
+
+    #[test]
+    fn parse_new_tasks_empty_when_absent() {
+        let text = "Did some work.\nSTATUS: SUCCESS\n";
+        let tasks = parse_proposed_tasks(text);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn parse_new_tasks_stops_at_blank_line() {
+        let text = "NEW_TASKS:\n{\"title\":\"A\"}\n\n{\"title\":\"B\"}\n";
+        let tasks = parse_proposed_tasks(text);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "A");
+    }
+
+    #[test]
+    fn parse_new_tasks_skips_non_json() {
+        let text = "NEW_TASKS:\n```json\n{\"title\":\"A\"}\n```\n";
+        let tasks = parse_proposed_tasks(text);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "A");
+    }
+
+    #[test]
+    fn tasks_from_numbered_list_basic() {
+        let reason =
+            "1. Widget config in wrong place\n2. Missing NumberInput\n3. Wrong field names";
+        let tasks = tasks_from_numbered_list(reason);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].title, "Widget config in wrong place");
+        assert_eq!(tasks[1].title, "Missing NumberInput");
+        assert_eq!(tasks[2].title, "Wrong field names");
+    }
+
+    #[test]
+    fn tasks_from_numbered_list_handles_parens() {
+        let reason = "1) First issue\n2) Second issue";
+        let tasks = tasks_from_numbered_list(reason);
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn tasks_from_numbered_list_ignores_non_numbered() {
+        let reason = "Some preamble\n1. Actual issue\nMore text";
+        let tasks = tasks_from_numbered_list(reason);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Actual issue");
+    }
+
+    #[test]
+    fn strip_numbered_prefix_basic() {
+        assert_eq!(strip_numbered_prefix("1. hello"), Some("hello"));
+        assert_eq!(
+            strip_numbered_prefix("12. multi-digit"),
+            Some("multi-digit")
+        );
+        assert_eq!(strip_numbered_prefix("3) paren style"), Some("paren style"));
+        assert_eq!(strip_numbered_prefix("no number"), None);
+        assert_eq!(strip_numbered_prefix("1."), None); // empty after strip
     }
 
     #[test]

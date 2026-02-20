@@ -23,6 +23,23 @@ and make the minimal code changes to complete it.
 5. Do not commit (no `jj commit` or `jj new`). Ralph handles commits.
 6. Do not change directories (`cd`). Ralph manages the working directory.
 
+## Spawning Follow-up Tasks
+
+If you discover work that falls outside the scope of your current
+task (a prerequisite, a related bug, a spec gap), emit it as a
+structured task. Place after a `NEW_TASKS:` line, one JSON object
+per line:
+
+```
+NEW_TASKS:
+{"title":"Fix the dependency","description":"Details...","priority":2}
+```
+
+Fields: `title` (required), `description` (optional), `priority`
+(optional), `blocked_by` (optional). IDs are assigned automatically.
+Only emit tasks for genuinely separate work — do not use this to
+defer parts of your own task.
+
 ## Output Contract
 
 End your response with exactly one of:
