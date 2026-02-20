@@ -214,6 +214,16 @@ impl AgentContext {
         }
     }
 
+    /// Return the task ID, if this context is task-scoped.
+    fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Plan { .. } => None,
+            Self::Implement { task_id, .. }
+            | Self::Test { task_id, .. }
+            | Self::Review { task_id, .. } => Some(task_id),
+        }
+    }
+
     /// Render the context variables into the prompt template.
     fn interpolate(&self, template: &str) -> String {
         match self {
@@ -556,10 +566,16 @@ pub async fn invoke_agent(
     let prompt = context.interpolate(&template);
 
     let model = config.model_for_attempt(role.label(), attempt);
-    eprintln!(
-        "[ralph] invoking {} agent (model: {model})...",
-        role.label()
-    );
+    match context.task_id() {
+        Some(id) => eprintln!(
+            "[ralph] {id} — invoking {} agent (model: {model})...",
+            role.label()
+        ),
+        None => eprintln!(
+            "[ralph] invoking {} agent (model: {model})...",
+            role.label()
+        ),
+    }
 
     // Spawn claude in its own process group so that child
     // processes (rust-analyzer, LSP servers, cargo) are
