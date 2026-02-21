@@ -127,6 +127,13 @@ async fn main() -> Result<()> {
     }
 }
 
+const DEFAULT_PROMPTS: &[(&str, &str)] = &[
+    ("planner.md", include_str!("../prompts/planner.md")),
+    ("implementer.md", include_str!("../prompts/implementer.md")),
+    ("tester.md", include_str!("../prompts/tester.md")),
+    ("reviewer.md", include_str!("../prompts/reviewer.md")),
+];
+
 async fn cmd_init() -> Result<()> {
     let ralph_dir = PathBuf::from(".ralph");
     tokio::fs::create_dir_all(&ralph_dir).await?;
@@ -141,6 +148,15 @@ async fn cmd_init() -> Result<()> {
         let default = config::Config::default();
         let toml_str = toml::to_string_pretty(&default)?;
         tokio::fs::write(&config_path, toml_str).await?;
+    }
+
+    let prompts_dir = PathBuf::from("prompts");
+    tokio::fs::create_dir_all(&prompts_dir).await?;
+    for (name, content) in DEFAULT_PROMPTS {
+        let path = prompts_dir.join(name);
+        if !path.exists() {
+            tokio::fs::write(&path, content).await?;
+        }
     }
 
     eprintln!("Initialized .ralph/");
