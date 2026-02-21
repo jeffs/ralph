@@ -333,10 +333,6 @@ async fn cmd_status(json: bool) -> Result<()> {
 
 fn cmd_status_json(tasks: &[task::Task], exec_state: &state::ExecutionState) -> Result<()> {
     #[derive(serde::Serialize)]
-    struct StatusOutput<'a> {
-        tasks: Vec<TaskStatus<'a>>,
-    }
-    #[derive(serde::Serialize)]
     struct TaskStatus<'a> {
         id: &'a str,
         title: &'a str,
@@ -350,30 +346,31 @@ fn cmd_status_json(tasks: &[task::Task], exec_state: &state::ExecutionState) -> 
         files_changed: &'a [std::path::PathBuf],
         started_at: Option<u64>,
         completed_at: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        postmortem: Option<&'a str>,
     }
     let default_exec = state::TaskExecution::default();
-    let out = StatusOutput {
-        tasks: tasks
-            .iter()
-            .map(|t| {
-                let e = exec_state.tasks.get(&t.id).unwrap_or(&default_exec);
-                TaskStatus {
-                    id: &t.id,
-                    title: &t.title,
-                    description: &t.description,
-                    priority: t.priority,
-                    blocked_by: &t.blocked_by,
-                    phase: &e.phase,
-                    phase_ordinal: e.phase.phase_ordinal(),
-                    attempts: e.attempts,
-                    last_error: e.last_error.as_deref(),
-                    files_changed: &e.files_changed,
-                    started_at: e.started_at,
-                    completed_at: e.completed_at,
-                }
-            })
-            .collect(),
-    };
+    let out: Vec<TaskStatus> = tasks
+        .iter()
+        .map(|t| {
+            let e = exec_state.tasks.get(&t.id).unwrap_or(&default_exec);
+            TaskStatus {
+                id: &t.id,
+                title: &t.title,
+                description: &t.description,
+                priority: t.priority,
+                blocked_by: &t.blocked_by,
+                phase: &e.phase,
+                phase_ordinal: e.phase.phase_ordinal(),
+                attempts: e.attempts,
+                last_error: e.last_error.as_deref(),
+                files_changed: &e.files_changed,
+                started_at: e.started_at,
+                completed_at: e.completed_at,
+                postmortem: e.postmortem.as_deref(),
+            }
+        })
+        .collect();
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
@@ -460,15 +457,11 @@ async fn cmd_nits_list(all: bool) -> Result<()> {
         if !all && n.status != nit::NitStatus::Open {
             continue;
         }
-        let preview = n.content.replace('\n', " ");
-        let content_preview = if preview.len() > 80 {
-            let mut end = 80;
-            while !preview.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}...", &preview[..end])
+        let content_preview = if !n.summary.is_empty() {
+            n.summary.clone()
         } else {
-            preview
+            let first_line = n.content.lines().next().unwrap_or(&n.content);
+            nit::truncate_with_ellipsis(first_line, 60)
         };
         let status_tag = if all && n.status != nit::NitStatus::Open {
             match n.status {
@@ -519,14 +512,19 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
         anyhow::bail!("task ID '{task_id}' already exists");
     }
 
-    let first_line = nit_entry
-        .content
-        .lines()
-        .next()
-        .unwrap_or(&nit_entry.content);
+    let title = if nit_entry.summary.is_empty() {
+        let first_line = nit_entry
+            .content
+            .lines()
+            .next()
+            .unwrap_or(&nit_entry.content);
+        nit::truncate_with_ellipsis(first_line, 60)
+    } else {
+        nit_entry.summary.clone()
+    };
     let new_task = task::Task {
         id: task_id.clone(),
-        title: format!("Nit: {first_line}"),
+        title,
         description: nit_entry.content.clone(),
         priority: max_priority + 1,
         blocked_by: vec![],

@@ -106,12 +106,14 @@ async fn record_nit(
     let path = PathBuf::from(".ralph/nits.jsonl");
     let nits = crate::nit::load_nits(&path).await.unwrap_or_default();
     let id = crate::nit::next_nit_id(&nits);
+    let summary = crate::nit::summarize(suggestions);
     let nit = crate::nit::Nit {
         id,
         source_task: source_task.to_string(),
         source_role: source_role.to_string(),
         attempt,
         content: suggestions.to_string(),
+        summary,
         status: crate::nit::NitStatus::Open,
         promoted_to: None,
         created_at: crate::state::unix_now(),

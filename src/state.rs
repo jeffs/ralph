@@ -36,6 +36,10 @@ pub struct TaskExecution {
     /// Unix timestamp when the task completed (reached Done/Failed).
     #[serde(default)]
     pub completed_at: Option<u64>,
+    /// Free-text postmortem note for triaged failures. Distinguishes
+    /// investigated failures from fresh ones needing attention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postmortem: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +78,7 @@ impl Default for TaskExecution {
             phase_entered_at: None,
             started_at: None,
             completed_at: None,
+            postmortem: None,
         }
     }
 }
