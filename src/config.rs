@@ -30,16 +30,35 @@ impl Default for WorkspaceConfig {
 
 /// Per-role model overrides. Any omitted role falls back to the
 /// top-level `model` field.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_planner_model", skip_serializing_if = "Option::is_none")]
     pub planner: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implementer: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tester: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_reviewer_model", skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<String>,
+}
+
+fn default_planner_model() -> Option<String> {
+    Some("opus".to_string())
+}
+
+fn default_reviewer_model() -> Option<String> {
+    Some("opus".to_string())
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            planner: default_planner_model(),
+            implementer: None,
+            tester: None,
+            reviewer: default_reviewer_model(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -159,10 +178,11 @@ impl Default for Config {
 
 impl ModelConfig {
     fn all_default(&self) -> bool {
-        self.planner.is_none()
-            && self.implementer.is_none()
-            && self.tester.is_none()
-            && self.reviewer.is_none()
+        let d = Self::default();
+        self.planner == d.planner
+            && self.implementer == d.implementer
+            && self.tester == d.tester
+            && self.reviewer == d.reviewer
     }
 
     /// Look up the override for a role by its label name.
@@ -217,10 +237,10 @@ mod tests {
     #[test]
     fn model_for_falls_back_to_default() {
         let config = Config::default();
-        assert_eq!(config.model_for("planner"), "sonnet");
+        assert_eq!(config.model_for("planner"), "opus");
         assert_eq!(config.model_for("implementer"), "sonnet");
         assert_eq!(config.model_for("tester"), "sonnet");
-        assert_eq!(config.model_for("reviewer"), "sonnet");
+        assert_eq!(config.model_for("reviewer"), "opus");
     }
 
     #[test]
@@ -243,7 +263,8 @@ mod tests {
     fn deserialize_simple_model_only() {
         let toml_str = r#"model = "haiku""#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.model_for("planner"), "haiku");
+        // planner/reviewer still default to opus even with a different base model
+        assert_eq!(config.model_for("planner"), "opus");
         assert_eq!(config.model_for("implementer"), "haiku");
     }
 
@@ -358,17 +379,7 @@ escalation_model = "opus"
     #[test]
     fn model_for_attempt_escalates_after_threshold() {
         let config = Config::default(); // escalation_after=2, no escalation_model
-        // Attempt 3 exceeds threshold → falls back to reviewer model (sonnet by default).
-        assert_eq!(config.model_for_attempt("implementer", 3), "sonnet");
-
-        // With a reviewer override, escalation uses the reviewer model.
-        let config = Config {
-            models: ModelConfig {
-                reviewer: Some("opus".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        // Attempt 3 exceeds threshold → falls back to reviewer model (opus by default).
         assert_eq!(config.model_for_attempt("implementer", 3), "opus");
     }
 
