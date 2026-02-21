@@ -289,7 +289,9 @@ async fn cmd_status(json: bool) -> Result<()> {
                 state::Phase::Done => done += 1,
                 state::Phase::Failed => failed += 1,
                 state::Phase::Pending => pending += 1,
-                _ => in_progress += 1,
+                state::Phase::Implementing
+                | state::Phase::Testing
+                | state::Phase::Reviewing => in_progress += 1,
             }
             let duration = match (e.started_at, e.completed_at) {
                 (Some(s), Some(c)) => format!(" ({}s)", c.saturating_sub(s)),
@@ -342,6 +344,7 @@ fn cmd_status_json(tasks: &[task::Task], exec_state: &state::ExecutionState) -> 
         priority: u32,
         blocked_by: &'a [String],
         phase: &'a state::Phase,
+        phase_ordinal: u8,
         attempts: u32,
         last_error: Option<&'a str>,
         files_changed: &'a [std::path::PathBuf],
@@ -361,6 +364,7 @@ fn cmd_status_json(tasks: &[task::Task], exec_state: &state::ExecutionState) -> 
                     priority: t.priority,
                     blocked_by: &t.blocked_by,
                     phase: &e.phase,
+                    phase_ordinal: e.phase.phase_ordinal(),
                     attempts: e.attempts,
                     last_error: e.last_error.as_deref(),
                     files_changed: &e.files_changed,

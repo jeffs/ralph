@@ -85,7 +85,7 @@ file is missing.
 
 Each task tracks:
 
-- **phase**: `Pending` → `Testing` → `Reviewing` → `Done` (or `Failed`)
+- **phase**: `Pending` → `Implementing` → `Testing` → `Reviewing` → `Done` (or `Failed`)
 - **attempts**: number of implementation cycles
 - **files_changed**: paths modified by the implementer
 - **feedback**: full agent output from failed test/review runs, forwarded
@@ -143,10 +143,10 @@ If no status line is found, Ralph treats it as `NEEDS_RETRY`.
 ## Task lifecycle
 
 ```
-Pending ──[implementer]──► Testing ──[tester]──► Reviewing ──[reviewer]──► Done
-   ▲                          │                      │
-   └──────────────────────────┴──────────────────────┘
-         (on failure, reset to Pending with feedback)
+Pending ──► Implementing ──[implementer]──► Testing ──[tester]──► Reviewing ──[reviewer]──► Done
+   ▲              │                            │                      │
+   └──────────────┴────────────────────────────┴──────────────────────┘
+                     (on failure, reset to Pending with feedback)
 ```
 
 After `max_attempts` failures (default: 3), the task moves to `Failed`

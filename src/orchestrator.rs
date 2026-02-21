@@ -497,6 +497,21 @@ async fn resume_inflight(
 ) -> Result<bool> {
     let mut progressed = false;
 
+    // Implementing phase → task was mid-implementation when Ralph
+    // restarted. Reset to Pending so the scheduler picks it up again.
+    let implementing: Vec<String> = state
+        .tasks
+        .iter()
+        .filter(|(_, e)| e.phase == Phase::Implementing)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in implementing {
+        eprintln!("[ralph] {id} stuck in Implementing, resetting to Pending");
+        let exec = state.entry(&id);
+        exec.phase = Phase::Pending;
+        progressed = true;
+    }
+
     // Testing phase → run tester (parallel for disjoint file sets)
     let testing: Vec<String> = state
         .tasks
@@ -699,6 +714,7 @@ fn checkpoint_description(group: &[&Task], state: &ExecutionState) -> String {
                 .get(&t.id)
                 .map(|e| match e.phase {
                     Phase::Pending => "pending",
+                    Phase::Implementing => "implementing",
                     Phase::Testing => "testing",
                     Phase::Reviewing => "reviewing",
                     Phase::Done => "done",
@@ -879,6 +895,16 @@ async fn run_group_with_workspaces(
         };
         created_ws.push(t.id.clone());
 
+        {
+            let exec = state.entry(&t.id);
+            exec.phase = Phase::Implementing;
+            if exec.started_at.is_none() {
+                exec.started_at = Some(crate::state::unix_now());
+            }
+            exec.phase_entered_at = Some(crate::state::unix_now());
+        }
+        state.save(&PathBuf::from(STATE_PATH)).await?;
+
         let id = t.id.clone();
         let title = t.title.clone();
         let desc = t.description.clone();
@@ -1014,6 +1040,16 @@ async fn run_group_singleton(
 ) -> Result<()> {
     let t = group[0];
     let pre_files = agent::jj_changed_files().await.unwrap_or_default();
+
+    {
+        let exec = state.entry(&t.id);
+        exec.phase = Phase::Implementing;
+        if exec.started_at.is_none() {
+            exec.started_at = Some(crate::state::unix_now());
+        }
+        exec.phase_entered_at = Some(crate::state::unix_now());
+    }
+    state.save(&PathBuf::from(STATE_PATH)).await?;
 
     let (guidance, feedback_history, attempt) = state
         .tasks

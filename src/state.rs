@@ -41,10 +41,25 @@ pub struct TaskExecution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Pending,
+    Implementing,
     Testing,
     Reviewing,
     Done,
     Failed,
+}
+
+impl Phase {
+    /// Integer phase ID for sorting and machine consumption.
+    pub fn phase_ordinal(self) -> u8 {
+        match self {
+            Phase::Pending => 0,
+            Phase::Implementing => 1,
+            Phase::Testing => 2,
+            Phase::Reviewing => 3,
+            Phase::Done => 4,
+            Phase::Failed => 5,
+        }
+    }
 }
 
 impl Default for TaskExecution {
@@ -343,5 +358,25 @@ mod tests {
         assert_eq!(loaded.tasks["T1"].feedback.len(), 2);
         assert!(loaded.tasks["T1"].feedback[0].contains("Tester"));
         assert!(loaded.tasks["T1"].feedback[1].contains("Reviewer"));
+    }
+
+    #[test]
+    fn phase_ordinal_returns_correct_integers() {
+        assert_eq!(Phase::Pending.phase_ordinal(), 0);
+        assert_eq!(Phase::Implementing.phase_ordinal(), 1);
+        assert_eq!(Phase::Testing.phase_ordinal(), 2);
+        assert_eq!(Phase::Reviewing.phase_ordinal(), 3);
+        assert_eq!(Phase::Done.phase_ordinal(), 4);
+        assert_eq!(Phase::Failed.phase_ordinal(), 5);
+    }
+
+    #[test]
+    fn roundtrip_implementing_phase() {
+        let mut state = ExecutionState::default();
+        state.entry("T1").phase = Phase::Implementing;
+
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: ExecutionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.tasks["T1"].phase, Phase::Implementing);
     }
 }
