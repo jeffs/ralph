@@ -358,9 +358,10 @@ async fn cmd_status(json: bool) -> Result<()> {
 
     let archive_path = PathBuf::from(".ralph/archive.jsonl");
     if let Ok(archived) = task::load_archive(&archive_path).await
-        && !archived.is_empty() {
-            println!("Archived: {} task(s)", archived.len());
-        }
+        && !archived.is_empty()
+    {
+        println!("Archived: {} task(s)", archived.len());
+    }
 
     let nits_path = PathBuf::from(".ralph/nits.jsonl");
     if let Ok(nits) = nit::load_nits(&nits_path).await {

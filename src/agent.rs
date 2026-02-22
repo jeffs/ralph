@@ -12,9 +12,6 @@ use tokio::process::Command as TokioCommand;
 
 use crate::config::Config;
 
-/// Stderr patterns that indicate the agent is stuck waiting for a file lock.
-const STUCK_PATTERNS: &[&str] = &["Blocking waiting for file lock", "waiting for lock"];
-
 /// Tracks active child process group IDs so a centralized signal
 /// handler can clean them all up on SIGINT / SIGTERM.
 #[derive(Clone)]
@@ -752,6 +749,7 @@ pub async fn invoke_agent(
 
     // Spawn a task to stream stderr in real-time.
     let role_label = role.label();
+    let stuck_patterns = config.stuck_patterns.clone();
     let liveness = Arc::new(AgentLiveness {
         stuck: AtomicBool::new(false),
         last_stderr_at: Mutex::new(Instant::now()),
@@ -765,7 +763,7 @@ pub async fn invoke_agent(
             // Update liveness timestamp on every line — proves the
             // agent is actively communicating, even if CPU is low.
             *liveness_clone.last_stderr_at.lock().expect("liveness lock") = Instant::now();
-            if STUCK_PATTERNS.iter().any(|pat| line.contains(pat)) {
+            if stuck_patterns.iter().any(|pat| line.contains(pat)) {
                 liveness_clone.stuck.store(true, Ordering::Release);
             }
             collected.push(line);
@@ -1115,6 +1113,7 @@ pub async fn jj_changed_files_for(revision: &str) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
 
     #[test]
     fn parse_pcpu_output_sums_values() {
@@ -1373,6 +1372,7 @@ Done!"#
 
     #[test]
     fn stuck_patterns_match_known_lines() {
+        let patterns = config::default_stuck_patterns();
         let matching = [
             "Blocking waiting for file lock on package cache",
             "warning: waiting for lock on build directory",
@@ -1380,7 +1380,7 @@ Done!"#
         ];
         for line in &matching {
             assert!(
-                STUCK_PATTERNS.iter().any(|pat| line.contains(pat)),
+                patterns.iter().any(|pat| line.contains(pat.as_str())),
                 "expected pattern match for: {line}"
             );
         }
@@ -1388,6 +1388,7 @@ Done!"#
 
     #[test]
     fn stuck_patterns_do_not_match_unrelated_lines() {
+        let patterns = config::default_stuck_patterns();
         let non_matching = [
             "Compiling foo v0.1.0",
             "error[E0308]: mismatched types",
@@ -1396,7 +1397,7 @@ Done!"#
         ];
         for line in &non_matching {
             assert!(
-                !STUCK_PATTERNS.iter().any(|pat| line.contains(pat)),
+                !patterns.iter().any(|pat| line.contains(pat.as_str())),
                 "unexpected pattern match for: {line}"
             );
         }

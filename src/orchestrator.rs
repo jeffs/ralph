@@ -740,15 +740,14 @@ async fn resume_inflight(
                 .unwrap_or_default();
             let ctx = AgentContext::test(id, files);
             let mut cfg = config.clone();
-            if config.workspace.isolate_target_dir {
-                let target_dir = PathBuf::from(WS_DIR).join("target");
-                let target_dir = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join(&target_dir);
-                cfg.env.set.insert(
-                    "CARGO_TARGET_DIR".to_string(),
-                    target_dir.to_string_lossy().to_string(),
-                );
+            if !config.workspace.isolate_env.is_empty() {
+                let base = std::env::current_dir().unwrap_or_default().join(WS_DIR);
+                for (env_var, subdir) in &config.workspace.isolate_env {
+                    cfg.env.set.insert(
+                        env_var.clone(),
+                        base.join(subdir).to_string_lossy().to_string(),
+                    );
+                }
             }
             let reg = registry.clone();
             let id_owned = id.clone();
@@ -1140,11 +1139,10 @@ async fn run_group_with_workspaces(
             })
             .unwrap_or((None, None, 1));
         let mut cfg = config.clone();
-        if config.workspace.isolate_target_dir {
-            let target_dir = ws_path.join("target");
+        for (env_var, subdir) in &config.workspace.isolate_env {
             cfg.env.set.insert(
-                "CARGO_TARGET_DIR".to_string(),
-                target_dir.to_string_lossy().to_string(),
+                env_var.clone(),
+                ws_path.join(subdir).to_string_lossy().to_string(),
             );
         }
         let reg = registry.clone();
@@ -1292,15 +1290,14 @@ async fn run_group_singleton(
         feedback_history.as_deref(),
     );
     let mut cfg = config.clone();
-    if config.workspace.isolate_target_dir {
-        let target_dir = PathBuf::from(WS_DIR).join("target");
-        let target_dir = std::env::current_dir()
-            .unwrap_or_default()
-            .join(&target_dir);
-        cfg.env.set.insert(
-            "CARGO_TARGET_DIR".to_string(),
-            target_dir.to_string_lossy().to_string(),
-        );
+    if !config.workspace.isolate_env.is_empty() {
+        let base = std::env::current_dir().unwrap_or_default().join(WS_DIR);
+        for (env_var, subdir) in &config.workspace.isolate_env {
+            cfg.env.set.insert(
+                env_var.clone(),
+                base.join(subdir).to_string_lossy().to_string(),
+            );
+        }
     }
     let result =
         agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg, None, registry, attempt).await;

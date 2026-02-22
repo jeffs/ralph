@@ -5,25 +5,54 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RawWorkspaceConfig")]
 pub struct WorkspaceConfig {
     /// Paths to symlink from project root into each workspace
-    #[serde(default)]
     pub shared: Vec<String>,
-    /// When true, each workspace gets its own CARGO_TARGET_DIR
-    /// to avoid cargo lock contention. Increases disk usage.
+    /// Environment variables to isolate per workspace.
+    /// Each entry maps an env var name to a subdirectory
+    /// (e.g. `CARGO_TARGET_DIR` → `"target"`).
+    pub isolate_env: HashMap<String, String>,
+}
+
+/// Raw deserialization helper that supports both the legacy
+/// `isolate_target_dir` bool and the new `isolate_env` map.
+#[derive(Deserialize)]
+struct RawWorkspaceConfig {
+    #[serde(default)]
+    shared: Vec<String>,
     #[serde(default = "default_isolate_target_dir")]
-    pub isolate_target_dir: bool,
+    isolate_target_dir: bool,
+    isolate_env: Option<HashMap<String, String>>,
 }
 
 fn default_isolate_target_dir() -> bool {
     true
 }
 
+fn default_isolate_env() -> HashMap<String, String> {
+    HashMap::from([("CARGO_TARGET_DIR".to_string(), "target".to_string())])
+}
+
+impl From<RawWorkspaceConfig> for WorkspaceConfig {
+    fn from(raw: RawWorkspaceConfig) -> Self {
+        let isolate_env = match raw.isolate_env {
+            Some(map) => map,
+            None if raw.isolate_target_dir => default_isolate_env(),
+            None => HashMap::new(),
+        };
+        Self {
+            shared: raw.shared,
+            isolate_env,
+        }
+    }
+}
+
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             shared: Vec::new(),
-            isolate_target_dir: default_isolate_target_dir(),
+            isolate_env: default_isolate_env(),
         }
     }
 }
@@ -131,6 +160,11 @@ pub struct Config {
     /// Maximum number of triage rounds per run
     #[serde(default = "default_max_triage_rounds")]
     pub max_triage_rounds: u32,
+    /// Stderr patterns that indicate the agent is stuck (e.g. waiting
+    /// for a file lock). When detected, the monitor kills the agent
+    /// after a grace period.
+    #[serde(default = "default_stuck_patterns")]
+    pub stuck_patterns: Vec<String>,
 }
 
 fn default_model() -> String {
@@ -163,6 +197,13 @@ fn default_auto_triage() -> bool {
 
 fn default_max_triage_rounds() -> u32 {
     3
+}
+
+pub(crate) fn default_stuck_patterns() -> Vec<String> {
+    vec![
+        "Blocking waiting for file lock".to_string(),
+        "waiting for lock".to_string(),
+    ]
 }
 
 fn default_prompts_dir() -> PathBuf {
@@ -204,6 +245,7 @@ impl Default for Config {
             escalation_model: None,
             auto_triage: default_auto_triage(),
             max_triage_rounds: default_max_triage_rounds(),
+            stuck_patterns: default_stuck_patterns(),
         }
     }
 }
@@ -340,19 +382,112 @@ reviewer = "opus"
     }
 
     #[test]
-    fn isolate_target_dir_defaults_to_true() {
+    fn isolate_env_defaults_to_cargo_target() {
         let config: Config = toml::from_str("").unwrap();
-        assert!(config.workspace.isolate_target_dir);
+        assert_eq!(
+            config
+                .workspace
+                .isolate_env
+                .get("CARGO_TARGET_DIR")
+                .map(|s| s.as_str()),
+            Some("target")
+        );
     }
 
     #[test]
-    fn isolate_target_dir_can_be_disabled() {
+    fn isolate_env_from_legacy_false() {
         let toml_str = r#"
 [workspace]
 isolate_target_dir = false
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(!config.workspace.isolate_target_dir);
+        assert!(config.workspace.isolate_env.is_empty());
+    }
+
+    #[test]
+    fn isolate_env_explicit() {
+        let toml_str = r#"
+[workspace.isolate_env]
+CARGO_TARGET_DIR = "target"
+GOPATH = ".gopath"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.workspace.isolate_env.len(), 2);
+        assert_eq!(
+            config
+                .workspace
+                .isolate_env
+                .get("CARGO_TARGET_DIR")
+                .map(|s| s.as_str()),
+            Some("target")
+        );
+        assert_eq!(
+            config
+                .workspace
+                .isolate_env
+                .get("GOPATH")
+                .map(|s| s.as_str()),
+            Some(".gopath")
+        );
+    }
+
+    #[test]
+    fn isolate_env_wins_over_legacy() {
+        let toml_str = r#"
+[workspace]
+isolate_target_dir = true
+
+[workspace.isolate_env]
+GOPATH = ".gopath"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        // isolate_env takes precedence — no CARGO_TARGET_DIR
+        assert_eq!(config.workspace.isolate_env.len(), 1);
+        assert_eq!(
+            config
+                .workspace
+                .isolate_env
+                .get("GOPATH")
+                .map(|s| s.as_str()),
+            Some(".gopath")
+        );
+    }
+
+    #[test]
+    fn isolate_env_legacy_true() {
+        let toml_str = r#"
+[workspace]
+isolate_target_dir = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config
+                .workspace
+                .isolate_env
+                .get("CARGO_TARGET_DIR")
+                .map(|s| s.as_str()),
+            Some("target")
+        );
+    }
+
+    #[test]
+    fn stuck_patterns_defaults_to_cargo() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.stuck_patterns.len(), 2);
+        assert!(
+            config
+                .stuck_patterns
+                .iter()
+                .any(|p| p.contains("file lock"))
+        );
+    }
+
+    #[test]
+    fn deserialize_custom_stuck_patterns() {
+        let toml_str = r#"stuck_patterns = ["deadlock detected", "acquire lock"]"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.stuck_patterns.len(), 2);
+        assert_eq!(config.stuck_patterns[0], "deadlock detected");
     }
 
     #[test]
