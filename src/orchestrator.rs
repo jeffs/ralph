@@ -370,18 +370,28 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                     // First, try structured NEW_TASKS from the reviewer output.
                     let mut added = ingest_new_tasks(&review, tasks_path, "final review").await?;
 
-                    // Fallback: parse numbered items from the failure reason.
+                    // For Tiers 2 & 3, use the full reviewer output rather than
+                    // the reason string, which may be a generic parse-failure
+                    // message (e.g. "no STATUS line in agent output").
+                    let findings = if review.text.trim().is_empty() {
+                        reason.as_str()
+                    } else {
+                        review.text.as_str()
+                    };
+
+                    // Tier 2: parse numbered items from reviewer findings.
                     if added == 0 {
-                        added =
-                            ingest_from_failure_reason(reason, tasks_path, "final review").await?;
+                        added = ingest_from_failure_reason(findings, tasks_path, "final review")
+                            .await?;
                     }
 
-                    // Last resort: wrap the prose failure reason as a single task.
-                    if added == 0 && !reason.trim().is_empty() {
+                    // Tier 3: wrap prose as a single task.
+                    if added == 0 && !findings.trim().is_empty() {
+                        let desc = truncate_feedback(findings, FEEDBACK_MAX_LEN);
                         let fallback = vec![agent::ProposedTask {
                             id: None,
-                            title: truncate_for_title(reason),
-                            description: reason.to_string(),
+                            title: truncate_for_title(findings),
+                            description: desc,
                             priority: None,
                             blocked_by: vec![],
                         }];
@@ -1306,8 +1316,15 @@ async fn run_group_singleton(
         guidance.as_deref(),
         feedback_history.as_deref(),
     );
-    let result =
-        agent::invoke_agent(AgentRole::Implementer, &ctx, config, None, registry, attempt).await;
+    let result = agent::invoke_agent(
+        AgentRole::Implementer,
+        &ctx,
+        config,
+        None,
+        registry,
+        attempt,
+    )
+    .await;
 
     {
         let exec = state.entry(&t.id);
@@ -1437,5 +1454,31 @@ STATUS: SUCCESS"#;
         assert_eq!(decisions[0].nit_id, "NIT-3");
         assert_eq!(decisions[1].nit_id, "NIT-4");
         assert!(decisions[1].reason.is_none());
+    }
+
+    /// When the reviewer omits a STATUS line, `reason` is the generic
+    /// "no STATUS line in agent output" — useless for task creation.
+    /// The fix uses `review.text` (the full output) for Tiers 2 & 3.
+    /// This test verifies that `tasks_from_numbered_list` (the Tier 2
+    /// extractor) can recover tasks from realistic reviewer output that
+    /// lacks a STATUS line.
+    #[test]
+    fn tier2_extracts_tasks_from_full_review_text() {
+        let review_text = "\
+I found several issues:\n\
+1. The `parse_config` function doesn't validate the `timeout` field\n\
+2. Missing unit test for the error branch in `handle_request`\n\
+3. `unwrap()` on line 47 of lib.rs should propagate with `?`\n";
+
+        let tasks = agent::tasks_from_numbered_list(review_text);
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks[0].title.contains("parse_config"));
+        assert!(tasks[1].title.contains("unit test"));
+        assert!(tasks[2].title.contains("unwrap"));
+
+        // The generic reason would yield nothing:
+        let generic = "no STATUS line in agent output";
+        let from_generic = agent::tasks_from_numbered_list(generic);
+        assert!(from_generic.is_empty());
     }
 }

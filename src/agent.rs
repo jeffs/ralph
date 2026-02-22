@@ -241,7 +241,10 @@ impl AgentContext {
     /// Render the context variables into the prompt template.
     fn interpolate(&self, template: &str) -> String {
         match self {
-            Self::Plan { input, existing_ids } => template
+            Self::Plan {
+                input,
+                existing_ids,
+            } => template
                 .replace("{{INPUT}}", input)
                 .replace("{{EXISTING_IDS}}", existing_ids),
             Self::Implement {

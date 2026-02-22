@@ -188,12 +188,11 @@ pub fn id_ranges_summary(tasks: &[Task]) -> String {
     let mut prefix_numbers: std::collections::BTreeMap<&str, Vec<u32>> =
         std::collections::BTreeMap::new();
     for t in tasks {
-        if let Some((prefix, num_str)) = t.id.rsplit_once('-') {
-            if !prefix.is_empty() {
-                if let Ok(n) = num_str.parse::<u32>() {
-                    prefix_numbers.entry(prefix).or_default().push(n);
-                }
-            }
+        if let Some((prefix, num_str)) = t.id.rsplit_once('-')
+            && !prefix.is_empty()
+            && let Ok(n) = num_str.parse::<u32>()
+        {
+            prefix_numbers.entry(prefix).or_default().push(n);
         }
     }
 
@@ -408,23 +407,71 @@ mod tests {
     #[test]
     fn id_ranges_summary_mixed_prefixes() {
         let tasks = vec![
-            Task { id: "REPL-1".into(), title: "A".into(), description: String::new(), priority: 1, blocked_by: vec![] },
-            Task { id: "REPL-3".into(), title: "B".into(), description: String::new(), priority: 2, blocked_by: vec![] },
-            Task { id: "REPL-5".into(), title: "C".into(), description: String::new(), priority: 3, blocked_by: vec![] },
-            Task { id: "GETVAR-1".into(), title: "D".into(), description: String::new(), priority: 4, blocked_by: vec![] },
-            Task { id: "GETVAR-3".into(), title: "E".into(), description: String::new(), priority: 5, blocked_by: vec![] },
+            Task {
+                id: "REPL-1".into(),
+                title: "A".into(),
+                description: String::new(),
+                priority: 1,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "REPL-3".into(),
+                title: "B".into(),
+                description: String::new(),
+                priority: 2,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "REPL-5".into(),
+                title: "C".into(),
+                description: String::new(),
+                priority: 3,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "GETVAR-1".into(),
+                title: "D".into(),
+                description: String::new(),
+                priority: 4,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "GETVAR-3".into(),
+                title: "E".into(),
+                description: String::new(),
+                priority: 5,
+                blocked_by: vec![],
+            },
         ];
         let summary = id_ranges_summary(&tasks);
-        assert!(summary.contains("REPL: 1 through 5 (next available: REPL-6)"), "got: {summary}");
-        assert!(summary.contains("GETVAR: 1 through 3 (next available: GETVAR-4)"), "got: {summary}");
+        assert!(
+            summary.contains("REPL: 1 through 5 (next available: REPL-6)"),
+            "got: {summary}"
+        );
+        assert!(
+            summary.contains("GETVAR: 1 through 3 (next available: GETVAR-4)"),
+            "got: {summary}"
+        );
         assert!(summary.contains("MUST NOT reuse"));
     }
 
     #[test]
     fn id_ranges_summary_non_prefix_ids() {
         let tasks = vec![
-            Task { id: "T1".into(), title: "A".into(), description: String::new(), priority: 1, blocked_by: vec![] },
-            Task { id: "T2".into(), title: "B".into(), description: String::new(), priority: 2, blocked_by: vec![] },
+            Task {
+                id: "T1".into(),
+                title: "A".into(),
+                description: String::new(),
+                priority: 1,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "T2".into(),
+                title: "B".into(),
+                description: String::new(),
+                priority: 2,
+                blocked_by: vec![],
+            },
         ];
         let summary = id_ranges_summary(&tasks);
         // No PREFIX-N pattern, so falls back to listing raw IDs.
@@ -436,13 +483,34 @@ mod tests {
     #[test]
     fn id_ranges_summary_mix_of_prefixed_and_plain() {
         let tasks = vec![
-            Task { id: "AUTH-1".into(), title: "A".into(), description: String::new(), priority: 1, blocked_by: vec![] },
-            Task { id: "AUTH-2".into(), title: "B".into(), description: String::new(), priority: 2, blocked_by: vec![] },
-            Task { id: "PLAIN".into(), title: "C".into(), description: String::new(), priority: 3, blocked_by: vec![] },
+            Task {
+                id: "AUTH-1".into(),
+                title: "A".into(),
+                description: String::new(),
+                priority: 1,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "AUTH-2".into(),
+                title: "B".into(),
+                description: String::new(),
+                priority: 2,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "PLAIN".into(),
+                title: "C".into(),
+                description: String::new(),
+                priority: 3,
+                blocked_by: vec![],
+            },
         ];
         let summary = id_ranges_summary(&tasks);
         // The PREFIX-N ones are recognized; PLAIN is not PREFIX-N so won't appear as a range.
-        assert!(summary.contains("AUTH: 1 through 2 (next available: AUTH-3)"), "got: {summary}");
+        assert!(
+            summary.contains("AUTH: 1 through 2 (next available: AUTH-3)"),
+            "got: {summary}"
+        );
     }
 
     #[test]
