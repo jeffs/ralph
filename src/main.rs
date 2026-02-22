@@ -303,9 +303,9 @@ async fn cmd_status(json: bool) -> Result<()> {
                 state::Phase::Failed => failed += 1,
                 state::Phase::Skipped => skipped += 1,
                 state::Phase::Pending => pending += 1,
-                state::Phase::Implementing
-                | state::Phase::Testing
-                | state::Phase::Reviewing => in_progress += 1,
+                state::Phase::Implementing | state::Phase::Testing | state::Phase::Reviewing => {
+                    in_progress += 1
+                }
             }
             let duration = match (e.started_at, e.completed_at) {
                 (Some(s), Some(c)) => format!(" ({}s)", c.saturating_sub(s)),

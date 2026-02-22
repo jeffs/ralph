@@ -292,6 +292,8 @@ pub struct AgentResult {
     pub status: AgentStatus,
     /// Cost reported by the claude CLI for this invocation
     pub cost_usd: Option<f64>,
+    /// Raw stderr lines from the claude process (for diagnostics)
+    pub stderr_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,6 +523,14 @@ const IDLE_CPU_THRESHOLD: f64 = 1.0;
 /// Grace period after a stuck-pattern is detected before killing the agent.
 const STUCK_GRACE_SECS: u64 = 60;
 
+/// Shared liveness state between the stderr reader and the monitor loop.
+/// Carries the stuck-on-lock flag and a timestamp of the last stderr line,
+/// so the monitor can distinguish "idle waiting for API" from "truly stuck".
+struct AgentLiveness {
+    stuck: AtomicBool,
+    last_stderr_at: Mutex<Instant>,
+}
+
 /// Monitor a running child process for idleness, stuck patterns, and hard timeout.
 ///
 /// Polls `child.wait()` in 30-second intervals. On each timeout (child still
@@ -528,14 +538,14 @@ const STUCK_GRACE_SECS: u64 = 60;
 /// exceeds `agent_idle_timeout_secs`, kills the group and returns a Failure
 /// result. Enforces `agent_timeout_secs` as the hard ceiling.
 ///
-/// `stuck_flag` is set by the stderr reader task when a stuck pattern is
-/// detected. Once set, the agent is killed after `STUCK_GRACE_SECS`.
+/// Stderr activity (tracked via `liveness.last_stderr_at`) resets the idle
+/// counter, preventing false kills when the CLI is waiting for an API response.
 async fn monitor_agent(
     mut child: tokio::process::Child,
     pgid: u32,
     agent_timeout_secs: u64,
     agent_idle_timeout_secs: u64,
-    stuck_flag: Arc<AtomicBool>,
+    liveness: Arc<AgentLiveness>,
 ) -> Result<std::process::ExitStatus, AgentStatus> {
     let started = Instant::now();
     let hard_limit = Duration::from_secs(agent_timeout_secs);
@@ -556,7 +566,7 @@ async fn monitor_agent(
         }
 
         // Check stuck flag.
-        if stuck_flag.load(Ordering::Acquire) {
+        if liveness.stuck.load(Ordering::Acquire) {
             let since = stuck_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= stuck_grace {
                 kill_process_group(pgid, 0).await;
@@ -586,15 +596,27 @@ async fn monitor_agent(
                 // Child still running — sample CPU.
                 let cpu = sample_pgid_cpu(pgid).await;
                 if cpu < IDLE_CPU_THRESHOLD {
-                    idle_duration += poll_timeout;
-                    if idle_duration >= idle_limit {
-                        kill_process_group(pgid, 0).await;
-                        return Err(AgentStatus::Failure {
-                            reason: format!(
-                                "agent idle for {}s (possible deadlock)",
-                                idle_duration.as_secs()
-                            ),
-                        });
+                    // CPU is low, but check if stderr was active recently.
+                    // The CLI writes progress to stderr while waiting for
+                    // the API, so recent stderr activity means the agent
+                    // is alive — just server-side.
+                    let stderr_recent = {
+                        let last = liveness.last_stderr_at.lock().expect("liveness lock");
+                        last.elapsed() < poll_timeout
+                    };
+                    if stderr_recent {
+                        idle_duration = Duration::ZERO;
+                    } else {
+                        idle_duration += poll_timeout;
+                        if idle_duration >= idle_limit {
+                            kill_process_group(pgid, 0).await;
+                            return Err(AgentStatus::Failure {
+                                reason: format!(
+                                    "agent idle for {}s (possible deadlock)",
+                                    idle_duration.as_secs()
+                                ),
+                            });
+                        }
                     }
                 } else {
                     // Active — reset idle counter and stuck grace timer.
@@ -709,15 +731,21 @@ pub async fn invoke_agent(
 
     // Spawn a task to stream stderr in real-time.
     let role_label = role.label();
-    let stuck_flag = Arc::new(AtomicBool::new(false));
-    let stuck_flag_clone = Arc::clone(&stuck_flag);
+    let liveness = Arc::new(AgentLiveness {
+        stuck: AtomicBool::new(false),
+        last_stderr_at: Mutex::new(Instant::now()),
+    });
+    let liveness_clone = Arc::clone(&liveness);
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr_handle).lines();
         let mut collected: Vec<String> = Vec::new();
         while let Ok(Some(line)) = lines.next_line().await {
             eprintln!("[ralph] {role_label}: {line}");
+            // Update liveness timestamp on every line — proves the
+            // agent is actively communicating, even if CPU is low.
+            *liveness_clone.last_stderr_at.lock().expect("liveness lock") = Instant::now();
             if STUCK_PATTERNS.iter().any(|pat| line.contains(pat)) {
-                stuck_flag_clone.store(true, Ordering::Release);
+                liveness_clone.stuck.store(true, Ordering::Release);
             }
             collected.push(line);
         }
@@ -725,74 +753,74 @@ pub async fn invoke_agent(
     });
 
     registry.register(child_pid);
-    let exit_status = match monitor_agent(
+    let monitor_result = monitor_agent(
         child,
         child_pid,
         config.agent_timeout_secs,
         config.agent_idle_timeout_secs,
-        stuck_flag,
+        liveness,
     )
-    .await
-    {
-        Ok(status) => status,
-        Err(status) => {
-            eprintln!("[ralph] {} agent stopped: {:?}", role.label(), status,);
-            registry.deregister(child_pid);
-            return Ok(AgentResult {
-                text: String::new(),
-                status,
-                cost_usd: None,
-            });
-        }
-    };
-    kill_process_group(child_pid, 0).await;
-    registry.deregister(child_pid);
+    .await;
 
-    // Join the concurrent stdout drain task.
+    // Always join both IO tasks, regardless of monitor outcome.
+    // This ensures we capture partial output even on kill/timeout.
     let stdout_bytes = stdout_task.await.unwrap_or_default();
-
     let stderr_lines = stderr_task.await.unwrap_or_default();
-    if !stderr_lines.is_empty() {
-        eprintln!(
-            "[ralph] {} stderr: {}",
-            role.label(),
-            stderr_lines.join("\n")
-        );
-    }
 
-    if !exit_status.success() {
-        return Ok(AgentResult {
-            text: String::new(),
-            status: AgentStatus::Failure {
-                reason: format!("claude exited with {}", exit_status),
-            },
-            cost_usd: None,
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
-
-    // Parse the JSON envelope
-    let (text, cost_usd) = match serde_json::from_str::<ClaudeJsonOutput>(&stdout) {
-        Ok(parsed) => (parsed.result.unwrap_or_default(), parsed.total_cost_usd),
-        Err(_) => {
-            // Fall back to raw stdout if JSON parsing fails
-            (stdout.to_string(), None)
+    /// Parse stdout bytes into (text, cost_usd) via the JSON envelope,
+    /// falling back to raw text if JSON parsing fails.
+    fn parse_stdout(bytes: &[u8]) -> (String, Option<f64>) {
+        let raw = String::from_utf8_lossy(bytes);
+        match serde_json::from_str::<ClaudeJsonOutput>(&raw) {
+            Ok(parsed) => (parsed.result.unwrap_or_default(), parsed.total_cost_usd),
+            Err(_) => (raw.into_owned(), None),
         }
-    };
-
-    if let Some(cost) = cost_usd {
-        eprintln!("[ralph] {} agent cost: ${cost:.4}", role.label());
     }
 
-    // Parse agent's self-reported status from the text
-    let status = parse_agent_status(&text);
+    match monitor_result {
+        Ok(exit_status) => {
+            kill_process_group(child_pid, 0).await;
+            registry.deregister(child_pid);
 
-    Ok(AgentResult {
-        text,
-        status,
-        cost_usd,
-    })
+            if !exit_status.success() {
+                let (text, cost_usd) = parse_stdout(&stdout_bytes);
+                return Ok(AgentResult {
+                    text,
+                    status: AgentStatus::Failure {
+                        reason: format!("claude exited with {}", exit_status),
+                    },
+                    cost_usd,
+                    stderr_lines,
+                });
+            }
+
+            let (text, cost_usd) = parse_stdout(&stdout_bytes);
+            if let Some(cost) = cost_usd {
+                eprintln!("[ralph] {} agent cost: ${cost:.4}", role.label());
+            }
+
+            let status = parse_agent_status(&text);
+            Ok(AgentResult {
+                text,
+                status,
+                cost_usd,
+                stderr_lines,
+            })
+        }
+        Err(status) => {
+            // kill already happened in monitor_agent
+            eprintln!("[ralph] {} agent stopped: {:?}", role.label(), status);
+            registry.deregister(child_pid);
+
+            let (text, cost_usd) = parse_stdout(&stdout_bytes);
+            Ok(AgentResult {
+                text,
+                status,
+                cost_usd,
+                stderr_lines,
+            })
+        }
+    }
 }
 
 /// Parse a numbered-list failure reason into individual proposed tasks.
@@ -1218,6 +1246,7 @@ Done!"#
                 .to_string(),
             status: AgentStatus::Success,
             cost_usd: None,
+            stderr_lines: vec![],
         };
         let jsonl = result.extract_jsonl().unwrap();
         assert!(jsonl.contains("T1"));

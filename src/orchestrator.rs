@@ -90,9 +90,23 @@ fn build_guidance(entries: &[String]) -> String {
 
 /// Record full agent response text as feedback so the
 /// implementer can see what went wrong on the next attempt.
-fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str) {
+/// When `stderr` is non-empty, appends it under a heading
+/// so the next attempt can see CLI diagnostics.
+fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str, stderr: &[String]) {
     let prefix = format!("[{phase_label} · attempt {}]", exec.attempts);
-    let body = truncate_feedback(full_text, FEEDBACK_MAX_LEN);
+    let mut body = truncate_feedback(full_text, FEEDBACK_MAX_LEN);
+    if !stderr.is_empty() {
+        // Budget: leave room for the stderr section within FEEDBACK_MAX_LEN.
+        let stderr_budget = FEEDBACK_MAX_LEN
+            .saturating_sub(body.len())
+            .saturating_sub(32);
+        if stderr_budget > 0 {
+            let stderr_text = stderr.join("\n");
+            let truncated = truncate_feedback(&stderr_text, stderr_budget);
+            body.push_str("\n\n[stderr]\n");
+            body.push_str(&truncated);
+        }
+    }
     exec.feedback.push(format!("{prefix}\n{body}"));
 }
 
@@ -582,7 +596,7 @@ async fn resume_inflight(
                             progressed = true;
                         }
                         AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                            push_feedback(exec, "Tester", &r.text);
+                            push_feedback(exec, "Tester", &r.text, &r.stderr_lines);
                             reset_or_fail(exec, config);
                             exec.last_error = Some(reason.clone());
                             progressed = true;
@@ -592,7 +606,7 @@ async fn resume_inflight(
                 }
                 Err(e) => {
                     let exec = state.entry(&id);
-                    push_feedback(exec, "Tester", &e.to_string());
+                    push_feedback(exec, "Tester", &e.to_string(), &[]);
                     reset_or_fail(exec, config);
                     exec.last_error = Some(e.to_string());
                     progressed = true;
@@ -686,7 +700,7 @@ async fn resume_inflight(
                             eprintln!("[ralph] {id} — done (with nits)");
                         }
                         AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                            push_feedback(exec, "Reviewer", &r.text);
+                            push_feedback(exec, "Reviewer", &r.text, &r.stderr_lines);
                             reset_or_fail(exec, config);
                             exec.last_error = Some(reason.clone());
                             progressed = true;
@@ -696,7 +710,7 @@ async fn resume_inflight(
                 }
                 Err(e) => {
                     let exec = state.entry(&id);
-                    push_feedback(exec, "Reviewer", &e.to_string());
+                    push_feedback(exec, "Reviewer", &e.to_string(), &[]);
                     reset_or_fail(exec, config);
                     exec.last_error = Some(e.to_string());
                     progressed = true;
@@ -1015,20 +1029,22 @@ async fn run_group_with_workspaces(
         outcomes.push(Outcome { id, success });
     }
 
-    // Merge successful workspaces, abandon failed ones
+    // Merge successful workspaces, abandon failed ones.
+    // Always capture files_changed (even on failure) for diagnostics.
     for outcome in &outcomes {
         if !created_ws.contains(&outcome.id) {
             continue;
         }
-        if outcome.success {
-            // Attribute files precisely from workspace
-            let rev = format!("ralph-{}@", outcome.id);
-            let files = agent::jj_changed_files_for(&rev).await.unwrap_or_default();
-            let exec = state.entry(&outcome.id);
-            exec.files_changed.extend(files);
-            exec.files_changed.sort();
-            exec.files_changed.dedup();
 
+        // Attribute files from the workspace, regardless of outcome.
+        let rev = format!("ralph-{}@", outcome.id);
+        let files = agent::jj_changed_files_for(&rev).await.unwrap_or_default();
+        let exec = state.entry(&outcome.id);
+        exec.files_changed.extend(files);
+        exec.files_changed.sort();
+        exec.files_changed.dedup();
+
+        if outcome.success {
             // Squash workspace changes into default working copy
             let squash_status = TokioCommand::new("jj")
                 .args(["squash", "--from", &rev, "--into", "@"])
@@ -1136,11 +1152,8 @@ async fn run_group_singleton(
         }
     }
 
-    // Attribute files via pre/post snapshot
-    if state
-        .tasks
-        .get(&t.id)
-        .is_some_and(|e| e.phase == Phase::Testing)
+    // Attribute files via pre/post snapshot (even on failure,
+    // so diagnostics can see what the agent changed).
     {
         let post_files = agent::jj_changed_files().await.unwrap_or_default();
         let new_files: Vec<PathBuf> = post_files

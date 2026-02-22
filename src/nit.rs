@@ -39,10 +39,10 @@ pub fn truncate_with_ellipsis(s: &str, max_len: usize) -> String {
         return s.to_string();
     }
     let search_range = &s[..max_len];
-    if let Some(pos) = search_range.rfind(' ') {
-        if pos > max_len / 2 {
-            return format!("{}…", s[..pos].trim_end());
-        }
+    if let Some(pos) = search_range.rfind(' ')
+        && pos > max_len / 2
+    {
+        return format!("{}…", s[..pos].trim_end());
     }
     // No good word boundary — hard-truncate at a char boundary
     let mut end = max_len;
@@ -178,7 +178,8 @@ mod tests {
 
     #[test]
     fn summarize_truncates_long_line() {
-        let long = "Fix the meta tag self-closing style inconsistency across all HTML template files";
+        let long =
+            "Fix the meta tag self-closing style inconsistency across all HTML template files";
         let summary = summarize(long);
         assert!(summary.len() <= 64); // 60 + room for ellipsis char
         assert!(summary.ends_with('…'));

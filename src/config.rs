@@ -32,13 +32,19 @@ impl Default for WorkspaceConfig {
 /// top-level `model` field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    #[serde(default = "default_planner_model", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_planner_model",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub planner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implementer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tester: Option<String>,
-    #[serde(default = "default_reviewer_model", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_reviewer_model",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reviewer: Option<String>,
 }
 

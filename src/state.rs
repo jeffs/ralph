@@ -243,8 +243,7 @@ impl ExecutionState {
     /// Multiple directives for the same task are applied in order
     /// (last wins).
     pub fn apply_directives(&mut self, directives: &[Directive], known_ids: &[String]) {
-        let known: std::collections::HashSet<&str> =
-            known_ids.iter().map(|s| s.as_str()).collect();
+        let known: std::collections::HashSet<&str> = known_ids.iter().map(|s| s.as_str()).collect();
         for d in directives {
             if !known.contains(d.task_id.as_str()) {
                 eprintln!(
@@ -261,8 +260,7 @@ impl ExecutionState {
                 }
                 DirectiveAction::Fail => {
                     exec.phase = Phase::Failed;
-                    exec.last_error =
-                        Some("manually failed via `ralph fail`".to_string());
+                    exec.last_error = Some("manually failed via `ralph fail`".to_string());
                     exec.completed_at = Some(unix_now());
                 }
                 DirectiveAction::Reset => {
