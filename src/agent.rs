@@ -144,7 +144,7 @@ impl AgentRole {
 /// carries only the data that role needs.
 pub enum AgentContext {
     /// Planner: decompose this input into tasks
-    Plan { input: String },
+    Plan { input: String, existing_ids: String },
     /// Implementer: execute this task
     Implement {
         task_id: String,
@@ -174,9 +174,10 @@ pub enum AgentContext {
 }
 
 impl AgentContext {
-    pub fn plan(input: &str) -> Self {
+    pub fn plan(input: &str, existing_ids: &str) -> Self {
         Self::Plan {
             input: input.to_string(),
+            existing_ids: existing_ids.to_string(),
         }
     }
 
@@ -230,6 +231,7 @@ impl AgentContext {
     fn task_id(&self) -> Option<&str> {
         match self {
             Self::Plan { .. } | Self::Triage { .. } => None,
+
             Self::Implement { task_id, .. }
             | Self::Test { task_id, .. }
             | Self::Review { task_id, .. } => Some(task_id),
@@ -239,7 +241,9 @@ impl AgentContext {
     /// Render the context variables into the prompt template.
     fn interpolate(&self, template: &str) -> String {
         match self {
-            Self::Plan { input } => template.replace("{{INPUT}}", input),
+            Self::Plan { input, existing_ids } => template
+                .replace("{{INPUT}}", input)
+                .replace("{{EXISTING_IDS}}", existing_ids),
             Self::Implement {
                 task_id,
                 task_title,
@@ -1284,9 +1288,16 @@ Done!"#
 
     #[test]
     fn interpolate_plan() {
-        let ctx = AgentContext::plan("add auth");
+        let ctx = AgentContext::plan("add auth", "");
         let result = ctx.interpolate("Do: {{INPUT}}");
         assert_eq!(result, "Do: add auth");
+    }
+
+    #[test]
+    fn interpolate_plan_with_existing_ids() {
+        let ctx = AgentContext::plan("add auth", "REPL: 1 through 3");
+        let result = ctx.interpolate("Do: {{INPUT}}\n{{EXISTING_IDS}}");
+        assert_eq!(result, "Do: add auth\nREPL: 1 through 3");
     }
 
     #[test]

@@ -201,9 +201,24 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
     orchestrator::spawn_signal_handler(registry.clone());
 
     let tasks_path = ralph_dir.join("tasks.jsonl");
+    let archive_path = ralph_dir.join("archive.jsonl");
+
+    // Load pre-existing tasks (active + archived) so the planner
+    // knows which IDs are taken and new tasks can be merged in.
+    let pre_existing = if tasks_path.exists() {
+        task::load_tasks(&tasks_path).await?
+    } else {
+        Vec::new()
+    };
+    let archived = task::load_archive(&archive_path).await?;
+
+    let mut all_for_summary = pre_existing.clone();
+    all_for_summary.extend(archived.iter().cloned());
+    let existing_ids_summary = task::id_ranges_summary(&all_for_summary);
+
     let result = agent::invoke_agent(
         agent::AgentRole::Planner,
-        &agent::AgentContext::plan(&input),
+        &agent::AgentContext::plan(&input, &existing_ids_summary),
         &config,
         None,
         &registry,
@@ -225,16 +240,70 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
         tokio::fs::write(&tasks_path, jsonl).await?;
     }
 
-    // Validate the output
-    let tasks = task::load_tasks(&tasks_path).await?;
-    let archive_path = ralph_dir.join("archive.jsonl");
-    let archived = task::load_archive(&archive_path).await?;
+    // Load whatever the planner wrote (may include pre-existing
+    // tasks if the planner rewrote the file, or just new tasks).
+    let planner_tasks = task::load_tasks(&tasks_path).await?;
+
+    let pre_ids: std::collections::HashSet<String> =
+        pre_existing.iter().map(|t| t.id.clone()).collect();
+    let planner_ids: std::collections::HashSet<String> =
+        planner_tasks.iter().map(|t| t.id.clone()).collect();
+
+    // Check for ID collisions: a pre-existing ID that the planner
+    // also emitted but with different content (i.e. it overwrote it).
+    let collisions: Vec<&str> = pre_existing
+        .iter()
+        .filter(|t| {
+            planner_ids.contains(&t.id)
+                && !planner_tasks
+                    .iter()
+                    .any(|pt| pt.id == t.id && pt.title == t.title)
+        })
+        .map(|t| t.id.as_str())
+        .collect();
+    if !collisions.is_empty() {
+        anyhow::bail!(
+            "ID collision: planner reused existing IDs: {}",
+            collisions.join(", ")
+        );
+    }
+
+    // Merge: prepend pre-existing tasks the planner omitted,
+    // so we never lose tasks from a previous plan.
+    let merged = if pre_existing.iter().all(|t| planner_ids.contains(&t.id)) {
+        // Planner included all pre-existing tasks — use as-is.
+        planner_tasks
+    } else {
+        let mut merged = pre_existing.clone();
+        for t in planner_tasks {
+            if !pre_ids.contains(&t.id) {
+                merged.push(t);
+            }
+        }
+        merged
+    };
+
+    task::write_tasks(&tasks_path, &merged).await?;
+
+    // Validate deps across the full set (active + archived).
     let archived_ids: std::collections::HashSet<&str> =
         archived.iter().map(|t| t.id.as_str()).collect();
-    task::validate_deps(&tasks, &archived_ids)?;
-    eprintln!("Planned {} tasks → {}", tasks.len(), tasks_path.display());
-    for t in &tasks {
-        eprintln!("  [{}] {} (pri={})", t.id, t.title, t.priority);
+    task::validate_deps(&merged, &archived_ids)?;
+
+    let new_count = merged.iter().filter(|t| !pre_ids.contains(&t.id)).count();
+    eprintln!(
+        "Planned {} new task(s), {} total → {}",
+        new_count,
+        merged.len(),
+        tasks_path.display()
+    );
+    for t in &merged {
+        let tag = if pre_ids.contains(&t.id) {
+            " (existing)"
+        } else {
+            ""
+        };
+        eprintln!("  [{}] {} (pri={}){}", t.id, t.title, t.priority, tag);
     }
     Ok(())
 }

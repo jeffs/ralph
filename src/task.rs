@@ -174,6 +174,60 @@ pub async fn append_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
     Ok(())
 }
 
+/// Scan tasks for `PREFIX-N` ID patterns and return a human-readable
+/// summary of taken ID ranges. Used to tell the planner which IDs
+/// are already in use so it can avoid collisions.
+///
+/// Returns an empty string when there are no tasks.
+pub fn id_ranges_summary(tasks: &[Task]) -> String {
+    if tasks.is_empty() {
+        return String::new();
+    }
+
+    // Collect (prefix, number) pairs from PREFIX-N patterns.
+    let mut prefix_numbers: std::collections::BTreeMap<&str, Vec<u32>> =
+        std::collections::BTreeMap::new();
+    for t in tasks {
+        if let Some((prefix, num_str)) = t.id.rsplit_once('-') {
+            if !prefix.is_empty() {
+                if let Ok(n) = num_str.parse::<u32>() {
+                    prefix_numbers.entry(prefix).or_default().push(n);
+                }
+            }
+        }
+    }
+
+    if prefix_numbers.is_empty() {
+        // No PREFIX-N IDs found — list the raw IDs so the planner
+        // still knows they're taken.
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        return format!(
+            "The following task IDs are already in use: {}\n\n\
+             You MUST NOT reuse any existing ID.\n",
+            ids.join(", ")
+        );
+    }
+
+    let mut lines = vec!["The following ID prefixes are already in use:".to_string()];
+    for (prefix, mut nums) in prefix_numbers {
+        nums.sort_unstable();
+        let min = nums[0];
+        let max = *nums.last().unwrap();
+        lines.push(format!(
+            "- {prefix}: {min} through {max} (next available: {prefix}-{})",
+            max + 1
+        ));
+    }
+    lines.push(String::new());
+    lines.push(
+        "You MUST NOT reuse any existing ID. Start numbering from the \
+         next available number for each prefix."
+            .to_string(),
+    );
+    lines.push(String::new());
+    lines.join("\n")
+}
+
 /// Generate the next auto-ID for dynamically discovered tasks.
 /// Scans existing IDs for the `GEN-N` pattern and increments.
 #[allow(dead_code)]
@@ -344,6 +398,51 @@ mod tests {
             err.to_string().contains("NONEXISTENT"),
             "error should name the bad ref: {err}"
         );
+    }
+
+    #[test]
+    fn id_ranges_summary_empty() {
+        assert_eq!(id_ranges_summary(&[]), "");
+    }
+
+    #[test]
+    fn id_ranges_summary_mixed_prefixes() {
+        let tasks = vec![
+            Task { id: "REPL-1".into(), title: "A".into(), description: String::new(), priority: 1, blocked_by: vec![] },
+            Task { id: "REPL-3".into(), title: "B".into(), description: String::new(), priority: 2, blocked_by: vec![] },
+            Task { id: "REPL-5".into(), title: "C".into(), description: String::new(), priority: 3, blocked_by: vec![] },
+            Task { id: "GETVAR-1".into(), title: "D".into(), description: String::new(), priority: 4, blocked_by: vec![] },
+            Task { id: "GETVAR-3".into(), title: "E".into(), description: String::new(), priority: 5, blocked_by: vec![] },
+        ];
+        let summary = id_ranges_summary(&tasks);
+        assert!(summary.contains("REPL: 1 through 5 (next available: REPL-6)"), "got: {summary}");
+        assert!(summary.contains("GETVAR: 1 through 3 (next available: GETVAR-4)"), "got: {summary}");
+        assert!(summary.contains("MUST NOT reuse"));
+    }
+
+    #[test]
+    fn id_ranges_summary_non_prefix_ids() {
+        let tasks = vec![
+            Task { id: "T1".into(), title: "A".into(), description: String::new(), priority: 1, blocked_by: vec![] },
+            Task { id: "T2".into(), title: "B".into(), description: String::new(), priority: 2, blocked_by: vec![] },
+        ];
+        let summary = id_ranges_summary(&tasks);
+        // No PREFIX-N pattern, so falls back to listing raw IDs.
+        assert!(summary.contains("T1"), "got: {summary}");
+        assert!(summary.contains("T2"), "got: {summary}");
+        assert!(summary.contains("MUST NOT reuse"));
+    }
+
+    #[test]
+    fn id_ranges_summary_mix_of_prefixed_and_plain() {
+        let tasks = vec![
+            Task { id: "AUTH-1".into(), title: "A".into(), description: String::new(), priority: 1, blocked_by: vec![] },
+            Task { id: "AUTH-2".into(), title: "B".into(), description: String::new(), priority: 2, blocked_by: vec![] },
+            Task { id: "PLAIN".into(), title: "C".into(), description: String::new(), priority: 3, blocked_by: vec![] },
+        ];
+        let summary = id_ranges_summary(&tasks);
+        // The PREFIX-N ones are recognized; PLAIN is not PREFIX-N so won't appear as a range.
+        assert!(summary.contains("AUTH: 1 through 2 (next available: AUTH-3)"), "got: {summary}");
     }
 
     #[test]

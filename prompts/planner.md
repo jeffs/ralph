@@ -40,7 +40,8 @@ object per line.
 
 ### Rules
 
-- Every `blocked_by` entry must reference an `id` in the file.
+- Every `blocked_by` entry must reference an `id` in this file
+  or an existing task ID listed below.
 - No duplicate `id` values.
 - `id` must not contain whitespace.
 
@@ -50,6 +51,8 @@ object per line.
 {"id":"T1","title":"Add foo function","description":"...","priority":1,"blocked_by":[]}
 {"id":"T2","title":"Add tests for foo","description":"...","priority":2,"blocked_by":["T1"]}
 ```
+
+{{EXISTING_IDS}}
 
 After writing the file, confirm with:
 
