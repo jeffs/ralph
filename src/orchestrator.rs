@@ -771,16 +771,7 @@ async fn resume_inflight(
                 .map(|e| e.files_changed.clone())
                 .unwrap_or_default();
             let ctx = AgentContext::test(id, files);
-            let mut cfg = config.clone();
-            if !config.workspace.isolate_env.is_empty() {
-                let base = std::env::current_dir().unwrap_or_default().join(WS_DIR);
-                for (env_var, subdir) in &config.workspace.isolate_env {
-                    cfg.env.set.insert(
-                        env_var.clone(),
-                        base.join(subdir).to_string_lossy().to_string(),
-                    );
-                }
-            }
+            let cfg = config.clone();
             let reg = registry.clone();
             let id_owned = id.clone();
             handles.push(tokio::spawn(async move {
@@ -1170,13 +1161,7 @@ async fn run_group_with_workspaces(
                 (g, fb, e.attempts + 1)
             })
             .unwrap_or((None, None, 1));
-        let mut cfg = config.clone();
-        for (env_var, subdir) in &config.workspace.isolate_env {
-            cfg.env.set.insert(
-                env_var.clone(),
-                ws_path.join(subdir).to_string_lossy().to_string(),
-            );
-        }
+        let cfg = config.clone();
         let reg = registry.clone();
         handles.push(tokio::spawn(async move {
             let ctx =
@@ -1321,18 +1306,8 @@ async fn run_group_singleton(
         guidance.as_deref(),
         feedback_history.as_deref(),
     );
-    let mut cfg = config.clone();
-    if !config.workspace.isolate_env.is_empty() {
-        let base = std::env::current_dir().unwrap_or_default().join(WS_DIR);
-        for (env_var, subdir) in &config.workspace.isolate_env {
-            cfg.env.set.insert(
-                env_var.clone(),
-                base.join(subdir).to_string_lossy().to_string(),
-            );
-        }
-    }
     let result =
-        agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg, None, registry, attempt).await;
+        agent::invoke_agent(AgentRole::Implementer, &ctx, config, None, registry, attempt).await;
 
     {
         let exec = state.entry(&t.id);

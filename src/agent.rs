@@ -712,6 +712,15 @@ pub async fn invoke_agent(
     for (key, val) in &config.env.set {
         cmd.env(key, val);
     }
+    // Apply workspace environment isolation: compute absolute paths
+    // from the agent's working directory so each workspace gets its
+    // own isolated directories (e.g. CARGO_TARGET_DIR).
+    if let Some(dir) = working_dir {
+        for (var_name, subdir) in &config.workspace.isolate_env {
+            let path = dir.join(subdir);
+            cmd.env(var_name, &path);
+        }
+    }
     cmd.arg("-p")
         .arg(&prompt)
         .arg("--output-format")
