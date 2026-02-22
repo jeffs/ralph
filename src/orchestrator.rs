@@ -241,6 +241,21 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         let mut state = ExecutionState::load(&state_path).await?;
         let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
 
+        // Drain sideband directives (from ralph skip/fail/reset)
+        match crate::state::drain_directives().await {
+            Ok(directives) if !directives.is_empty() => {
+                for d in &directives {
+                    eprintln!("[ralph] applying directive: {:?} {}", d.action, d.task_id);
+                }
+                state.apply_directives(&directives, &task_ids);
+                state.save(&state_path).await?;
+            }
+            Err(e) => {
+                eprintln!("[ralph] failed to drain directives: {e}");
+            }
+            _ => {}
+        }
+
         // Check convergence: all done → final review
         if state.all_done(&task_ids) {
             eprintln!("[ralph] all tasks done, final review...");
@@ -721,6 +736,7 @@ fn checkpoint_description(group: &[&Task], state: &ExecutionState) -> String {
                     Phase::Reviewing => "reviewing",
                     Phase::Done => "done",
                     Phase::Failed => "failed",
+                    Phase::Skipped => "skipped",
                 })
                 .unwrap_or("unknown");
             format!("{} ({})", t.id, phase)

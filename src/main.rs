@@ -48,7 +48,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Mark a task as Done without running it
+    /// Skip a task (satisfies deps, shown as Skipped)
     Skip {
         /// Task ID to skip (e.g. "T3")
         task_id: String,
@@ -227,7 +227,6 @@ async fn cmd_run(tasks_path: Option<PathBuf>, max_iterations: usize) -> Result<(
 
 async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
     let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
-    let state_path = PathBuf::from(".ralph/state.json");
 
     if !tasks_path.exists() {
         anyhow::bail!("No tasks found. Run `ralph plan` first.");
@@ -243,31 +242,20 @@ async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
         );
     }
 
-    let mut exec_state = state::ExecutionState::load(&state_path).await?;
-    let exec = exec_state.entry(task_id);
-
-    match action {
-        "skip" => {
-            exec.phase = state::Phase::Done;
-            eprintln!("Marked {} as Done (skipped)", task_id);
-        }
-        "fail" => {
-            exec.phase = state::Phase::Failed;
-            exec.last_error = Some("manually failed via `ralph fail`".to_string());
-            eprintln!("Marked {} as Failed", task_id);
-        }
-        "reset" => {
-            exec.phase = state::Phase::Pending;
-            exec.attempts = 0;
-            exec.last_error = None;
-            exec.feedback.clear();
-            // guidance is intentionally preserved — it outlives retries.
-            eprintln!("Reset {} to Pending (attempts cleared)", task_id);
-        }
+    let directive_action = match action {
+        "skip" => state::DirectiveAction::Skip,
+        "fail" => state::DirectiveAction::Fail,
+        "reset" => state::DirectiveAction::Reset,
         _ => unreachable!(),
-    }
+    };
 
-    exec_state.save(&state_path).await?;
+    state::append_directive(&state::Directive {
+        task_id: task_id.to_string(),
+        action: directive_action,
+    })
+    .await?;
+
+    eprintln!("Queued {action} for {task_id}");
     Ok(())
 }
 
@@ -285,7 +273,15 @@ async fn cmd_status(json: bool) -> Result<()> {
     }
 
     let tasks = task::load_tasks(&tasks_path).await?;
-    let exec_state = state::ExecutionState::load(&state_path).await?;
+    let mut exec_state = state::ExecutionState::load(&state_path).await?;
+
+    // Merge pending directives into the in-memory view (don't save back).
+    let pending_directives = state::load_directives().await.unwrap_or_default();
+    let directive_count = pending_directives.len();
+    if !pending_directives.is_empty() {
+        let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        exec_state.apply_directives(&pending_directives, &task_ids);
+    }
 
     if json {
         return cmd_status_json(&tasks, &exec_state);
@@ -297,6 +293,7 @@ async fn cmd_status(json: bool) -> Result<()> {
     let mut failed = 0u32;
     let mut in_progress = 0u32;
     let mut pending = 0u32;
+    let mut skipped = 0u32;
 
     println!("Tasks: {}", tasks.len());
     for t in &tasks {
@@ -304,6 +301,7 @@ async fn cmd_status(json: bool) -> Result<()> {
             match e.phase {
                 state::Phase::Done => done += 1,
                 state::Phase::Failed => failed += 1,
+                state::Phase::Skipped => skipped += 1,
                 state::Phase::Pending => pending += 1,
                 state::Phase::Implementing
                 | state::Phase::Testing
@@ -330,9 +328,13 @@ async fn cmd_status(json: bool) -> Result<()> {
         println!("  [{}] {} — {}", t.id, t.title, info);
     }
     println!(
-        "Summary: {} done, {} failed, {} in-progress, {} pending",
-        done, failed, in_progress, pending
+        "Summary: {} done, {} skipped, {} failed, {} in-progress, {} pending",
+        done, skipped, failed, in_progress, pending
     );
+
+    if directive_count > 0 {
+        println!("Pending directives: {directive_count}");
+    }
 
     let nits_path = PathBuf::from(".ralph/nits.jsonl");
     if let Ok(nits) = nit::load_nits(&nits_path).await {

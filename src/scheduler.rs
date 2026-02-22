@@ -14,7 +14,7 @@ pub fn ready_tasks<'a>(
     let done_ids: HashSet<&str> = state
         .tasks
         .iter()
-        .filter(|(_, exec)| exec.phase == Phase::Done)
+        .filter(|(_, exec)| exec.phase.satisfies_dep())
         .map(|(id, _)| id.as_str())
         .collect();
 
@@ -169,6 +169,16 @@ mod tests {
         let ready = ready_tasks(&tasks, &state, &default_config());
         let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["A", "C", "B"]);
+    }
+
+    #[test]
+    fn ready_includes_unblocked_after_dep_skipped() {
+        let tasks = vec![task("A", 1, vec![]), task("B", 2, vec!["A"])];
+        let mut state = ExecutionState::default();
+        state.entry("A").phase = Phase::Skipped;
+        let ready = ready_tasks(&tasks, &state, &default_config());
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "B");
     }
 
     #[test]
