@@ -46,6 +46,11 @@ pub struct ModelConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub reviewer: Option<String>,
+    #[serde(
+        default = "default_triager_model",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub triager: Option<String>,
 }
 
 fn default_planner_model() -> Option<String> {
@@ -56,6 +61,10 @@ fn default_reviewer_model() -> Option<String> {
     Some("opus".to_string())
 }
 
+fn default_triager_model() -> Option<String> {
+    Some("opus".to_string())
+}
+
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
@@ -63,6 +72,7 @@ impl Default for ModelConfig {
             implementer: None,
             tester: None,
             reviewer: default_reviewer_model(),
+            triager: default_triager_model(),
         }
     }
 }
@@ -115,6 +125,12 @@ pub struct Config {
     /// Model to escalate to (defaults to models.reviewer if unset)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation_model: Option<String>,
+    /// Automatically triage open nits after final review
+    #[serde(default = "default_auto_triage")]
+    pub auto_triage: bool,
+    /// Maximum number of triage rounds per run
+    #[serde(default = "default_max_triage_rounds")]
+    pub max_triage_rounds: u32,
 }
 
 fn default_model() -> String {
@@ -139,6 +155,14 @@ fn default_kill_grace_secs() -> u64 {
 
 fn default_escalation_after() -> u32 {
     2
+}
+
+fn default_auto_triage() -> bool {
+    true
+}
+
+fn default_max_triage_rounds() -> u32 {
+    3
 }
 
 fn default_prompts_dir() -> PathBuf {
@@ -178,6 +202,8 @@ impl Default for Config {
             max_cost_usd: None,
             escalation_after: default_escalation_after(),
             escalation_model: None,
+            auto_triage: default_auto_triage(),
+            max_triage_rounds: default_max_triage_rounds(),
         }
     }
 }
@@ -189,6 +215,7 @@ impl ModelConfig {
             && self.implementer == d.implementer
             && self.tester == d.tester
             && self.reviewer == d.reviewer
+            && self.triager == d.triager
     }
 
     /// Look up the override for a role by its label name.
@@ -198,6 +225,7 @@ impl ModelConfig {
             "implementer" => &self.implementer,
             "tester" => &self.tester,
             "reviewer" => &self.reviewer,
+            "triager" => &self.triager,
             _ => return None,
         };
         field.as_deref()
@@ -393,6 +421,30 @@ escalation_model = "opus"
     fn model_for_attempt_uses_explicit_escalation_model() {
         let config: Config = toml::from_str(r#"escalation_model = "haiku""#).unwrap();
         assert_eq!(config.model_for_attempt("implementer", 3), "haiku");
+    }
+
+    #[test]
+    fn auto_triage_defaults_to_true() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.auto_triage);
+        assert_eq!(config.max_triage_rounds, 3);
+    }
+
+    #[test]
+    fn deserialize_triage_config() {
+        let toml_str = r#"
+auto_triage = false
+max_triage_rounds = 5
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.auto_triage);
+        assert_eq!(config.max_triage_rounds, 5);
+    }
+
+    #[test]
+    fn triager_model_defaults_to_opus() {
+        let config = Config::default();
+        assert_eq!(config.model_for("triager"), "opus");
     }
 
     #[test]

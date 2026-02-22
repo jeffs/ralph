@@ -118,6 +118,7 @@ pub enum AgentRole {
     Implementer,
     Tester,
     Reviewer,
+    Triager,
 }
 
 impl AgentRole {
@@ -127,6 +128,7 @@ impl AgentRole {
             Self::Implementer => "implementer.md",
             Self::Tester => "tester.md",
             Self::Reviewer => "reviewer.md",
+            Self::Triager => "triager.md",
         }
     }
 
@@ -136,6 +138,7 @@ impl AgentRole {
             Self::Implementer => "implementer",
             Self::Tester => "tester",
             Self::Reviewer => "reviewer",
+            Self::Triager => "triager",
         }
     }
 }
@@ -165,6 +168,11 @@ pub enum AgentContext {
         task_description: String,
         diff_summary: String,
         diff: String,
+    },
+    /// Triager: decide which nits to promote or dismiss
+    Triage {
+        nits_json: String,
+        tasks_summary: String,
     },
 }
 
@@ -214,10 +222,17 @@ impl AgentContext {
         }
     }
 
+    pub fn triage(nits_json: String, tasks_summary: String) -> Self {
+        Self::Triage {
+            nits_json,
+            tasks_summary,
+        }
+    }
+
     /// Return the task ID, if this context is task-scoped.
     fn task_id(&self) -> Option<&str> {
         match self {
-            Self::Plan { .. } => None,
+            Self::Plan { .. } | Self::Triage { .. } => None,
             Self::Implement { task_id, .. }
             | Self::Test { task_id, .. }
             | Self::Review { task_id, .. } => Some(task_id),
@@ -279,6 +294,12 @@ impl AgentContext {
                 .replace("{{TASK_DESCRIPTION}}", task_description)
                 .replace("{{DIFF_SUMMARY}}", diff_summary)
                 .replace("{{DIFF}}", diff),
+            Self::Triage {
+                nits_json,
+                tasks_summary,
+            } => template
+                .replace("{{NITS}}", nits_json)
+                .replace("{{TASKS_SUMMARY}}", tasks_summary),
         }
     }
 }
@@ -1313,6 +1334,17 @@ Done!"#
         let guidance_pos = result.find("## Guidance").unwrap();
         let feedback_pos = result.find("## Previous Attempt Feedback").unwrap();
         assert!(guidance_pos < feedback_pos);
+    }
+
+    #[test]
+    fn interpolate_triage() {
+        let ctx = AgentContext::triage(
+            r#"{"id":"NIT-1","content":"rename foo"}"#.to_string(),
+            "[T1] Do thing (Done)".to_string(),
+        );
+        let result = ctx.interpolate("Nits:\n{{NITS}}\n\nTasks:\n{{TASKS_SUMMARY}}");
+        assert!(result.contains("NIT-1"));
+        assert!(result.contains("[T1] Do thing (Done)"));
     }
 
     #[test]

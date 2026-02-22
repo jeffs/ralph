@@ -47,7 +47,7 @@ Ralph commits progress to Jujutsu (`jj`) after each group of tasks.
 
 | Module          | Purpose                                                |
 |-----------------|--------------------------------------------------------|
-| `main.rs`       | CLI: `init`, `plan`, `run`, `status`, `skip/fail/reset`|
+| `main.rs`       | CLI: `init`, `plan`, `run`, `status`, `skip/fail/reset`, `archive/restore`|
 | `task.rs`       | Task model, JSONL parsing, validation                  |
 | `state.rs`      | Per-task execution state (phase, attempts, feedback)   |
 | `config.rs`     | TOML configuration loading and defaults                |
@@ -231,6 +231,10 @@ kill_grace_secs = 5
 # Budget limit (stop if exceeded)
 max_cost_usd = 10.0
 
+# Automatically triage open nits after final review
+auto_triage = true
+max_triage_rounds = 3
+
 # Directory containing prompt templates
 prompts_dir = "prompts"
 
@@ -281,6 +285,20 @@ ralph reset <task_id>         # Reset a task to Pending
 ralph archive <task_id>       # Move a terminal task to archive.jsonl
 ralph archive --done          # Archive all Done + Skipped tasks
 ralph restore <task_id>       # Restore a task from archive.jsonl
+```
+
+### Automated nit triage
+
+After the final review passes, Ralph automatically triages any open
+nits by invoking a **Triager** agent. The triager reads all open nits
+and the current task summary, then emits a promote/dismiss decision
+for each. Promoted nits become new tasks and the main loop continues;
+dismissed nits are marked as such. This repeats up to
+`max_triage_rounds` times (default: 3).
+
+Disable with `auto_triage = false` in config.
+
+```
 ```
 
 ## Rules for agents working under Ralph

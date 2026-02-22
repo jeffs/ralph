@@ -147,6 +147,7 @@ const DEFAULT_PROMPTS: &[(&str, &str)] = &[
     ("implementer.md", include_str!("../prompts/implementer.md")),
     ("tester.md", include_str!("../prompts/tester.md")),
     ("reviewer.md", include_str!("../prompts/reviewer.md")),
+    ("triager.md", include_str!("../prompts/triager.md")),
 ];
 
 async fn cmd_init() -> Result<()> {

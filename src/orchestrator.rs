@@ -239,6 +239,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
     isolate_dirty_tree().await;
     cleanup_stale_workspaces().await;
     let mut cumulative_cost: f64 = 0.0;
+    let mut triage_rounds: u32 = 0;
 
     for iteration in 1..=max_iterations {
         if registry.is_shutdown() {
@@ -327,6 +328,25 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                             eprintln!("[ralph] failed to record nit: {e}");
                         }
                     }
+
+                    if config.auto_triage && triage_rounds < config.max_triage_rounds {
+                        let promoted = triage_open_nits(
+                            tasks_path,
+                            config,
+                            &registry,
+                            &mut cumulative_cost,
+                        )
+                        .await?;
+                        if promoted > 0 {
+                            triage_rounds += 1;
+                            eprintln!(
+                                "[ralph] triage round {triage_rounds}: \
+                                 {promoted} nit(s) promoted, continuing..."
+                            );
+                            continue;
+                        }
+                    }
+
                     eprintln!(
                         "[ralph] final review passed — \
                          converged!"
@@ -485,6 +505,172 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
     eprintln!("[ralph] loop finished.");
     Ok(())
+}
+
+// ── Nit triage ────────────────────────────────────────────
+
+/// A single triage decision emitted by the triager agent.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct TriageDecision {
+    pub nit_id: String,
+    pub decision: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Parse triage decisions from agent output text.
+/// Each line that parses as a `TriageDecision` JSON object is collected.
+pub(crate) fn parse_triage_decisions(text: &str) -> Vec<TriageDecision> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('{') {
+                serde_json::from_str::<TriageDecision>(trimmed).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Invoke the triager agent on open nits, apply decisions,
+/// and return the number of promoted nits.
+async fn triage_open_nits(
+    tasks_path: &Path,
+    config: &Config,
+    registry: &ProcessRegistry,
+    cumulative_cost: &mut f64,
+) -> Result<usize> {
+    let nits_path = PathBuf::from(".ralph/nits.jsonl");
+    let mut nits = crate::nit::load_nits(&nits_path).await.unwrap_or_default();
+
+    let open: Vec<&crate::nit::Nit> = nits
+        .iter()
+        .filter(|n| n.status == crate::nit::NitStatus::Open)
+        .collect();
+
+    if open.is_empty() {
+        return Ok(0);
+    }
+
+    eprintln!("[ralph] triaging {} open nit(s)...", open.len());
+
+    // Build context for the triager
+    let nits_json = open
+        .iter()
+        .map(|n| serde_json::to_string(n).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let tasks = task::load_tasks(tasks_path).await.unwrap_or_default();
+    let state_path = PathBuf::from(STATE_PATH);
+    let exec_state = ExecutionState::load(&state_path).await?;
+    let tasks_summary = tasks
+        .iter()
+        .map(|t| {
+            let phase = exec_state
+                .tasks
+                .get(&t.id)
+                .map(|e| format!("{:?}", e.phase))
+                .unwrap_or_else(|| "Pending".to_string());
+            format!("[{}] {} ({})", t.id, t.title, phase)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let ctx = AgentContext::triage(nits_json, tasks_summary);
+    let result = agent::invoke_agent(
+        AgentRole::Triager,
+        &ctx,
+        config,
+        None,
+        registry,
+        0,
+    )
+    .await?;
+
+    *cumulative_cost += result.cost_usd.unwrap_or(0.0);
+
+    if registry.is_shutdown() {
+        return Ok(0);
+    }
+
+    let decisions = parse_triage_decisions(&result.text);
+    if decisions.is_empty() {
+        eprintln!("[ralph] triager returned no decisions");
+        return Ok(0);
+    }
+
+    let mut promoted_count = 0usize;
+    let mut proposals = Vec::new();
+
+    for d in &decisions {
+        let nit_entry = nits.iter_mut().find(|n| n.id == d.nit_id);
+        let Some(nit_entry) = nit_entry else {
+            eprintln!("[ralph] triager referenced unknown nit '{}'", d.nit_id);
+            continue;
+        };
+        if nit_entry.status != crate::nit::NitStatus::Open {
+            continue;
+        }
+
+        match d.decision.as_str() {
+            "promote" => {
+                let title = d
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| crate::nit::summarize(&nit_entry.content));
+                let description = d
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| nit_entry.content.clone());
+                proposals.push(agent::ProposedTask {
+                    id: None,
+                    title,
+                    description,
+                    priority: None,
+                    blocked_by: vec![],
+                });
+                nit_entry.status = crate::nit::NitStatus::Promoted;
+                promoted_count += 1;
+                eprintln!("[ralph] triager: promote {}", d.nit_id);
+            }
+            "dismiss" => {
+                nit_entry.status = crate::nit::NitStatus::Dismissed;
+                let reason = d.reason.as_deref().unwrap_or("triager dismissed");
+                eprintln!("[ralph] triager: dismiss {} — {reason}", d.nit_id);
+            }
+            other => {
+                eprintln!(
+                    "[ralph] triager: unknown decision '{}' for {}",
+                    other, d.nit_id
+                );
+            }
+        }
+    }
+
+    // Save nit status updates
+    if let Err(e) = crate::nit::save_nits(&nits_path, &nits).await {
+        eprintln!("[ralph] failed to save nit updates: {e}");
+    }
+
+    // Materialize promoted nits as tasks
+    if !proposals.is_empty() {
+        match materialize_proposed_tasks(&proposals, tasks_path, "triager").await {
+            Ok(added) => {
+                eprintln!("[ralph] triager created {added} task(s)");
+            }
+            Err(e) => {
+                eprintln!("[ralph] failed to materialize triager tasks: {e}");
+            }
+        }
+    }
+
+    Ok(promoted_count)
 }
 
 /// Group Testing tasks by disjoint file sets for parallel execution.
@@ -1171,4 +1357,47 @@ async fn run_group_singleton(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_triage_decisions_valid() {
+        let text = r#"Looking at the nits...
+{"nit_id":"NIT-1","decision":"promote","title":"Fix naming","description":"Rename foo to bar"}
+{"nit_id":"NIT-2","decision":"dismiss","reason":"Stylistic preference"}
+STATUS: SUCCESS"#;
+        let decisions = parse_triage_decisions(text);
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].nit_id, "NIT-1");
+        assert_eq!(decisions[0].decision, "promote");
+        assert_eq!(decisions[0].title.as_deref(), Some("Fix naming"));
+        assert_eq!(decisions[1].nit_id, "NIT-2");
+        assert_eq!(decisions[1].decision, "dismiss");
+        assert_eq!(decisions[1].reason.as_deref(), Some("Stylistic preference"));
+    }
+
+    #[test]
+    fn parse_triage_decisions_empty() {
+        let text = "No JSON here.\nSTATUS: SUCCESS\n";
+        let decisions = parse_triage_decisions(text);
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn parse_triage_decisions_mixed_lines() {
+        let text = r#"Here's my analysis:
+Not JSON
+{"nit_id":"NIT-3","decision":"promote","title":"Add tests"}
+Some commentary
+{"nit_id":"NIT-4","decision":"dismiss"}
+STATUS: SUCCESS"#;
+        let decisions = parse_triage_decisions(text);
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].nit_id, "NIT-3");
+        assert_eq!(decisions[1].nit_id, "NIT-4");
+        assert!(decisions[1].reason.is_none());
+    }
 }
