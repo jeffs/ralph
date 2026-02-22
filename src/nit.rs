@@ -38,16 +38,15 @@ pub fn truncate_with_ellipsis(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         return s.to_string();
     }
-    let search_range = &s[..max_len];
+    let mut end = max_len;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let search_range = &s[..end];
     if let Some(pos) = search_range.rfind(' ')
         && pos > max_len / 2
     {
         return format!("{}…", s[..pos].trim_end());
-    }
-    // No good word boundary — hard-truncate at a char boundary
-    let mut end = max_len;
-    while !s.is_char_boundary(end) {
-        end -= 1;
     }
     format!("{}…", &s[..end])
 }
@@ -197,6 +196,15 @@ mod tests {
         assert!(result.len() <= 64);
         assert!(result.ends_with('…'));
         assert!(!result.ends_with(" …")); // no trailing space before ellipsis
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_multibyte_boundary() {
+        // em-dash is 3 bytes; place it so byte 60 lands mid-character
+        let s = "(1) New `<meta>` tag uses `>` while existing tags use `/>` — minor style inconsistency.";
+        let result = truncate_with_ellipsis(s, 60);
+        assert!(result.len() <= 64);
+        assert!(result.ends_with('…'));
     }
 
     #[test]
