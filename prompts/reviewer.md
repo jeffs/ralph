@@ -61,9 +61,15 @@ If the implementation is acceptable but has minor suggestions (style, naming, op
 STATUS: APPROVED_WITH_NITS: <suggestions>
 ```
 
-If there are correctness issues, missing requirements, or bugs,
-emit them as NEW_TASKS (above) and then:
+If there are correctness issues, missing requirements, or bugs:
+
+1. You **MUST** emit a `NEW_TASKS:` block (see above) describing each issue
+   as a concrete follow-up task — one JSON object per line.
+2. Then emit the status line:
 
 ```
 STATUS: FAILURE: <summary of issues>
 ```
+
+**Important**: A FAILURE status without a preceding `NEW_TASKS:` block is
+invalid — the orchestrator cannot act on prose alone. Always emit tasks first.

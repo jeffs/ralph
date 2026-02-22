@@ -9,6 +9,7 @@ use crate::agent::{
     build_feedback_history, truncate_feedback,
 };
 use crate::config::Config;
+use crate::nit::truncate_with_ellipsis;
 use crate::scheduler;
 use crate::state::{ExecutionState, Phase};
 use crate::task::{self, Task};
@@ -165,6 +166,20 @@ async fn ingest_from_failure_reason(
         return Ok(0);
     }
     materialize_proposed_tasks(&proposals, tasks_path, source_label).await
+}
+
+/// Extract the first sentence (or first ~120 chars) of a failure reason
+/// to use as a task title.
+fn truncate_for_title(reason: &str) -> String {
+    // Collapse to a single line.
+    let oneline: String = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Try to cut at the first sentence boundary.
+    if let Some(pos) = oneline.find(". ")
+        && pos < 120
+    {
+        return oneline[..=pos].to_string();
+    }
+    truncate_with_ellipsis(&oneline, 120)
 }
 
 /// Shared logic: validate, deduplicate, assign IDs, and append proposed tasks.
@@ -359,6 +374,23 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                     if added == 0 {
                         added =
                             ingest_from_failure_reason(reason, tasks_path, "final review").await?;
+                    }
+
+                    // Last resort: wrap the prose failure reason as a single task.
+                    if added == 0 && !reason.trim().is_empty() {
+                        let fallback = vec![agent::ProposedTask {
+                            id: None,
+                            title: truncate_for_title(reason),
+                            description: reason.to_string(),
+                            priority: None,
+                            blocked_by: vec![],
+                        }];
+                        added = materialize_proposed_tasks(
+                            &fallback,
+                            tasks_path,
+                            "final review (synthesized)",
+                        )
+                        .await?;
                     }
 
                     if added > 0 {
@@ -1383,6 +1415,38 @@ STATUS: SUCCESS"#;
         let text = "No JSON here.\nSTATUS: SUCCESS\n";
         let decisions = parse_triage_decisions(text);
         assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn truncate_for_title_short_reason() {
+        let reason = "Fix the lint error";
+        assert_eq!(truncate_for_title(reason), "Fix the lint error");
+    }
+
+    #[test]
+    fn truncate_for_title_first_sentence() {
+        let reason = "`cargo clippy` fails with 2 pedantic lint errors in `src/parser.rs`. \
+                       All tests pass but the project's clippy policy is violated.";
+        let title = truncate_for_title(reason);
+        assert_eq!(
+            title,
+            "`cargo clippy` fails with 2 pedantic lint errors in `src/parser.rs`."
+        );
+    }
+
+    #[test]
+    fn truncate_for_title_long_no_sentence() {
+        let reason = "a]".repeat(100); // 200 chars, no sentence boundary
+        let title = truncate_for_title(&reason);
+        assert!(title.len() <= 124); // 120 + ellipsis (up to 4 bytes)
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_for_title_collapses_whitespace() {
+        let reason = "line one\n  line two\n  line three. rest";
+        let title = truncate_for_title(reason);
+        assert_eq!(title, "line one line two line three.");
     }
 
     #[test]
