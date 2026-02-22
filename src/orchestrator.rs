@@ -251,7 +251,11 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         registry.audit_and_kill_orphans().await;
 
         let tasks = task::load_tasks(tasks_path).await?;
-        task::validate_deps(&tasks)?;
+        let archive_path = std::path::PathBuf::from(".ralph/archive.jsonl");
+        let archived = task::load_archive(&archive_path).await?;
+        let archived_ids: std::collections::HashSet<&str> =
+            archived.iter().map(|t| t.id.as_str()).collect();
+        task::validate_deps(&tasks, &archived_ids)?;
         let mut state = ExecutionState::load(&state_path).await?;
         let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
 

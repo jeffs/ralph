@@ -73,8 +73,9 @@ agent writes this file; Ralph never modifies it.
 | `priority`  | integer  | yes      | 1 = highest                          |
 | `blocked_by`| string[] | no       | IDs that must complete first         |
 
-All `blocked_by` references must point to an `id` in the same file.
-Duplicate IDs, empty IDs, and IDs containing whitespace are rejected.
+All `blocked_by` references must point to an `id` in the same file or
+in the archive (`archive.jsonl`). Duplicate IDs, empty IDs, and IDs
+containing whitespace are rejected.
 
 ## Execution state
 
@@ -277,6 +278,9 @@ ralph status                  # Show task progress
 ralph skip <task_id>          # Mark a task Done (skip it)
 ralph fail <task_id>          # Mark a task Failed
 ralph reset <task_id>         # Reset a task to Pending
+ralph archive <task_id>       # Move a terminal task to archive.jsonl
+ralph archive --done          # Archive all Done + Skipped tasks
+ralph restore <task_id>       # Restore a task from archive.jsonl
 ```
 
 ## Rules for agents working under Ralph
@@ -341,6 +345,7 @@ repo) respect the orchestration protocol.
 .ralph/
   config.toml       # Orchestration settings
   tasks.jsonl       # Task definitions (planner output, human-editable)
+  archive.jsonl     # Archived terminal tasks (same format as tasks.jsonl)
   state.json        # Execution state (managed by Ralph, not hand-edited)
   ws-<task_id>/     # Temporary jj workspaces (auto-cleaned)
   .gitignore        # Contains "*" — nothing in .ralph/ is committed

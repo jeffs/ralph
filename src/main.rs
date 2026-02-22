@@ -75,6 +75,19 @@ enum Command {
         /// Task ID (e.g. "T3")
         task_id: String,
     },
+    /// Move terminal tasks to .ralph/archive.jsonl
+    Archive {
+        /// Task ID to archive (omit for bulk with --done)
+        task_id: Option<String>,
+        /// Archive all Done + Skipped tasks
+        #[arg(long)]
+        done: bool,
+    },
+    /// Restore an archived task back to tasks.jsonl
+    Restore {
+        /// Task ID to restore
+        task_id: String,
+    },
     /// Manage captured nits (improvement suggestions)
     Nits {
         /// Show all nits (including dismissed/promoted)
@@ -119,6 +132,8 @@ async fn main() -> Result<()> {
         Command::Reset { task_id } => cmd_override_task(&task_id, "reset").await,
         Command::Hint { task_id, text } => cmd_hint(&task_id, &text).await,
         Command::Unhint { task_id } => cmd_unhint(&task_id).await,
+        Command::Archive { task_id, done } => cmd_archive(task_id, done).await,
+        Command::Restore { task_id } => cmd_restore(&task_id).await,
         Command::Nits { all, action } => match action {
             None => cmd_nits_list(all).await,
             Some(NitsAction::Promote { nit_id }) => cmd_nits_promote(&nit_id).await,
@@ -211,7 +226,11 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
 
     // Validate the output
     let tasks = task::load_tasks(&tasks_path).await?;
-    task::validate_deps(&tasks)?;
+    let archive_path = ralph_dir.join("archive.jsonl");
+    let archived = task::load_archive(&archive_path).await?;
+    let archived_ids: std::collections::HashSet<&str> =
+        archived.iter().map(|t| t.id.as_str()).collect();
+    task::validate_deps(&tasks, &archived_ids)?;
     eprintln!("Planned {} tasks → {}", tasks.len(), tasks_path.display());
     for t in &tasks {
         eprintln!("  [{}] {} (pri={})", t.id, t.title, t.priority);
@@ -336,6 +355,13 @@ async fn cmd_status(json: bool) -> Result<()> {
         println!("Pending directives: {directive_count}");
     }
 
+    let archive_path = PathBuf::from(".ralph/archive.jsonl");
+    if let Ok(archived) = task::load_archive(&archive_path).await {
+        if !archived.is_empty() {
+            println!("Archived: {} task(s)", archived.len());
+        }
+    }
+
     let nits_path = PathBuf::from(".ralph/nits.jsonl");
     if let Ok(nits) = nit::load_nits(&nits_path).await {
         let open_count = nits
@@ -449,6 +475,87 @@ async fn cmd_unhint(task_id: &str) -> Result<()> {
     exec_state.save(&state_path).await?;
 
     eprintln!("Cleared {count} guidance entries from {task_id}");
+    Ok(())
+}
+
+async fn cmd_archive(task_id: Option<String>, done: bool) -> Result<()> {
+    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
+    let archive_path = PathBuf::from(".ralph/archive.jsonl");
+    let state_path = PathBuf::from(".ralph/state.json");
+
+    if !tasks_path.exists() {
+        anyhow::bail!("No tasks found. Run `ralph plan` first.");
+    }
+
+    let tasks = task::load_tasks(&tasks_path).await?;
+    let exec_state = state::ExecutionState::load(&state_path).await?;
+
+    let is_terminal = |id: &str| -> bool {
+        exec_state
+            .tasks
+            .get(id)
+            .is_some_and(|e| matches!(e.phase, state::Phase::Done | state::Phase::Failed | state::Phase::Skipped))
+    };
+
+    let to_archive: std::collections::HashSet<&str> = if let Some(ref id) = task_id {
+        if !tasks.iter().any(|t| t.id == *id) {
+            let valid_ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+            anyhow::bail!(
+                "Unknown task ID '{}'. Valid IDs: {}",
+                id,
+                valid_ids.join(", ")
+            );
+        }
+        if !is_terminal(id) {
+            anyhow::bail!(
+                "Task '{}' is not in a terminal phase (Done/Failed/Skipped)",
+                id
+            );
+        }
+        [id.as_str()].into_iter().collect()
+    } else if done {
+        tasks
+            .iter()
+            .filter(|t| {
+                exec_state
+                    .tasks
+                    .get(&t.id)
+                    .is_some_and(|e| matches!(e.phase, state::Phase::Done | state::Phase::Skipped))
+            })
+            .map(|t| t.id.as_str())
+            .collect()
+    } else {
+        anyhow::bail!("Provide a task ID or use --done to archive all completed tasks");
+    };
+
+    if to_archive.is_empty() {
+        eprintln!("No tasks to archive.");
+        return Ok(());
+    }
+
+    task::archive_tasks(&tasks_path, &archive_path, &to_archive).await?;
+    eprintln!("Archived {} task(s)", to_archive.len());
+    Ok(())
+}
+
+async fn cmd_restore(task_id: &str) -> Result<()> {
+    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
+    let archive_path = PathBuf::from(".ralph/archive.jsonl");
+
+    if !archive_path.exists() {
+        anyhow::bail!("No archive found at {}", archive_path.display());
+    }
+
+    // Check for ID collision with active tasks
+    if tasks_path.exists() {
+        let active = task::load_tasks(&tasks_path).await?;
+        if active.iter().any(|t| t.id == task_id) {
+            anyhow::bail!("Task ID '{}' already exists in active tasks", task_id);
+        }
+    }
+
+    task::restore_task(&tasks_path, &archive_path, task_id).await?;
+    eprintln!("Restored {task_id} to tasks.jsonl");
     Ok(())
 }
 

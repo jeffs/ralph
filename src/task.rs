@@ -84,14 +84,15 @@ fn validate_tasks(tasks: &[Task]) -> Result<()> {
 }
 
 /// Validate that every `blocked_by` ID references an
-/// actual task. Returns an error listing the dangling
-/// references, preventing silent deadlocks.
-pub fn validate_deps(tasks: &[Task]) -> Result<()> {
+/// actual task or a known extra ID (e.g. archived tasks).
+/// Returns an error listing the dangling references,
+/// preventing silent deadlocks.
+pub fn validate_deps(tasks: &[Task], extra_ids: &std::collections::HashSet<&str>) -> Result<()> {
     let ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
     let mut bad = Vec::new();
     for t in tasks {
         for dep in &t.blocked_by {
-            if !ids.contains(dep.as_str()) {
+            if !ids.contains(dep.as_str()) && !extra_ids.contains(dep.as_str()) {
                 bad.push(format!("{} blocked_by unknown task {}", t.id, dep));
             }
         }
@@ -113,6 +114,50 @@ pub async fn write_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
         buf.push('\n');
     }
     tokio::fs::write(path, buf).await?;
+    Ok(())
+}
+
+/// Load tasks from the archive file, returning an empty vec if missing.
+pub async fn load_archive(path: &Path) -> Result<Vec<Task>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    load_tasks(path).await
+}
+
+/// Move tasks from `tasks_path` to `archive_path`.
+/// The caller must ensure all IDs exist and are eligible.
+pub async fn archive_tasks(
+    tasks_path: &Path,
+    archive_path: &Path,
+    ids: &std::collections::HashSet<&str>,
+) -> Result<()> {
+    let all = load_tasks(tasks_path).await?;
+    let (to_archive, remaining): (Vec<Task>, Vec<Task>) =
+        all.into_iter().partition(|t| ids.contains(t.id.as_str()));
+    append_tasks(archive_path, &to_archive).await?;
+    write_tasks(tasks_path, &remaining).await?;
+    Ok(())
+}
+
+/// Move a task from `archive_path` back to `tasks_path`.
+pub async fn restore_task(
+    tasks_path: &Path,
+    archive_path: &Path,
+    task_id: &str,
+) -> Result<()> {
+    let archived = load_archive(archive_path).await?;
+    let (to_restore, remaining): (Vec<Task>, Vec<Task>) =
+        archived.into_iter().partition(|t| t.id == task_id);
+    if to_restore.is_empty() {
+        anyhow::bail!("task '{}' not found in archive", task_id);
+    }
+    append_tasks(tasks_path, &to_restore).await?;
+    if remaining.is_empty() {
+        tokio::fs::remove_file(archive_path).await?;
+    } else {
+        write_tasks(archive_path, &remaining).await?;
+    }
     Ok(())
 }
 
@@ -221,7 +266,8 @@ mod tests {
                 blocked_by: vec!["A".into()],
             },
         ];
-        assert!(validate_deps(&tasks).is_ok());
+        let empty = std::collections::HashSet::new();
+        assert!(validate_deps(&tasks, &empty).is_ok());
     }
 
     #[test]
@@ -296,10 +342,78 @@ mod tests {
             priority: 1,
             blocked_by: vec!["NONEXISTENT".into()],
         }];
-        let err = validate_deps(&tasks).unwrap_err();
+        let empty = std::collections::HashSet::new();
+        let err = validate_deps(&tasks, &empty).unwrap_err();
         assert!(
             err.to_string().contains("NONEXISTENT"),
             "error should name the bad ref: {err}"
         );
+    }
+
+    #[test]
+    fn validate_deps_accepts_archived_id() {
+        let tasks = vec![Task {
+            id: "B".into(),
+            title: "B".into(),
+            description: String::new(),
+            priority: 1,
+            blocked_by: vec!["ARCHIVED-1".into()],
+        }];
+        let mut extra = std::collections::HashSet::new();
+        extra.insert("ARCHIVED-1");
+        assert!(validate_deps(&tasks, &extra).is_ok());
+    }
+
+    #[tokio::test]
+    async fn archive_restore_roundtrip() {
+        let dir = std::env::temp_dir()
+            .join("ralph_task_tests")
+            .join("archive_roundtrip")
+            .join(format!("{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let tasks_path = dir.join("tasks.jsonl");
+        let archive_path = dir.join("archive.jsonl");
+
+        let tasks = vec![
+            Task {
+                id: "T1".into(),
+                title: "Done task".into(),
+                description: String::new(),
+                priority: 1,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "T2".into(),
+                title: "Active task".into(),
+                description: String::new(),
+                priority: 2,
+                blocked_by: vec![],
+            },
+        ];
+        write_tasks(&tasks_path, &tasks).await.unwrap();
+
+        // Archive T1
+        let mut ids = std::collections::HashSet::new();
+        ids.insert("T1");
+        archive_tasks(&tasks_path, &archive_path, &ids).await.unwrap();
+
+        let remaining = load_tasks(&tasks_path).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "T2");
+
+        let archived = load_archive(&archive_path).await.unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, "T1");
+
+        // Restore T1
+        restore_task(&tasks_path, &archive_path, "T1").await.unwrap();
+
+        let restored = load_tasks(&tasks_path).await.unwrap();
+        assert_eq!(restored.len(), 2);
+        assert!(restored.iter().any(|t| t.id == "T1"));
+        assert!(!archive_path.exists()); // archive removed when empty
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
