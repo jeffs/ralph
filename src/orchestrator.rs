@@ -330,13 +330,9 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                     }
 
                     if config.auto_triage && triage_rounds < config.max_triage_rounds {
-                        let promoted = triage_open_nits(
-                            tasks_path,
-                            config,
-                            &registry,
-                            &mut cumulative_cost,
-                        )
-                        .await?;
+                        let promoted =
+                            triage_open_nits(tasks_path, config, &registry, &mut cumulative_cost)
+                                .await?;
                         if promoted > 0 {
                             triage_rounds += 1;
                             eprintln!(
@@ -583,15 +579,7 @@ async fn triage_open_nits(
         .join("\n");
 
     let ctx = AgentContext::triage(nits_json, tasks_summary);
-    let result = agent::invoke_agent(
-        AgentRole::Triager,
-        &ctx,
-        config,
-        None,
-        registry,
-        0,
-    )
-    .await?;
+    let result = agent::invoke_agent(AgentRole::Triager, &ctx, config, None, registry, 0).await?;
 
     *cumulative_cost += result.cost_usd.unwrap_or(0.0);
 
@@ -751,7 +739,17 @@ async fn resume_inflight(
                 .map(|e| e.files_changed.clone())
                 .unwrap_or_default();
             let ctx = AgentContext::test(id, files);
-            let cfg = config.clone();
+            let mut cfg = config.clone();
+            if config.workspace.isolate_target_dir {
+                let target_dir = PathBuf::from(WS_DIR).join("target");
+                let target_dir = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(&target_dir);
+                cfg.env.set.insert(
+                    "CARGO_TARGET_DIR".to_string(),
+                    target_dir.to_string_lossy().to_string(),
+                );
+            }
             let reg = registry.clone();
             let id_owned = id.clone();
             handles.push(tokio::spawn(async move {
@@ -1293,15 +1291,19 @@ async fn run_group_singleton(
         guidance.as_deref(),
         feedback_history.as_deref(),
     );
-    let result = agent::invoke_agent(
-        AgentRole::Implementer,
-        &ctx,
-        config,
-        None,
-        registry,
-        attempt,
-    )
-    .await;
+    let mut cfg = config.clone();
+    if config.workspace.isolate_target_dir {
+        let target_dir = PathBuf::from(WS_DIR).join("target");
+        let target_dir = std::env::current_dir()
+            .unwrap_or_default()
+            .join(&target_dir);
+        cfg.env.set.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            target_dir.to_string_lossy().to_string(),
+        );
+    }
+    let result =
+        agent::invoke_agent(AgentRole::Implementer, &ctx, &cfg, None, registry, attempt).await;
 
     {
         let exec = state.entry(&t.id);

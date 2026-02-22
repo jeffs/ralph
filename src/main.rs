@@ -357,11 +357,10 @@ async fn cmd_status(json: bool) -> Result<()> {
     }
 
     let archive_path = PathBuf::from(".ralph/archive.jsonl");
-    if let Ok(archived) = task::load_archive(&archive_path).await {
-        if !archived.is_empty() {
+    if let Ok(archived) = task::load_archive(&archive_path).await
+        && !archived.is_empty() {
             println!("Archived: {} task(s)", archived.len());
         }
-    }
 
     let nits_path = PathBuf::from(".ralph/nits.jsonl");
     if let Ok(nits) = nit::load_nits(&nits_path).await {
@@ -492,10 +491,12 @@ async fn cmd_archive(task_id: Option<String>, done: bool) -> Result<()> {
     let exec_state = state::ExecutionState::load(&state_path).await?;
 
     let is_terminal = |id: &str| -> bool {
-        exec_state
-            .tasks
-            .get(id)
-            .is_some_and(|e| matches!(e.phase, state::Phase::Done | state::Phase::Failed | state::Phase::Skipped))
+        exec_state.tasks.get(id).is_some_and(|e| {
+            matches!(
+                e.phase,
+                state::Phase::Done | state::Phase::Failed | state::Phase::Skipped
+            )
+        })
     };
 
     let to_archive: std::collections::HashSet<&str> = if let Some(ref id) = task_id {

@@ -141,11 +141,7 @@ pub async fn archive_tasks(
 }
 
 /// Move a task from `archive_path` back to `tasks_path`.
-pub async fn restore_task(
-    tasks_path: &Path,
-    archive_path: &Path,
-    task_id: &str,
-) -> Result<()> {
+pub async fn restore_task(tasks_path: &Path, archive_path: &Path, task_id: &str) -> Result<()> {
     let archived = load_archive(archive_path).await?;
     let (to_restore, remaining): (Vec<Task>, Vec<Task>) =
         archived.into_iter().partition(|t| t.id == task_id);
@@ -396,7 +392,9 @@ mod tests {
         // Archive T1
         let mut ids = std::collections::HashSet::new();
         ids.insert("T1");
-        archive_tasks(&tasks_path, &archive_path, &ids).await.unwrap();
+        archive_tasks(&tasks_path, &archive_path, &ids)
+            .await
+            .unwrap();
 
         let remaining = load_tasks(&tasks_path).await.unwrap();
         assert_eq!(remaining.len(), 1);
@@ -407,7 +405,9 @@ mod tests {
         assert_eq!(archived[0].id, "T1");
 
         // Restore T1
-        restore_task(&tasks_path, &archive_path, "T1").await.unwrap();
+        restore_task(&tasks_path, &archive_path, "T1")
+            .await
+            .unwrap();
 
         let restored = load_tasks(&tasks_path).await.unwrap();
         assert_eq!(restored.len(), 2);
