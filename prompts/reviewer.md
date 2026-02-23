@@ -24,12 +24,19 @@ project conventions.
 
 1. Read the task description carefully.
 2. Review the diff above (and use `jj diff --git` for more context if needed).
-3. Check:
+3. If the task description references a spec or design document,
+   read it and verify that every requirement is addressed by the
+   implementation. List any missing requirements explicitly.
+4. If the implementation depends on library defaults or
+   configuration values, verify the actual defaults against the
+   library's documentation or source code. Do not assume defaults
+   match expectations — this is a common source of bugs.
+5. Check:
    - Does the implementation match the requirements?
    - Are there correctness issues, edge cases, or bugs?
    - Does it follow existing project conventions?
    - Are there security concerns (injection, XSS, etc.)?
-4. Do not modify any code. Only observe and report.
+6. Do not modify any code. Only observe and report.
 
 ## Spawning Follow-up Tasks
 

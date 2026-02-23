@@ -156,6 +156,8 @@ pub enum AgentContext {
     /// Tester: validate recent changes
     Test {
         task_id: String,
+        task_title: String,
+        task_description: String,
         files_changed: Vec<PathBuf>,
     },
     /// Reviewer: review implementation against requirements
@@ -197,9 +199,11 @@ impl AgentContext {
         }
     }
 
-    pub fn test(id: &str, files: Vec<PathBuf>) -> Self {
+    pub fn test(id: &str, title: &str, description: &str, files: Vec<PathBuf>) -> Self {
         Self::Test {
             task_id: id.to_string(),
+            task_title: title.to_string(),
+            task_description: description.to_string(),
             files_changed: files,
         }
     }
@@ -275,6 +279,8 @@ impl AgentContext {
             }
             Self::Test {
                 task_id,
+                task_title,
+                task_description,
                 files_changed,
             } => {
                 let files_str = files_changed
@@ -284,6 +290,8 @@ impl AgentContext {
                     .join("\n");
                 template
                     .replace("{{TASK_ID}}", task_id)
+                    .replace("{{TASK_TITLE}}", task_title)
+                    .replace("{{TASK_DESCRIPTION}}", task_description)
                     .replace("{{FILES_CHANGED}}", &files_str)
             }
             Self::Review {

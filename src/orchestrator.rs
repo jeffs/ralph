@@ -780,7 +780,11 @@ async fn resume_inflight(
                 .get(id)
                 .map(|e| e.files_changed.clone())
                 .unwrap_or_default();
-            let ctx = AgentContext::test(id, files);
+            let t = tasks.iter().find(|t| t.id == *id);
+            let (title, desc) = t
+                .map(|t| (t.title.as_str(), t.description.as_str()))
+                .unwrap_or(("unknown", ""));
+            let ctx = AgentContext::test(id, title, desc, files);
             let cfg = config.clone();
             let reg = registry.clone();
             let id_owned = id.clone();
