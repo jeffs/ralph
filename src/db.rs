@@ -499,7 +499,8 @@ pub fn task_ids_in_use(conn: &Connection) -> Result<HashSet<String>> {
     Ok(ids)
 }
 
-/// Verify that every dep_id in task_deps references an existing task ID.
+/// Verify that every dep_id in task_deps references an existing task ID and
+/// that no dependency cycles exist.
 pub fn validate_deps(conn: &Connection) -> Result<()> {
     let all_ids = task_ids_in_use(conn)?;
     let mut stmt = conn.prepare("SELECT task_id, dep_id FROM task_deps")?;
@@ -513,10 +514,63 @@ pub fn validate_deps(conn: &Connection) -> Result<()> {
             bad.push(format!("{task_id} blocked_by unknown task {dep_id}"));
         }
     }
+
+    // DFS-based cycle detection among tasks present in the database.
+    // Returns the cycle as [a, b, ..., a] (start node repeated at end), or None.
+    fn dfs(
+        id: &str,
+        adj: &HashMap<String, Vec<String>>,
+        state: &mut HashMap<String, u8>,
+        path: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        state.insert(id.to_string(), 1);
+        path.push(id.to_string());
+        if let Some(deps) = adj.get(id) {
+            for dep in deps {
+                match *state.get(dep).unwrap_or(&0) {
+                    1 => {
+                        // dep is on the current DFS stack — cycle found.
+                        if let Some(idx) = path.iter().position(|x| x == dep) {
+                            let mut cycle = path[idx..].to_vec();
+                            cycle.push(dep.clone());
+                            return Some(cycle);
+                        }
+                    }
+                    0 => {
+                        if let Some(c) = dfs(dep, adj, state, path) {
+                            return Some(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        path.pop();
+        state.insert(id.to_string(), 2);
+        None
+    }
+
+    // Build adjacency list from dep entries where both ends exist in the DB.
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for (task_id, dep_id) in &deps {
+        if all_ids.contains(dep_id) {
+            adj.entry(task_id.clone()).or_default().push(dep_id.clone());
+        }
+    }
+    let mut state: HashMap<String, u8> = HashMap::new();
+    for id in &all_ids {
+        if *state.get(id).unwrap_or(&0) == 0 {
+            let mut path = Vec::new();
+            if let Some(cycle) = dfs(id, &adj, &mut state, &mut path) {
+                bad.push(format!("dependency cycle: {}", cycle.join(" -> ")));
+            }
+        }
+    }
+
     if bad.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("dangling dependency references:\n  {}", bad.join("\n  "))
+        anyhow::bail!("dependency validation failed:\n  {}", bad.join("\n  "))
     }
 }
 
@@ -1193,6 +1247,25 @@ mod tests {
             err.to_string().contains("GHOST"),
             "error should mention the dangling dep: {err}"
         );
+    }
+
+    #[test]
+    fn validate_deps_catches_cycle() {
+        let conn = open_memory().unwrap();
+        let mut a = make_task("A");
+        a.blocked_by = vec!["B".to_string()];
+        insert_task(&conn, &a).unwrap();
+        let mut b = make_task("B");
+        b.blocked_by = vec!["A".to_string()];
+        insert_task(&conn, &b).unwrap();
+
+        let err = validate_deps(&conn).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("A") && msg.contains("B"),
+            "error should name the cycle participants: {err}"
+        );
+        assert!(msg.contains("cycle"), "error should mention 'cycle': {err}");
     }
 
     // ── Directive CRUD ──────────────────────────────────────

@@ -174,10 +174,9 @@ fn validate_tasks(tasks: &[TaskDef]) -> Result<()> {
     }
 }
 
-/// Validate that every `blocked_by` ID references an
-/// actual task or a known extra ID (e.g. archived tasks).
-/// Returns an error listing the dangling references,
-/// preventing silent deadlocks.
+/// Validate that every `blocked_by` ID references an actual task or a known
+/// extra ID (e.g. archived tasks), and that no dependency cycles exist.
+/// Returns an error listing all dangling references and/or cycles found.
 pub fn validate_deps(tasks: &[TaskDef], extra_ids: &std::collections::HashSet<&str>) -> Result<()> {
     let ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
     let mut bad = Vec::new();
@@ -188,10 +187,69 @@ pub fn validate_deps(tasks: &[TaskDef], extra_ids: &std::collections::HashSet<&s
             }
         }
     }
+
+    // DFS-based cycle detection among tasks in this set.
+    // Returns the cycle as [a, b, ..., a] (start node repeated at end), or None.
+    fn dfs<'a>(
+        id: &'a str,
+        adj: &std::collections::HashMap<&'a str, Vec<&'a str>>,
+        state: &mut std::collections::HashMap<&'a str, u8>,
+        path: &mut Vec<&'a str>,
+    ) -> Option<Vec<String>> {
+        state.insert(id, 1);
+        path.push(id);
+        if let Some(deps) = adj.get(id) {
+            for &dep in deps {
+                match *state.get(dep).unwrap_or(&0) {
+                    1 => {
+                        // dep is on the current DFS stack — cycle found.
+                        if let Some(idx) = path.iter().position(|&x| x == dep) {
+                            let mut cycle: Vec<String> =
+                                path[idx..].iter().map(|s| s.to_string()).collect();
+                            cycle.push(dep.to_string());
+                            return Some(cycle);
+                        }
+                    }
+                    0 => {
+                        if let Some(c) = dfs(dep, adj, state, path) {
+                            return Some(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        path.pop();
+        state.insert(id, 2);
+        None
+    }
+
+    let adj: std::collections::HashMap<&str, Vec<&str>> = tasks
+        .iter()
+        .map(|t| {
+            let deps: Vec<&str> = t
+                .blocked_by
+                .iter()
+                .map(|d| d.as_str())
+                .filter(|d| ids.contains(d))
+                .collect();
+            (t.id.as_str(), deps)
+        })
+        .collect();
+    let mut state: std::collections::HashMap<&str, u8> = std::collections::HashMap::new();
+    for &id in &ids {
+        if *state.get(id).unwrap_or(&0) == 0 {
+            let mut path = Vec::new();
+            if let Some(cycle) = dfs(id, &adj, &mut state, &mut path) {
+                bad.push(format!("dependency cycle: {}", cycle.join(" -> ")));
+            }
+        }
+    }
+
     if bad.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("dangling dependency references:\n  {}", bad.join("\n  "));
+        anyhow::bail!("dependency validation failed:\n  {}", bad.join("\n  "));
     }
 }
 
@@ -502,6 +560,69 @@ mod tests {
             err.to_string().contains("NONEXISTENT"),
             "error should name the bad ref: {err}"
         );
+    }
+
+    #[test]
+    fn validate_deps_catches_cycle() {
+        let tasks = vec![
+            TaskDef {
+                id: "A".into(),
+                title: "A".into(),
+                description: String::new(),
+                priority: 1,
+                blocked_by: vec!["B".into()],
+            },
+            TaskDef {
+                id: "B".into(),
+                title: "B".into(),
+                description: String::new(),
+                priority: 2,
+                blocked_by: vec!["A".into()],
+            },
+        ];
+        let empty = std::collections::HashSet::new();
+        let err = validate_deps(&tasks, &empty).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("A") && msg.contains("B"),
+            "error should name the cycle participants: {err}"
+        );
+        assert!(msg.contains("cycle"), "error should mention 'cycle': {err}");
+    }
+
+    #[test]
+    fn validate_deps_catches_three_way_cycle() {
+        let tasks = vec![
+            TaskDef {
+                id: "X".into(),
+                title: "X".into(),
+                description: String::new(),
+                priority: 1,
+                blocked_by: vec!["Z".into()],
+            },
+            TaskDef {
+                id: "Y".into(),
+                title: "Y".into(),
+                description: String::new(),
+                priority: 2,
+                blocked_by: vec!["X".into()],
+            },
+            TaskDef {
+                id: "Z".into(),
+                title: "Z".into(),
+                description: String::new(),
+                priority: 3,
+                blocked_by: vec!["Y".into()],
+            },
+        ];
+        let empty = std::collections::HashSet::new();
+        let err = validate_deps(&tasks, &empty).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("X") && msg.contains("Y") && msg.contains("Z"),
+            "error should name all cycle participants: {err}"
+        );
+        assert!(msg.contains("cycle"), "error should mention 'cycle': {err}");
     }
 
     #[test]
