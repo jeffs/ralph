@@ -278,9 +278,11 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
 }
 
 async fn cmd_run(tasks_path: Option<PathBuf>, max_iterations: usize) -> Result<()> {
-    let tasks_path = tasks_path.unwrap_or_else(|| PathBuf::from(".ralph/tasks.jsonl"));
+    let _ = tasks_path; // tasks are now loaded from the database
     let config = config::Config::load().await?;
-    orchestrator::run_loop(&tasks_path, max_iterations, &config).await
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
+    orchestrator::run_loop(&conn, max_iterations, &config).await
 }
 
 async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
