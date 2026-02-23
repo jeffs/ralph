@@ -405,7 +405,7 @@ async fn cmd_status(json: bool) -> Result<()> {
             .last_error
             .as_deref()
             .map(|e| {
-                let truncated = if e.len() > 80 { &e[..80] } else { e };
+                let truncated = &e[..e.floor_char_boundary(80)];
                 format!(" err={truncated}")
             })
             .unwrap_or_default();

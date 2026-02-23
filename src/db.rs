@@ -74,7 +74,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             attempt     INTEGER NOT NULL DEFAULT 0,
             content     TEXT    NOT NULL,
             summary     TEXT    NOT NULL DEFAULT '',
-            status      TEXT    NOT NULL DEFAULT 'open',
+            status      TEXT    NOT NULL DEFAULT 'Open',
             promoted_to TEXT,
             created_at  INTEGER NOT NULL DEFAULT 0
         );

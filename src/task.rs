@@ -127,7 +127,7 @@ pub fn parse_tasks(contents: &str) -> Result<Vec<TaskDef>> {
         .map(|(i, line)| {
             serde_json::from_str::<TaskDef>(line).with_context(|| {
                 let preview = if line.len() > 120 {
-                    format!("{}...", &line[..120])
+                    format!("{}...", &line[..line.floor_char_boundary(120)])
                 } else {
                     line.to_string()
                 };
