@@ -45,37 +45,7 @@ pub struct TaskExecution {
     pub postmortem: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Phase {
-    Pending,
-    Implementing,
-    Testing,
-    Reviewing,
-    Done,
-    Failed,
-    Skipped,
-}
-
-impl Phase {
-    /// Integer phase ID for sorting and machine consumption.
-    pub fn phase_ordinal(self) -> u8 {
-        match self {
-            Phase::Pending => 0,
-            Phase::Implementing => 1,
-            Phase::Testing => 2,
-            Phase::Reviewing => 3,
-            Phase::Done => 4,
-            Phase::Failed => 5,
-            Phase::Skipped => 6,
-        }
-    }
-
-    /// Whether this phase counts as "dependency satisfied" for
-    /// downstream tasks. Both Done and Skipped satisfy deps.
-    pub fn satisfies_dep(self) -> bool {
-        matches!(self, Phase::Done | Phase::Skipped)
-    }
-}
+pub use crate::task::{Directive, DirectiveAction, Phase, unix_now};
 
 impl Default for TaskExecution {
     fn default() -> Self {
@@ -92,14 +62,6 @@ impl Default for TaskExecution {
             postmortem: None,
         }
     }
-}
-
-/// Current Unix timestamp in seconds.
-pub fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 impl ExecutionState {
@@ -152,21 +114,6 @@ impl ExecutionState {
 }
 
 // ── Sideband directives ───────────────────────────────────
-
-/// A sideband override written by `ralph skip/fail/reset` and
-/// drained atomically by the orchestrator each iteration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Directive {
-    pub task_id: String,
-    pub action: DirectiveAction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DirectiveAction {
-    Skip,
-    Fail,
-    Reset,
-}
 
 /// Append a single directive as one JSONL line. Safe for
 /// concurrent appenders (writes < PIPE_BUF are atomic on POSIX).
