@@ -320,12 +320,19 @@ async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
     match (task_id, failed) {
         (Some(id), false) => cmd_override_task(&id, "reset").await,
         (None, true) => {
-            std::fs::create_dir_all(".ralph")?;
-            let conn = db::open(&db::db_path())?;
-            let tasks = db::list_active_tasks(&conn)?;
+            let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
+            let state_path = PathBuf::from(".ralph/state.json");
+            if !tasks_path.exists() {
+                anyhow::bail!("No tasks found. Run `ralph plan` first.");
+            }
+            let tasks = task::load_tasks(&tasks_path).await?;
+            let exec_state = state::ExecutionState::load(&state_path).await?;
             let failed_ids: Vec<&str> = tasks
                 .iter()
-                .filter(|t| matches!(t.phase, task::Phase::Failed))
+                .filter(|t| {
+                    exec_state.tasks.get(&t.id)
+                        .is_some_and(|e| matches!(e.phase, state::Phase::Failed))
+                })
                 .map(|t| t.id.as_str())
                 .collect();
             if failed_ids.is_empty() {
@@ -333,7 +340,10 @@ async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
                 return Ok(());
             }
             for id in &failed_ids {
-                db::insert_directive(&conn, id, task::DirectiveAction::Reset)?;
+                state::append_directive(&state::Directive {
+                    task_id: id.to_string(),
+                    action: state::DirectiveAction::Reset,
+                }).await?;
             }
             eprintln!("Queued reset for {} task(s): {}", failed_ids.len(), failed_ids.join(", "));
             Ok(())
