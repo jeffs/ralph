@@ -4,7 +4,6 @@ mod db;
 mod nit;
 mod orchestrator;
 mod scheduler;
-mod state;
 mod task;
 
 use std::path::PathBuf;
@@ -850,6 +849,33 @@ async fn cmd_dump(json: bool, all: bool) -> Result<()> {
     }
 }
 
+/// Minimal legacy types for deserializing `.ralph/state.json` during import.
+#[derive(serde::Deserialize)]
+struct LegacyExecutionState {
+    tasks: std::collections::HashMap<String, LegacyTaskExecution>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyTaskExecution {
+    phase: task::Phase,
+    attempts: u32,
+    last_error: Option<String>,
+    #[serde(default)]
+    files_changed: Vec<std::path::PathBuf>,
+    #[serde(default)]
+    feedback: Vec<String>,
+    #[serde(default)]
+    guidance: Vec<String>,
+    #[serde(default)]
+    phase_entered_at: Option<u64>,
+    #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    completed_at: Option<u64>,
+    #[serde(default)]
+    postmortem: Option<String>,
+}
+
 async fn cmd_import(dir: PathBuf) -> Result<()> {
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
@@ -865,8 +891,9 @@ async fn cmd_import(dir: PathBuf) -> Result<()> {
 
     // ── Step 2: state.json → ExecutionState ───────────────────
     let state_path = dir.join("state.json");
-    let exec_state = if state_path.exists() {
-        Some(state::ExecutionState::load(&state_path).await?)
+    let exec_state: Option<LegacyExecutionState> = if state_path.exists() {
+        let contents = tokio::fs::read_to_string(&state_path).await?;
+        Some(serde_json::from_str(&contents)?)
     } else {
         None
     };
