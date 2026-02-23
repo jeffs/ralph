@@ -79,7 +79,7 @@ enum Command {
         /// Task ID (e.g. "T3")
         task_id: String,
     },
-    /// Move terminal tasks to .ralph/archive.jsonl
+    /// Move terminal tasks to archive
     Archive {
         /// Task ID to archive (omit for bulk with --done)
         task_id: Option<String>,
@@ -87,7 +87,7 @@ enum Command {
         #[arg(long)]
         done: bool,
     },
-    /// Restore an archived task back to tasks.jsonl
+    /// Restore an archived task back to active
     Restore {
         /// Task ID to restore
         task_id: String,
@@ -207,21 +207,14 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
     let registry = agent::ProcessRegistry::new(config.kill_grace_secs);
     orchestrator::spawn_signal_handler(registry.clone());
 
-    let tasks_path = ralph_dir.join("tasks.jsonl");
-    let archive_path = ralph_dir.join("archive.jsonl");
+    let conn = db::open(&db::db_path())?;
 
-    // Load existing tasks (active + archived) so the planner
-    // knows which IDs are taken.
-    let existing = if tasks_path.exists() {
-        task::load_tasks(&tasks_path).await?
-    } else {
-        Vec::new()
-    };
-    let archived = task::load_archive(&archive_path).await?;
-
-    let mut all_for_summary = existing.clone();
-    all_for_summary.extend(archived.iter().cloned());
-    let existing_ids_summary = task::id_ranges_summary(&all_for_summary);
+    // Get all in-use IDs (active + archived) for collision detection.
+    let taken_ids = db::task_ids_in_use(&conn)?;
+    // Get summary of existing ID ranges for the planner prompt.
+    let existing_ids_summary = db::id_ranges_summary(&conn)?;
+    // Count active tasks for the post-plan log message.
+    let existing_active_count = db::list_active_tasks(&conn)?.len();
 
     let result = agent::invoke_agent(
         agent::AgentRole::Planner,
@@ -242,36 +235,31 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
     let jsonl = result
         .extract_jsonl()
         .ok_or_else(|| anyhow::anyhow!("planner produced no JSONL output"))?;
-    let mut new_tasks = task::parse_tasks(&jsonl)?;
+    let mut new_task_defs = task::parse_tasks(&jsonl)?;
 
     // Renumber any IDs that collide with existing tasks.
-    let taken_ids: std::collections::HashSet<String> = existing
-        .iter()
-        .chain(archived.iter())
-        .map(|t| t.id.clone())
-        .collect();
-    let renames = task::renumber_collisions(&mut new_tasks, &taken_ids);
+    let renames = task::renumber_collisions(&mut new_task_defs, &taken_ids);
     for (old, new) in &renames {
         eprintln!("[ralph] renumbered colliding ID: {old} → {new}");
     }
 
-    // Validate deps across existing + new + archived.
-    let mut all_tasks = existing.clone();
-    all_tasks.extend(new_tasks.iter().cloned());
-    let archived_ids: std::collections::HashSet<&str> =
-        archived.iter().map(|t| t.id.as_str()).collect();
-    task::validate_deps(&all_tasks, &archived_ids)?;
+    // Validate deps: new tasks can reference each other or any known DB ID.
+    let extra_ids: std::collections::HashSet<&str> =
+        taken_ids.iter().map(|s| s.as_str()).collect();
+    task::validate_deps(&new_task_defs, &extra_ids)?;
 
-    // Append new tasks to the file.
-    task::append_tasks(&tasks_path, &new_tasks).await?;
+    // Convert TaskDef → Task and insert into the database.
+    let new_tasks: Vec<task::Task> = new_task_defs.iter().map(task::Task::from_def).collect();
+    let new_count = new_tasks.len();
+    db::insert_tasks(&conn, &new_tasks)?;
 
     eprintln!(
         "Planned {} new task(s), {} total → {}",
-        new_tasks.len(),
-        existing.len() + new_tasks.len(),
-        tasks_path.display()
+        new_count,
+        existing_active_count + new_count,
+        db::db_path().display()
     );
-    for t in &new_tasks {
+    for t in &new_task_defs {
         eprintln!("  [{}] {} (pri={})", t.id, t.title, t.priority);
     }
     Ok(())
@@ -286,14 +274,11 @@ async fn cmd_run(tasks_path: Option<PathBuf>, max_iterations: usize) -> Result<(
 }
 
 async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
-    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
 
-    if !tasks_path.exists() {
-        anyhow::bail!("No tasks found. Run `ralph plan` first.");
-    }
-
-    let tasks = task::load_tasks(&tasks_path).await?;
-    if !tasks.iter().any(|t| t.id == task_id) {
+    if db::get_task(&conn, task_id)?.is_none() {
+        let tasks = db::list_active_tasks(&conn)?;
         let valid_ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
         anyhow::bail!(
             "Unknown task ID '{}'. Valid IDs: {}",
@@ -303,18 +288,13 @@ async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
     }
 
     let directive_action = match action {
-        "skip" => state::DirectiveAction::Skip,
-        "fail" => state::DirectiveAction::Fail,
-        "reset" => state::DirectiveAction::Reset,
+        "skip" => task::DirectiveAction::Skip,
+        "fail" => task::DirectiveAction::Fail,
+        "reset" => task::DirectiveAction::Reset,
         _ => unreachable!(),
     };
 
-    state::append_directive(&state::Directive {
-        task_id: task_id.to_string(),
-        action: directive_action,
-    })
-    .await?;
-
+    db::insert_directive(&conn, task_id, directive_action)?;
     eprintln!("Queued {action} for {task_id}");
     Ok(())
 }
@@ -357,10 +337,8 @@ async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
 }
 
 async fn cmd_status(json: bool) -> Result<()> {
-    let state_path = PathBuf::from(".ralph/state.json");
-    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
-
-    if !tasks_path.exists() {
+    let db_path = db::db_path();
+    if !db_path.exists() {
         if json {
             println!("{{\"tasks\":[]}}");
         } else {
@@ -369,22 +347,14 @@ async fn cmd_status(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    let tasks = task::load_tasks(&tasks_path).await?;
-    let mut exec_state = state::ExecutionState::load(&state_path).await?;
-
-    // Merge pending directives into the in-memory view (don't save back).
-    let pending_directives = state::load_directives().await.unwrap_or_default();
-    let directive_count = pending_directives.len();
-    if !pending_directives.is_empty() {
-        let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
-        exec_state.apply_directives(&pending_directives, &task_ids);
-    }
+    let conn = db::open(&db_path)?;
+    let tasks = db::list_active_tasks(&conn)?;
 
     if json {
-        return cmd_status_json(&tasks, &exec_state);
+        return cmd_status_json(&tasks);
     }
 
-    let now = state::unix_now();
+    let now = task::unix_now();
 
     let mut done = 0u32;
     let mut failed = 0u32;
@@ -394,34 +364,29 @@ async fn cmd_status(json: bool) -> Result<()> {
 
     println!("Tasks: {}", tasks.len());
     for t in &tasks {
-        let info = if let Some(e) = exec_state.tasks.get(&t.id) {
-            match e.phase {
-                state::Phase::Done => done += 1,
-                state::Phase::Failed => failed += 1,
-                state::Phase::Skipped => skipped += 1,
-                state::Phase::Pending => pending += 1,
-                state::Phase::Implementing | state::Phase::Testing | state::Phase::Reviewing => {
-                    in_progress += 1
-                }
+        match t.phase {
+            task::Phase::Done => done += 1,
+            task::Phase::Failed => failed += 1,
+            task::Phase::Skipped => skipped += 1,
+            task::Phase::Pending => pending += 1,
+            task::Phase::Implementing | task::Phase::Testing | task::Phase::Reviewing => {
+                in_progress += 1
             }
-            let duration = match (e.started_at, e.completed_at) {
-                (Some(s), Some(c)) => format!(" ({}s)", c.saturating_sub(s)),
-                (Some(s), None) => format!(" ({}s elapsed)", now.saturating_sub(s)),
-                _ => String::new(),
-            };
-            let error = e
-                .last_error
-                .as_deref()
-                .map(|e| {
-                    let truncated = if e.len() > 80 { &e[..80] } else { e };
-                    format!(" err={truncated}")
-                })
-                .unwrap_or_default();
-            format!("{:?} attempts={}{duration}{error}", e.phase, e.attempts)
-        } else {
-            pending += 1;
-            "Pending".to_string()
+        }
+        let duration = match (t.started_at, t.completed_at) {
+            (Some(s), Some(c)) => format!(" ({}s)", c.saturating_sub(s)),
+            (Some(s), None) => format!(" ({}s elapsed)", now.saturating_sub(s)),
+            _ => String::new(),
         };
+        let error = t
+            .last_error
+            .as_deref()
+            .map(|e| {
+                let truncated = if e.len() > 80 { &e[..80] } else { e };
+                format!(" err={truncated}")
+            })
+            .unwrap_or_default();
+        let info = format!("{:?} attempts={}{duration}{error}", t.phase, t.attempts);
         println!("  [{}] {} — {}", t.id, t.title, info);
     }
     println!(
@@ -429,31 +394,26 @@ async fn cmd_status(json: bool) -> Result<()> {
         done, skipped, failed, in_progress, pending
     );
 
-    if directive_count > 0 {
-        println!("Pending directives: {directive_count}");
+    let directives = db::peek_directives(&conn)?;
+    if !directives.is_empty() {
+        println!("Pending directives: {}", directives.len());
     }
 
-    let archive_path = PathBuf::from(".ralph/archive.jsonl");
-    if let Ok(archived) = task::load_archive(&archive_path).await
-        && !archived.is_empty()
-    {
-        println!("Archived: {} task(s)", archived.len());
+    let all_tasks = db::list_all_tasks(&conn)?;
+    let archived_count = all_tasks.iter().filter(|t| t.archived).count();
+    if archived_count > 0 {
+        println!("Archived: {} task(s)", archived_count);
     }
 
-    let nits_path = PathBuf::from(".ralph/nits.jsonl");
-    if let Ok(nits) = nit::load_nits(&nits_path).await {
-        let open_count = nits
-            .iter()
-            .filter(|n| n.status == nit::NitStatus::Open)
-            .count();
-        if open_count > 0 {
-            println!("Nits: {open_count} open (run `ralph nits` to see them)");
-        }
+    let open_nits = db::list_nits(&conn, false)?;
+    if !open_nits.is_empty() {
+        println!("Nits: {} open (run `ralph nits` to see them)", open_nits.len());
     }
+
     Ok(())
 }
 
-fn cmd_status_json(tasks: &[task::TaskDef], exec_state: &state::ExecutionState) -> Result<()> {
+fn cmd_status_json(tasks: &[task::Task]) -> Result<()> {
     #[derive(serde::Serialize)]
     struct TaskStatus<'a> {
         id: &'a str,
@@ -461,7 +421,7 @@ fn cmd_status_json(tasks: &[task::TaskDef], exec_state: &state::ExecutionState) 
         description: &'a str,
         priority: u32,
         blocked_by: &'a [String],
-        phase: &'a state::Phase,
+        phase: &'a task::Phase,
         phase_ordinal: u8,
         attempts: u32,
         last_error: Option<&'a str>,
@@ -471,26 +431,22 @@ fn cmd_status_json(tasks: &[task::TaskDef], exec_state: &state::ExecutionState) 
         #[serde(skip_serializing_if = "Option::is_none")]
         postmortem: Option<&'a str>,
     }
-    let default_exec = state::TaskExecution::default();
     let out: Vec<TaskStatus> = tasks
         .iter()
-        .map(|t| {
-            let e = exec_state.tasks.get(&t.id).unwrap_or(&default_exec);
-            TaskStatus {
-                id: &t.id,
-                title: &t.title,
-                description: &t.description,
-                priority: t.priority,
-                blocked_by: &t.blocked_by,
-                phase: &e.phase,
-                phase_ordinal: e.phase.phase_ordinal(),
-                attempts: e.attempts,
-                last_error: e.last_error.as_deref(),
-                files_changed: &e.files_changed,
-                started_at: e.started_at,
-                completed_at: e.completed_at,
-                postmortem: e.postmortem.as_deref(),
-            }
+        .map(|t| TaskStatus {
+            id: &t.id,
+            title: &t.title,
+            description: &t.description,
+            priority: t.priority,
+            blocked_by: &t.blocked_by,
+            phase: &t.phase,
+            phase_ordinal: t.phase.phase_ordinal(),
+            attempts: t.attempts,
+            last_error: t.last_error.as_deref(),
+            files_changed: &t.files_changed,
+            started_at: t.started_at,
+            completed_at: t.completed_at,
+            postmortem: t.postmortem.as_deref(),
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&out)?);
@@ -498,15 +454,12 @@ fn cmd_status_json(tasks: &[task::TaskDef], exec_state: &state::ExecutionState) 
 }
 
 async fn cmd_hint(task_id: &str, text: &str) -> Result<()> {
-    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
-    let state_path = PathBuf::from(".ralph/state.json");
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
 
-    if !tasks_path.exists() {
-        anyhow::bail!("No tasks found. Run `ralph plan` first.");
-    }
-
-    let tasks = task::load_tasks(&tasks_path).await?;
-    if !tasks.iter().any(|t| t.id == task_id) {
+    let t = db::get_task(&conn, task_id)?;
+    if t.is_none() {
+        let tasks = db::list_active_tasks(&conn)?;
         let valid_ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
         anyhow::bail!(
             "Unknown task ID '{}'. Valid IDs: {}",
@@ -515,29 +468,22 @@ async fn cmd_hint(task_id: &str, text: &str) -> Result<()> {
         );
     }
 
-    let mut exec_state = state::ExecutionState::load(&state_path).await?;
-    let exec = exec_state.entry(task_id);
-    exec.guidance.push(text.to_string());
-    exec_state.save(&state_path).await?;
+    let mut guidance = t.unwrap().guidance;
+    guidance.push(text.to_string());
+    let count = guidance.len();
+    db::set_guidance(&conn, task_id, &guidance)?;
 
-    eprintln!(
-        "Added guidance to {} ({} total)",
-        task_id,
-        exec_state.tasks[task_id].guidance.len()
-    );
+    eprintln!("Added guidance to {} ({} total)", task_id, count);
     Ok(())
 }
 
 async fn cmd_unhint(task_id: &str) -> Result<()> {
-    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
-    let state_path = PathBuf::from(".ralph/state.json");
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
 
-    if !tasks_path.exists() {
-        anyhow::bail!("No tasks found. Run `ralph plan` first.");
-    }
-
-    let tasks = task::load_tasks(&tasks_path).await?;
-    if !tasks.iter().any(|t| t.id == task_id) {
+    let t = db::get_task(&conn, task_id)?;
+    if t.is_none() {
+        let tasks = db::list_active_tasks(&conn)?;
         let valid_ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
         anyhow::bail!(
             "Unknown task ID '{}'. Valid IDs: {}",
@@ -546,102 +492,92 @@ async fn cmd_unhint(task_id: &str) -> Result<()> {
         );
     }
 
-    let mut exec_state = state::ExecutionState::load(&state_path).await?;
-    let exec = exec_state.entry(task_id);
-    let count = exec.guidance.len();
-    exec.guidance.clear();
-    exec_state.save(&state_path).await?;
+    let count = t.unwrap().guidance.len();
+    db::set_guidance(&conn, task_id, &[])?;
 
     eprintln!("Cleared {count} guidance entries from {task_id}");
     Ok(())
 }
 
 async fn cmd_archive(task_id: Option<String>, done: bool) -> Result<()> {
-    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
-    let archive_path = PathBuf::from(".ralph/archive.jsonl");
-    let state_path = PathBuf::from(".ralph/state.json");
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
 
-    if !tasks_path.exists() {
-        anyhow::bail!("No tasks found. Run `ralph plan` first.");
-    }
-
-    let tasks = task::load_tasks(&tasks_path).await?;
-    let exec_state = state::ExecutionState::load(&state_path).await?;
-
-    let is_terminal = |id: &str| -> bool {
-        exec_state.tasks.get(id).is_some_and(|e| {
-            matches!(
-                e.phase,
-                state::Phase::Done | state::Phase::Failed | state::Phase::Skipped
-            )
-        })
-    };
-
-    let to_archive: std::collections::HashSet<&str> = if let Some(ref id) = task_id {
-        if !tasks.iter().any(|t| t.id == *id) {
-            let valid_ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-            anyhow::bail!(
-                "Unknown task ID '{}'. Valid IDs: {}",
-                id,
-                valid_ids.join(", ")
-            );
+    if let Some(ref id) = task_id {
+        match db::get_task(&conn, id)? {
+            None => {
+                let tasks = db::list_active_tasks(&conn)?;
+                let valid_ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+                anyhow::bail!(
+                    "Unknown task ID '{}'. Valid IDs: {}",
+                    id,
+                    valid_ids.join(", ")
+                );
+            }
+            Some(t)
+                if !matches!(
+                    t.phase,
+                    task::Phase::Done | task::Phase::Failed | task::Phase::Skipped
+                ) =>
+            {
+                anyhow::bail!(
+                    "Task '{}' is not in a terminal phase (Done/Failed/Skipped)",
+                    id
+                );
+            }
+            Some(_) => {
+                db::archive_task(&conn, id)?;
+                eprintln!("Archived 1 task(s)");
+            }
         }
-        if !is_terminal(id) {
-            anyhow::bail!(
-                "Task '{}' is not in a terminal phase (Done/Failed/Skipped)",
-                id
-            );
-        }
-        [id.as_str()].into_iter().collect()
     } else if done {
-        tasks
+        let tasks = db::list_active_tasks(&conn)?;
+        let to_archive: Vec<String> = tasks
             .iter()
-            .filter(|t| {
-                exec_state
-                    .tasks
-                    .get(&t.id)
-                    .is_some_and(|e| matches!(e.phase, state::Phase::Done | state::Phase::Skipped))
-            })
-            .map(|t| t.id.as_str())
-            .collect()
+            .filter(|t| matches!(t.phase, task::Phase::Done | task::Phase::Skipped))
+            .map(|t| t.id.clone())
+            .collect();
+
+        if to_archive.is_empty() {
+            eprintln!("No tasks to archive.");
+            return Ok(());
+        }
+
+        let count = to_archive.len();
+        for id in &to_archive {
+            db::archive_task(&conn, id)?;
+        }
+        eprintln!("Archived {} task(s)", count);
     } else {
         anyhow::bail!("Provide a task ID or use --done to archive all completed tasks");
-    };
-
-    if to_archive.is_empty() {
-        eprintln!("No tasks to archive.");
-        return Ok(());
     }
 
-    task::archive_tasks(&tasks_path, &archive_path, &to_archive).await?;
-    eprintln!("Archived {} task(s)", to_archive.len());
     Ok(())
 }
 
 async fn cmd_restore(task_id: &str) -> Result<()> {
-    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
-    let archive_path = PathBuf::from(".ralph/archive.jsonl");
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
 
-    if !archive_path.exists() {
-        anyhow::bail!("No archive found at {}", archive_path.display());
-    }
-
-    // Check for ID collision with active tasks
-    if tasks_path.exists() {
-        let active = task::load_tasks(&tasks_path).await?;
-        if active.iter().any(|t| t.id == task_id) {
-            anyhow::bail!("Task ID '{}' already exists in active tasks", task_id);
+    match db::get_task(&conn, task_id)? {
+        None => anyhow::bail!("Task '{}' not found in archive", task_id),
+        Some(t) if !t.archived => {
+            anyhow::bail!("Task ID '{}' already exists in active tasks", task_id)
+        }
+        Some(_) => {
+            db::restore_task(&conn, task_id)?;
+            eprintln!("Restored {task_id}");
         }
     }
 
-    task::restore_task(&tasks_path, &archive_path, task_id).await?;
-    eprintln!("Restored {task_id} to tasks.jsonl");
     Ok(())
 }
 
 async fn cmd_nits_list(all: bool) -> Result<()> {
-    let path = PathBuf::from(".ralph/nits.jsonl");
-    let nits = nit::load_nits(&path).await?;
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
+    // Load all nits for accurate counts; filter display based on `all`.
+    let nits = db::list_nits(&conn, true)?;
 
     let open = nits
         .iter()
@@ -686,11 +622,12 @@ async fn cmd_nits_list(all: bool) -> Result<()> {
 }
 
 async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
-    let nits_path = PathBuf::from(".ralph/nits.jsonl");
-    let mut nits = nit::load_nits(&nits_path).await?;
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
 
+    let nits = db::list_nits(&conn, true)?;
     let nit_entry = nits
-        .iter_mut()
+        .iter()
         .find(|n| n.id == nit_id)
         .ok_or_else(|| anyhow::anyhow!("nit '{nit_id}' not found"))?;
 
@@ -703,17 +640,11 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
         anyhow::bail!("nit '{nit_id}' is already {status_name}");
     }
 
-    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
-    let tasks = if tasks_path.exists() {
-        task::load_tasks(&tasks_path).await?
-    } else {
-        Vec::new()
-    };
-
-    let max_priority = tasks.iter().map(|t| t.priority).max().unwrap_or(0);
+    let active_tasks = db::list_active_tasks(&conn)?;
+    let max_priority = active_tasks.iter().map(|t| t.priority).max().unwrap_or(0);
     let task_id = nit_id.replace('-', "");
 
-    if tasks.iter().any(|t| t.id == task_id) {
+    if db::get_task(&conn, &task_id)?.is_some() {
         anyhow::bail!("task ID '{task_id}' already exists");
     }
 
@@ -727,39 +658,30 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
     } else {
         nit_entry.summary.clone()
     };
-    let new_task = task::TaskDef {
+
+    let def = task::TaskDef {
         id: task_id.clone(),
         title,
         description: nit_entry.content.clone(),
         priority: max_priority + 1,
         blocked_by: vec![],
     };
+    let new_task = task::Task::from_def(&def);
+    db::insert_tasks(&conn, &[new_task])?;
 
-    // Append to tasks.jsonl
-    use tokio::io::AsyncWriteExt;
-    let mut line = serde_json::to_string(&new_task)?;
-    line.push('\n');
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&tasks_path)
-        .await?;
-    file.write_all(line.as_bytes()).await?;
-
-    nit_entry.status = nit::NitStatus::Promoted;
-    nit_entry.promoted_to = Some(task_id.clone());
-    nit::save_nits(&nits_path, &nits).await?;
+    db::update_nit_status(&conn, nit_id, nit::NitStatus::Promoted, Some(&task_id))?;
 
     eprintln!("Promoted {nit_id} → task {task_id}");
     Ok(())
 }
 
 async fn cmd_nits_dismiss(nit_id: &str) -> Result<()> {
-    let nits_path = PathBuf::from(".ralph/nits.jsonl");
-    let mut nits = nit::load_nits(&nits_path).await?;
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
 
+    let nits = db::list_nits(&conn, true)?;
     let nit_entry = nits
-        .iter_mut()
+        .iter()
         .find(|n| n.id == nit_id)
         .ok_or_else(|| anyhow::anyhow!("nit '{nit_id}' not found"))?;
 
@@ -772,20 +694,20 @@ async fn cmd_nits_dismiss(nit_id: &str) -> Result<()> {
         anyhow::bail!("nit '{nit_id}' is already {status_name}");
     }
 
-    nit_entry.status = nit::NitStatus::Dismissed;
-    nit::save_nits(&nits_path, &nits).await?;
+    db::update_nit_status(&conn, nit_id, nit::NitStatus::Dismissed, None)?;
 
     eprintln!("Dismissed {nit_id}");
     Ok(())
 }
 
 async fn cmd_nits_triage() -> Result<()> {
-    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
     let config = config::Config::load().await?;
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
     let registry = agent::ProcessRegistry::new(config.kill_grace_secs);
     orchestrator::spawn_signal_handler(registry.clone());
     let mut cost = 0.0;
-    let promoted = orchestrator::triage_open_nits(&tasks_path, &config, &registry, &mut cost).await?;
+    let promoted = orchestrator::triage_open_nits(&conn, &config, &registry, &mut cost).await?;
     if cost > 0.0 {
         eprintln!("[ralph] triage cost: ${cost:.4}");
     }
