@@ -174,6 +174,19 @@ const DEFAULT_PROMPTS: &[(&str, &str)] = &[
     ("triager.md", include_str!("../prompts/triager.md")),
 ];
 
+/// Check for legacy flat files without a database, and bail with a
+/// migration message if found.
+fn check_legacy_files() -> Result<()> {
+    let db_path = PathBuf::from(".ralph/ralph.db");
+    let legacy_path = PathBuf::from(".ralph/tasks.jsonl");
+    if !db_path.exists() && legacy_path.exists() {
+        anyhow::bail!(
+            "Found legacy flat files but no database. Run `ralph import` to migrate."
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_init() -> Result<()> {
     let ralph_dir = PathBuf::from(".ralph");
     tokio::fs::create_dir_all(&ralph_dir).await?;
@@ -198,6 +211,8 @@ async fn cmd_init() -> Result<()> {
             tokio::fs::write(&path, content).await?;
         }
     }
+
+    db::open(&db::db_path())?;
 
     eprintln!("Initialized .ralph/");
     Ok(())
@@ -284,6 +299,7 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
 
 async fn cmd_run(tasks_path: Option<PathBuf>, max_iterations: usize) -> Result<()> {
     let _ = tasks_path; // tasks are now loaded from the database
+    check_legacy_files()?;
     let config = config::Config::load().await?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
@@ -291,6 +307,7 @@ async fn cmd_run(tasks_path: Option<PathBuf>, max_iterations: usize) -> Result<(
 }
 
 async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
+    check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
@@ -354,6 +371,7 @@ async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
 }
 
 async fn cmd_status(json: bool) -> Result<()> {
+    check_legacy_files()?;
     let db_path = db::db_path();
     if !db_path.exists() {
         if json {
@@ -471,6 +489,7 @@ fn cmd_status_json(tasks: &[task::Task]) -> Result<()> {
 }
 
 async fn cmd_hint(task_id: &str, text: &str) -> Result<()> {
+    check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
@@ -495,6 +514,7 @@ async fn cmd_hint(task_id: &str, text: &str) -> Result<()> {
 }
 
 async fn cmd_unhint(task_id: &str) -> Result<()> {
+    check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
@@ -517,6 +537,7 @@ async fn cmd_unhint(task_id: &str) -> Result<()> {
 }
 
 async fn cmd_archive(task_id: Option<String>, done: bool) -> Result<()> {
+    check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
@@ -573,6 +594,7 @@ async fn cmd_archive(task_id: Option<String>, done: bool) -> Result<()> {
 }
 
 async fn cmd_restore(task_id: &str) -> Result<()> {
+    check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
@@ -804,6 +826,7 @@ fn cmd_dump_json(
 }
 
 async fn cmd_dump(json: bool, all: bool) -> Result<()> {
+    check_legacy_files()?;
     let db_path = db::db_path();
     if !db_path.exists() {
         if json {
@@ -945,6 +968,7 @@ async fn cmd_import(dir: PathBuf) -> Result<()> {
 }
 
 async fn cmd_nits_list(all: bool) -> Result<()> {
+    check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
     // Load all nits for accurate counts; filter display based on `all`.
@@ -993,6 +1017,7 @@ async fn cmd_nits_list(all: bool) -> Result<()> {
 }
 
 async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
+    check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
@@ -1047,6 +1072,7 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
 }
 
 async fn cmd_nits_dismiss(nit_id: &str) -> Result<()> {
+    check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
@@ -1072,6 +1098,7 @@ async fn cmd_nits_dismiss(nit_id: &str) -> Result<()> {
 }
 
 async fn cmd_nits_triage() -> Result<()> {
+    check_legacy_files()?;
     let config = config::Config::load().await?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
