@@ -219,6 +219,7 @@ async fn cmd_init() -> Result<()> {
 }
 
 async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: bool) -> Result<()> {
+    check_legacy_files()?;
     let input = if stdin {
         use tokio::io::AsyncReadExt;
         let mut buf = String::new();
