@@ -227,6 +227,77 @@ pub fn id_ranges_summary(tasks: &[Task]) -> String {
     lines.join("\n")
 }
 
+/// Renumber any tasks whose IDs collide with `taken_ids`.
+///
+/// For `PREFIX-N` style IDs, increments N past the highest taken
+/// number for that prefix. For non-prefixed IDs, appends `-2`, `-3`, etc.
+/// Updates `blocked_by` references within `tasks` to match.
+/// Returns the list of `(old_id, new_id)` renames performed.
+pub fn renumber_collisions(
+    tasks: &mut [Task],
+    taken_ids: &std::collections::HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut prefix_max: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    for id in taken_ids {
+        if let Some((prefix, num_str)) = id.rsplit_once('-')
+            && !prefix.is_empty()
+            && let Ok(n) = num_str.parse::<u32>()
+        {
+            let entry = prefix_max.entry(prefix.to_string()).or_insert(0);
+            *entry = (*entry).max(n);
+        }
+    }
+
+    let mut all_ids = taken_ids.clone();
+    let mut renames: Vec<(String, String)> = Vec::new();
+
+    for task in tasks.iter_mut() {
+        if !all_ids.contains(&task.id) {
+            all_ids.insert(task.id.clone());
+            continue;
+        }
+
+        let old_id = task.id.clone();
+        let new_id = if let Some((prefix, num_str)) = old_id.rsplit_once('-')
+            && !prefix.is_empty()
+            && num_str.parse::<u32>().is_ok()
+        {
+            let next = prefix_max.entry(prefix.to_string()).or_insert(0);
+            *next += 1;
+            format!("{prefix}-{next}")
+        } else {
+            let mut candidate = format!("{old_id}-2");
+            let mut n = 3u32;
+            while all_ids.contains(&candidate) {
+                candidate = format!("{old_id}-{n}");
+                n += 1;
+            }
+            candidate
+        };
+
+        all_ids.insert(new_id.clone());
+        task.id = new_id.clone();
+        renames.push((old_id, new_id));
+    }
+
+    if !renames.is_empty() {
+        let rename_map: std::collections::HashMap<&str, &str> = renames
+            .iter()
+            .map(|(old, new)| (old.as_str(), new.as_str()))
+            .collect();
+        for task in tasks.iter_mut() {
+            for dep in &mut task.blocked_by {
+                if let Some(new) = rename_map.get(dep.as_str()) {
+                    *dep = new.to_string();
+                }
+            }
+        }
+    }
+
+    renames
+}
+
 /// Generate the next auto-ID for dynamically discovered tasks.
 /// Scans existing IDs for the `GEN-N` pattern and increments.
 #[allow(dead_code)]
@@ -380,6 +451,69 @@ mod tests {
             blocked_by: vec![],
         }];
         assert_eq!(next_generated_id(&tasks), "GEN-1");
+    }
+
+    #[test]
+    fn renumber_no_collisions() {
+        let taken: std::collections::HashSet<String> =
+            ["REPL-1", "REPL-2"].iter().map(|s| s.to_string()).collect();
+        let mut tasks = vec![Task {
+            id: "REPL-3".into(),
+            title: "A".into(),
+            description: String::new(),
+            priority: 1,
+            blocked_by: vec![],
+        }];
+        let renames = renumber_collisions(&mut tasks, &taken);
+        assert!(renames.is_empty());
+        assert_eq!(tasks[0].id, "REPL-3");
+    }
+
+    #[test]
+    fn renumber_prefixed_collisions() {
+        let taken: std::collections::HashSet<String> =
+            ["GEN-1", "GEN-2", "GEN-3"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let mut tasks = vec![
+            Task {
+                id: "GEN-1".into(),
+                title: "A".into(),
+                description: String::new(),
+                priority: 1,
+                blocked_by: vec![],
+            },
+            Task {
+                id: "GEN-2".into(),
+                title: "B".into(),
+                description: String::new(),
+                priority: 2,
+                blocked_by: vec!["GEN-1".into()],
+            },
+        ];
+        let renames = renumber_collisions(&mut tasks, &taken);
+        assert_eq!(renames.len(), 2);
+        assert_eq!(tasks[0].id, "GEN-4");
+        assert_eq!(tasks[1].id, "GEN-5");
+        // blocked_by references updated
+        assert_eq!(tasks[1].blocked_by, vec!["GEN-4"]);
+    }
+
+    #[test]
+    fn renumber_non_prefixed_collisions() {
+        let taken: std::collections::HashSet<String> =
+            ["T1"].iter().map(|s| s.to_string()).collect();
+        let mut tasks = vec![Task {
+            id: "T1".into(),
+            title: "A".into(),
+            description: String::new(),
+            priority: 1,
+            blocked_by: vec![],
+        }];
+        let renames = renumber_collisions(&mut tasks, &taken);
+        assert_eq!(renames.len(), 1);
+        assert_eq!(tasks[0].id, "T1-2");
     }
 
     #[test]

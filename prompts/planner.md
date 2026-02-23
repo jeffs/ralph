@@ -25,8 +25,8 @@ implementable tasks.
 
 ## Output Contract
 
-Write the tasks as JSONL to `.ralph/tasks.jsonl`. One JSON
-object per line.
+Output the new tasks as JSONL (one JSON object per line).
+Do NOT write any files.
 
 ### Field Schema
 
@@ -40,7 +40,7 @@ object per line.
 
 ### Rules
 
-- Every `blocked_by` entry must reference an `id` in this file
+- Every `blocked_by` entry must reference an `id` in your output
   or an existing task ID listed below.
 - No duplicate `id` values.
 - `id` must not contain whitespace.
@@ -54,6 +54,6 @@ object per line.
 
 {{EXISTING_IDS}}
 
-After writing the file, confirm with:
+After outputting the JSONL, confirm with:
 
 STATUS: SUCCESS

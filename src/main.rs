@@ -203,16 +203,16 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
     let tasks_path = ralph_dir.join("tasks.jsonl");
     let archive_path = ralph_dir.join("archive.jsonl");
 
-    // Load pre-existing tasks (active + archived) so the planner
-    // knows which IDs are taken and new tasks can be merged in.
-    let pre_existing = if tasks_path.exists() {
+    // Load existing tasks (active + archived) so the planner
+    // knows which IDs are taken.
+    let existing = if tasks_path.exists() {
         task::load_tasks(&tasks_path).await?
     } else {
         Vec::new()
     };
     let archived = task::load_archive(&archive_path).await?;
 
-    let mut all_for_summary = pre_existing.clone();
+    let mut all_for_summary = existing.clone();
     all_for_summary.extend(archived.iter().cloned());
     let existing_ids_summary = task::id_ranges_summary(&all_for_summary);
 
@@ -231,79 +231,41 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
         return Ok(());
     }
 
-    // The planner writes tasks.jsonl directly via claude's
-    // file access. But we also extract any JSONL from the
-    // result as a fallback.
-    if !tasks_path.exists()
-        && let Some(jsonl) = result.extract_jsonl()
-    {
-        tokio::fs::write(&tasks_path, jsonl).await?;
-    }
+    // Extract new tasks from the planner's stdout.
+    let jsonl = result
+        .extract_jsonl()
+        .ok_or_else(|| anyhow::anyhow!("planner produced no JSONL output"))?;
+    let mut new_tasks = task::parse_tasks(&jsonl)?;
 
-    // Load whatever the planner wrote (may include pre-existing
-    // tasks if the planner rewrote the file, or just new tasks).
-    let planner_tasks = task::load_tasks(&tasks_path).await?;
-
-    let pre_ids: std::collections::HashSet<String> =
-        pre_existing.iter().map(|t| t.id.clone()).collect();
-    let planner_ids: std::collections::HashSet<String> =
-        planner_tasks.iter().map(|t| t.id.clone()).collect();
-
-    // Check for ID collisions: a pre-existing ID that the planner
-    // also emitted but with different content (i.e. it overwrote it).
-    let collisions: Vec<&str> = pre_existing
+    // Renumber any IDs that collide with existing tasks.
+    let taken_ids: std::collections::HashSet<String> = existing
         .iter()
-        .filter(|t| {
-            planner_ids.contains(&t.id)
-                && !planner_tasks
-                    .iter()
-                    .any(|pt| pt.id == t.id && pt.title == t.title)
-        })
-        .map(|t| t.id.as_str())
+        .chain(archived.iter())
+        .map(|t| t.id.clone())
         .collect();
-    if !collisions.is_empty() {
-        anyhow::bail!(
-            "ID collision: planner reused existing IDs: {}",
-            collisions.join(", ")
-        );
+    let renames = task::renumber_collisions(&mut new_tasks, &taken_ids);
+    for (old, new) in &renames {
+        eprintln!("[ralph] renumbered colliding ID: {old} → {new}");
     }
 
-    // Merge: prepend pre-existing tasks the planner omitted,
-    // so we never lose tasks from a previous plan.
-    let merged = if pre_existing.iter().all(|t| planner_ids.contains(&t.id)) {
-        // Planner included all pre-existing tasks — use as-is.
-        planner_tasks
-    } else {
-        let mut merged = pre_existing.clone();
-        for t in planner_tasks {
-            if !pre_ids.contains(&t.id) {
-                merged.push(t);
-            }
-        }
-        merged
-    };
-
-    task::write_tasks(&tasks_path, &merged).await?;
-
-    // Validate deps across the full set (active + archived).
+    // Validate deps across existing + new + archived.
+    let mut all_tasks = existing.clone();
+    all_tasks.extend(new_tasks.iter().cloned());
     let archived_ids: std::collections::HashSet<&str> =
         archived.iter().map(|t| t.id.as_str()).collect();
-    task::validate_deps(&merged, &archived_ids)?;
+    task::validate_deps(&all_tasks, &archived_ids)?;
 
-    let new_count = merged.iter().filter(|t| !pre_ids.contains(&t.id)).count();
+    // Append new tasks to the file.
+    task::append_tasks(&tasks_path, &new_tasks).await?;
+
     eprintln!(
         "Planned {} new task(s), {} total → {}",
-        new_count,
-        merged.len(),
+        new_tasks.len(),
+        existing.len() + new_tasks.len(),
         tasks_path.display()
     );
-    for t in &merged {
-        let tag = if pre_ids.contains(&t.id) {
-            " (existing)"
-        } else {
-            ""
-        };
-        eprintln!("  [{}] {} (pri={}){}", t.id, t.title, t.priority, tag);
+    for t in &new_tasks {
+        eprintln!("  [{}] {} (pri={})", t.id, t.title, t.priority);
     }
     Ok(())
 }
