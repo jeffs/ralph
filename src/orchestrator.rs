@@ -254,7 +254,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
     isolate_dirty_tree().await;
     cleanup_stale_workspaces().await;
     let mut cumulative_cost: f64 = 0.0;
-    let mut triage_rounds: u32 = 0;
+    let mut triage_rounds: u32;
 
     for iteration in 1..=max_iterations {
         if registry.is_shutdown() {
@@ -344,6 +344,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                         }
                     }
 
+                    triage_rounds = 0;
                     if config.auto_triage && triage_rounds < config.max_triage_rounds {
                         let promoted =
                             triage_open_nits(tasks_path, config, &registry, &mut cumulative_cost)
@@ -577,7 +578,7 @@ pub(crate) fn parse_triage_decisions(text: &str) -> Vec<TriageDecision> {
 
 /// Invoke the triager agent on open nits, apply decisions,
 /// and return the number of promoted nits.
-async fn triage_open_nits(
+pub async fn triage_open_nits(
     tasks_path: &Path,
     config: &Config,
     registry: &ProcessRegistry,

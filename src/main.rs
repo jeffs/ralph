@@ -110,6 +110,8 @@ enum NitsAction {
         /// Nit ID (e.g. "NIT-1")
         nit_id: String,
     },
+    /// Run the triager agent on all open nits
+    Triage,
 }
 
 #[tokio::main]
@@ -138,6 +140,7 @@ async fn main() -> Result<()> {
             None => cmd_nits_list(all).await,
             Some(NitsAction::Promote { nit_id }) => cmd_nits_promote(&nit_id).await,
             Some(NitsAction::Dismiss { nit_id }) => cmd_nits_dismiss(&nit_id).await,
+            Some(NitsAction::Triage) => cmd_nits_triage().await,
         },
     }
 }
@@ -730,5 +733,21 @@ async fn cmd_nits_dismiss(nit_id: &str) -> Result<()> {
     nit::save_nits(&nits_path, &nits).await?;
 
     eprintln!("Dismissed {nit_id}");
+    Ok(())
+}
+
+async fn cmd_nits_triage() -> Result<()> {
+    let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
+    let config = config::Config::load().await?;
+    let registry = agent::ProcessRegistry::new(config.kill_grace_secs);
+    orchestrator::spawn_signal_handler(registry.clone());
+    let mut cost = 0.0;
+    let promoted = orchestrator::triage_open_nits(&tasks_path, &config, &registry, &mut cost).await?;
+    if cost > 0.0 {
+        eprintln!("[ralph] triage cost: ${cost:.4}");
+    }
+    if promoted == 0 {
+        eprintln!("No nits promoted.");
+    }
     Ok(())
 }
