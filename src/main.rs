@@ -33,9 +33,6 @@ enum Command {
     },
     /// Run the orchestration loop on tasks
     Run {
-        /// Path to task file (default: .ralph/tasks.jsonl)
-        #[arg(long)]
-        tasks: Option<PathBuf>,
         /// Max iterations before stopping
         #[arg(long, default_value_t = 50)]
         max_iterations: usize,
@@ -142,10 +139,7 @@ async fn main() -> Result<()> {
             spec,
             stdin,
         } => cmd_plan(description, spec, stdin).await,
-        Command::Run {
-            tasks,
-            max_iterations,
-        } => cmd_run(tasks, max_iterations).await,
+        Command::Run { max_iterations } => cmd_run(max_iterations).await,
         Command::Status { json } => cmd_status(json).await,
         Command::Skip { task_id } => cmd_override_task(&task_id, "skip").await,
         Command::Fail { task_id } => cmd_override_task(&task_id, "fail").await,
@@ -297,8 +291,7 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
     Ok(())
 }
 
-async fn cmd_run(tasks_path: Option<PathBuf>, max_iterations: usize) -> Result<()> {
-    let _ = tasks_path; // tasks are now loaded from the database
+async fn cmd_run(max_iterations: usize) -> Result<()> {
     check_legacy_files()?;
     let config = config::Config::load().await?;
     std::fs::create_dir_all(".ralph")?;
