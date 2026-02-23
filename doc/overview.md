@@ -210,13 +210,13 @@ Ralph uses **Jujutsu (`jj`)** exclusively — never Git commands.
 `.ralph/config.toml`:
 
 ```toml
-# Default model for all roles
-model = "sonnet"
-
-# Per-role overrides
+# Per-role model configuration (all roles required)
 [models]
 planner = "opus"
+implementer = "sonnet"
+tester = "sonnet"
 reviewer = "opus"
+triager = "opus"
 
 # Max retries per task before marking Failed
 max_attempts = 3

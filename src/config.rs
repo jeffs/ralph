@@ -57,51 +57,25 @@ impl Default for WorkspaceConfig {
     }
 }
 
-/// Per-role model overrides. Any omitted role falls back to the
-/// top-level `model` field.
+/// Per-role model configuration. All fields are required — deserialization
+/// fails if any role is missing from the `[models]` section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    #[serde(
-        default = "default_planner_model",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub planner: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub implementer: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tester: Option<String>,
-    #[serde(
-        default = "default_reviewer_model",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub reviewer: Option<String>,
-    #[serde(
-        default = "default_triager_model",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub triager: Option<String>,
-}
-
-fn default_planner_model() -> Option<String> {
-    Some("opus".to_string())
-}
-
-fn default_reviewer_model() -> Option<String> {
-    Some("opus".to_string())
-}
-
-fn default_triager_model() -> Option<String> {
-    Some("opus".to_string())
+    pub planner: String,
+    pub implementer: String,
+    pub tester: String,
+    pub reviewer: String,
+    pub triager: String,
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            planner: default_planner_model(),
-            implementer: None,
-            tester: None,
-            reviewer: default_reviewer_model(),
-            triager: default_triager_model(),
+            planner: "opus".to_string(),
+            implementer: "sonnet".to_string(),
+            tester: "sonnet".to_string(),
+            reviewer: "opus".to_string(),
+            triager: "opus".to_string(),
         }
     }
 }
@@ -118,11 +92,7 @@ pub struct EnvConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Default model for all agent roles
-    #[serde(default = "default_model")]
-    pub model: String,
-    /// Per-role model overrides
-    #[serde(default, skip_serializing_if = "ModelConfig::all_default")]
+    /// Per-role model configuration (all roles required)
     pub models: ModelConfig,
     /// Max attempts per task before marking failed
     #[serde(default = "default_max_attempts")]
@@ -165,10 +135,6 @@ pub struct Config {
     /// after a grace period.
     #[serde(default = "default_stuck_patterns")]
     pub stuck_patterns: Vec<String>,
-}
-
-fn default_model() -> String {
-    "sonnet".to_string()
 }
 
 fn default_max_attempts() -> u32 {
@@ -231,7 +197,6 @@ fn default_prompts_dir() -> PathBuf {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: default_model(),
             models: ModelConfig::default(),
             max_attempts: default_max_attempts(),
             agent_timeout_secs: default_agent_timeout_secs(),
@@ -251,34 +216,24 @@ impl Default for Config {
 }
 
 impl ModelConfig {
-    fn all_default(&self) -> bool {
-        let d = Self::default();
-        self.planner == d.planner
-            && self.implementer == d.implementer
-            && self.tester == d.tester
-            && self.reviewer == d.reviewer
-            && self.triager == d.triager
-    }
-
-    /// Look up the override for a role by its label name.
-    fn get(&self, role: &str) -> Option<&str> {
-        let field = match role {
+    /// Look up the model for a role by its label name.
+    /// Panics on unknown role names (programming error).
+    fn get(&self, role: &str) -> &str {
+        match role {
             "planner" => &self.planner,
             "implementer" => &self.implementer,
             "tester" => &self.tester,
             "reviewer" => &self.reviewer,
             "triager" => &self.triager,
-            _ => return None,
-        };
-        field.as_deref()
+            _ => panic!("unknown agent role: {role}"),
+        }
     }
 }
 
 impl Config {
     /// Resolve the model string for a given role label.
-    /// Checks per-role overrides first, falls back to the default `model`.
     pub fn model_for(&self, role: &str) -> &str {
-        self.models.get(role).unwrap_or(&self.model)
+        self.models.get(role)
     }
 
     /// Resolve the model for a given role and attempt number.
@@ -310,80 +265,86 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// Minimal `[models]` section for tests that don't care about models.
+    const MODELS_TOML: &str = r#"
+[models]
+planner = "opus"
+implementer = "sonnet"
+tester = "sonnet"
+reviewer = "opus"
+triager = "opus"
+"#;
+
     #[test]
-    fn model_for_falls_back_to_default() {
+    fn model_for_returns_configured_models() {
         let config = Config::default();
         assert_eq!(config.model_for("planner"), "opus");
         assert_eq!(config.model_for("implementer"), "sonnet");
         assert_eq!(config.model_for("tester"), "sonnet");
         assert_eq!(config.model_for("reviewer"), "opus");
+        assert_eq!(config.model_for("triager"), "opus");
     }
 
     #[test]
-    fn model_for_respects_per_role_override() {
-        let config = Config {
-            models: ModelConfig {
-                planner: Some("opus".to_string()),
-                reviewer: Some("opus".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(config.model_for("planner"), "opus");
-        assert_eq!(config.model_for("implementer"), "sonnet");
-        assert_eq!(config.model_for("tester"), "sonnet");
-        assert_eq!(config.model_for("reviewer"), "opus");
-    }
-
-    #[test]
-    fn deserialize_simple_model_only() {
-        let toml_str = r#"model = "haiku""#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        // planner/reviewer still default to opus even with a different base model
-        assert_eq!(config.model_for("planner"), "opus");
-        assert_eq!(config.model_for("implementer"), "haiku");
-    }
-
-    #[test]
-    fn deserialize_with_per_role_overrides() {
+    fn deserialize_all_models_explicit() {
         let toml_str = r#"
-model = "sonnet"
-
 [models]
 planner = "opus"
+implementer = "haiku"
+tester = "haiku"
 reviewer = "opus"
+triager = "sonnet"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.model_for("planner"), "opus");
-        assert_eq!(config.model_for("implementer"), "sonnet");
-        assert_eq!(config.model_for("tester"), "sonnet");
+        assert_eq!(config.model_for("implementer"), "haiku");
+        assert_eq!(config.model_for("tester"), "haiku");
         assert_eq!(config.model_for("reviewer"), "opus");
+        assert_eq!(config.model_for("triager"), "sonnet");
+    }
+
+    #[test]
+    fn missing_models_section_fails() {
+        let result = toml::from_str::<Config>("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn missing_single_role_fails() {
+        let toml_str = r#"
+[models]
+planner = "opus"
+implementer = "sonnet"
+tester = "sonnet"
+reviewer = "opus"
+"#;
+        let result = toml::from_str::<Config>(toml_str);
+        assert!(result.is_err());
     }
 
     #[test]
     fn deserialize_agent_idle_timeout_secs() {
-        let toml_str = r#"agent_idle_timeout_secs = 60"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!("agent_idle_timeout_secs = 60\n{MODELS_TOML}");
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.agent_idle_timeout_secs, 60);
     }
 
     #[test]
     fn deserialize_kill_grace_secs() {
-        let toml_str = r#"kill_grace_secs = 10"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!("kill_grace_secs = 10\n{MODELS_TOML}");
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.kill_grace_secs, 10);
     }
 
     #[test]
     fn kill_grace_secs_defaults_to_5() {
-        let toml_str = r#"model = "sonnet""#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let config: Config = toml::from_str(MODELS_TOML).unwrap();
         assert_eq!(config.kill_grace_secs, 5);
     }
 
     #[test]
     fn isolate_env_defaults_to_cargo_target() {
-        let config: Config = toml::from_str("").unwrap();
+        let config: Config = toml::from_str(MODELS_TOML).unwrap();
         assert_eq!(
             config
                 .workspace
@@ -396,22 +357,19 @@ reviewer = "opus"
 
     #[test]
     fn isolate_env_from_legacy_false() {
-        let toml_str = r#"
-[workspace]
-isolate_target_dir = false
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!(
+            "{MODELS_TOML}\n[workspace]\nisolate_target_dir = false\n"
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert!(config.workspace.isolate_env.is_empty());
     }
 
     #[test]
     fn isolate_env_explicit() {
-        let toml_str = r#"
-[workspace.isolate_env]
-CARGO_TARGET_DIR = "target"
-GOPATH = ".gopath"
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!(
+            "{MODELS_TOML}\n[workspace.isolate_env]\nCARGO_TARGET_DIR = \"target\"\nGOPATH = \".gopath\"\n"
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.workspace.isolate_env.len(), 2);
         assert_eq!(
             config
@@ -433,14 +391,10 @@ GOPATH = ".gopath"
 
     #[test]
     fn isolate_env_wins_over_legacy() {
-        let toml_str = r#"
-[workspace]
-isolate_target_dir = true
-
-[workspace.isolate_env]
-GOPATH = ".gopath"
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!(
+            "{MODELS_TOML}\n[workspace]\nisolate_target_dir = true\n\n[workspace.isolate_env]\nGOPATH = \".gopath\"\n"
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
         // isolate_env takes precedence — no CARGO_TARGET_DIR
         assert_eq!(config.workspace.isolate_env.len(), 1);
         assert_eq!(
@@ -455,11 +409,10 @@ GOPATH = ".gopath"
 
     #[test]
     fn isolate_env_legacy_true() {
-        let toml_str = r#"
-[workspace]
-isolate_target_dir = true
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!(
+            "{MODELS_TOML}\n[workspace]\nisolate_target_dir = true\n"
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(
             config
                 .workspace
@@ -472,7 +425,7 @@ isolate_target_dir = true
 
     #[test]
     fn stuck_patterns_defaults_to_cargo() {
-        let config: Config = toml::from_str("").unwrap();
+        let config: Config = toml::from_str(MODELS_TOML).unwrap();
         assert_eq!(config.stuck_patterns.len(), 2);
         assert!(
             config
@@ -484,23 +437,27 @@ isolate_target_dir = true
 
     #[test]
     fn deserialize_custom_stuck_patterns() {
-        let toml_str = r#"stuck_patterns = ["deadlock detected", "acquire lock"]"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!(
+            "stuck_patterns = [\"deadlock detected\", \"acquire lock\"]\n{MODELS_TOML}"
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.stuck_patterns.len(), 2);
         assert_eq!(config.stuck_patterns[0], "deadlock detected");
     }
 
     #[test]
     fn deserialize_env_config() {
-        let toml_str = r#"
+        let toml_str = format!(
+            r#"{MODELS_TOML}
 [env]
 passthrough = ["MY_TOKEN", "CUSTOM_VAR"]
 
 [env.set]
 FOO = "bar"
 BAZ = "qux"
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+"#
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.env.passthrough, vec!["MY_TOKEN", "CUSTOM_VAR"]);
         assert_eq!(config.env.set.get("FOO").map(|s| s.as_str()), Some("bar"));
         assert_eq!(config.env.set.get("BAZ").map(|s| s.as_str()), Some("qux"));
@@ -508,31 +465,30 @@ BAZ = "qux"
 
     #[test]
     fn deserialize_max_cost_usd() {
-        let toml_str = r#"max_cost_usd = 5.0"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!("max_cost_usd = 5.0\n{MODELS_TOML}");
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.max_cost_usd, Some(5.0));
     }
 
     #[test]
     fn max_cost_usd_defaults_to_none() {
-        let config: Config = toml::from_str("").unwrap();
+        let config: Config = toml::from_str(MODELS_TOML).unwrap();
         assert_eq!(config.max_cost_usd, None);
     }
 
     #[test]
     fn escalation_after_defaults_to_2() {
-        let config: Config = toml::from_str("").unwrap();
+        let config: Config = toml::from_str(MODELS_TOML).unwrap();
         assert_eq!(config.escalation_after, 2);
         assert_eq!(config.escalation_model, None);
     }
 
     #[test]
     fn deserialize_escalation_config() {
-        let toml_str = r#"
-escalation_after = 3
-escalation_model = "opus"
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!(
+            "escalation_after = 3\nescalation_model = \"opus\"\n{MODELS_TOML}"
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.escalation_after, 3);
         assert_eq!(config.escalation_model.as_deref(), Some("opus"));
     }
@@ -540,38 +496,37 @@ escalation_model = "opus"
     #[test]
     fn model_for_attempt_no_escalation() {
         let config = Config::default();
-        // Attempts 1 and 2 use the normal implementer model.
         assert_eq!(config.model_for_attempt("implementer", 1), "sonnet");
         assert_eq!(config.model_for_attempt("implementer", 2), "sonnet");
     }
 
     #[test]
     fn model_for_attempt_escalates_after_threshold() {
-        let config = Config::default(); // escalation_after=2, no escalation_model
-        // Attempt 3 exceeds threshold → falls back to reviewer model (opus by default).
+        let config = Config::default();
+        // Attempt 3 exceeds threshold → falls back to reviewer model (opus).
         assert_eq!(config.model_for_attempt("implementer", 3), "opus");
     }
 
     #[test]
     fn model_for_attempt_uses_explicit_escalation_model() {
-        let config: Config = toml::from_str(r#"escalation_model = "haiku""#).unwrap();
+        let toml_str = format!("escalation_model = \"haiku\"\n{MODELS_TOML}");
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.model_for_attempt("implementer", 3), "haiku");
     }
 
     #[test]
     fn auto_triage_defaults_to_true() {
-        let config: Config = toml::from_str("").unwrap();
+        let config: Config = toml::from_str(MODELS_TOML).unwrap();
         assert!(config.auto_triage);
         assert_eq!(config.max_triage_rounds, 3);
     }
 
     #[test]
     fn deserialize_triage_config() {
-        let toml_str = r#"
-auto_triage = false
-max_triage_rounds = 5
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let toml_str = format!(
+            "auto_triage = false\nmax_triage_rounds = 5\n{MODELS_TOML}"
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
         assert!(!config.auto_triage);
         assert_eq!(config.max_triage_rounds, 5);
     }
@@ -584,13 +539,7 @@ max_triage_rounds = 5
 
     #[test]
     fn model_for_attempt_ignores_non_implementer() {
-        let config = Config {
-            models: ModelConfig {
-                reviewer: Some("opus".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let config = Config::default();
         // Non-implementer roles are not affected by escalation.
         assert_eq!(config.model_for_attempt("tester", 5), "sonnet");
         assert_eq!(config.model_for_attempt("reviewer", 5), "opus");
