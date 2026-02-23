@@ -61,7 +61,10 @@ enum Command {
     /// Reset a task to Pending (clear attempts)
     Reset {
         /// Task ID to reset (e.g. "T3")
-        task_id: String,
+        task_id: Option<String>,
+        /// Reset all failed (unarchived) tasks
+        #[arg(long)]
+        failed: bool,
     },
     /// Add persistent guidance for a task's implementer
     Hint {
@@ -131,7 +134,7 @@ async fn main() -> Result<()> {
         Command::Status { json } => cmd_status(json).await,
         Command::Skip { task_id } => cmd_override_task(&task_id, "skip").await,
         Command::Fail { task_id } => cmd_override_task(&task_id, "fail").await,
-        Command::Reset { task_id } => cmd_override_task(&task_id, "reset").await,
+        Command::Reset { task_id, failed } => cmd_reset(task_id, failed).await,
         Command::Hint { task_id, text } => cmd_hint(&task_id, &text).await,
         Command::Unhint { task_id } => cmd_unhint(&task_id).await,
         Command::Archive { task_id, done } => cmd_archive(task_id, done).await,
@@ -311,6 +314,33 @@ async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
 
     eprintln!("Queued {action} for {task_id}");
     Ok(())
+}
+
+async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
+    match (task_id, failed) {
+        (Some(id), false) => cmd_override_task(&id, "reset").await,
+        (None, true) => {
+            std::fs::create_dir_all(".ralph")?;
+            let conn = db::open(&db::db_path())?;
+            let tasks = db::list_active_tasks(&conn)?;
+            let failed_ids: Vec<&str> = tasks
+                .iter()
+                .filter(|t| matches!(t.phase, task::Phase::Failed))
+                .map(|t| t.id.as_str())
+                .collect();
+            if failed_ids.is_empty() {
+                eprintln!("No failed tasks to reset.");
+                return Ok(());
+            }
+            for id in &failed_ids {
+                db::insert_directive(&conn, id, task::DirectiveAction::Reset)?;
+            }
+            eprintln!("Queued reset for {} task(s): {}", failed_ids.len(), failed_ids.join(", "));
+            Ok(())
+        }
+        (Some(_), true) => anyhow::bail!("Provide either a task ID or --failed, not both"),
+        (None, false) => anyhow::bail!("Provide a task ID or --failed"),
+    }
 }
 
 async fn cmd_status(json: bool) -> Result<()> {
