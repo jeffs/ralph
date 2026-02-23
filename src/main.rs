@@ -942,19 +942,19 @@ async fn cmd_import(dir: PathBuf) -> Result<()> {
     let apply_exec = |def: &task::TaskDef, archived: bool| -> task::Task {
         let mut t = task::Task::from_def(def);
         t.archived = archived;
-        if let Some(ref es) = exec_state {
-            if let Some(exec) = es.tasks.get(&def.id) {
-                t.phase = exec.phase;
-                t.attempts = exec.attempts;
-                t.last_error = exec.last_error.clone();
-                t.files_changed = exec.files_changed.clone();
-                t.feedback = exec.feedback.clone();
-                t.guidance = exec.guidance.clone();
-                t.phase_entered_at = exec.phase_entered_at;
-                t.started_at = exec.started_at;
-                t.completed_at = exec.completed_at;
-                t.postmortem = exec.postmortem.clone();
-            }
+        if let Some(ref es) = exec_state
+            && let Some(exec) = es.tasks.get(&def.id)
+        {
+            t.phase = exec.phase;
+            t.attempts = exec.attempts;
+            t.last_error = exec.last_error.clone();
+            t.files_changed = exec.files_changed.clone();
+            t.feedback = exec.feedback.clone();
+            t.guidance = exec.guidance.clone();
+            t.phase_entered_at = exec.phase_entered_at;
+            t.started_at = exec.started_at;
+            t.completed_at = exec.completed_at;
+            t.postmortem = exec.postmortem.clone();
         }
         t
     };

@@ -21,6 +21,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 /// Open an in-memory database with the same schema. Used in tests.
+#[allow(dead_code)]
 pub fn open_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     init_conn(&conn)?;
@@ -319,6 +320,7 @@ fn list_tasks_where(conn: &Connection, filter: &str) -> Result<Vec<Task>> {
 // ── Task CRUD ─────────────────────────────────────────────────
 
 /// Upsert a task row and replace its deps atomically.
+#[allow(dead_code)]
 pub fn insert_task(conn: &Connection, task: &Task) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     upsert_task_in(&tx, task)?;
@@ -461,6 +463,7 @@ pub fn set_guidance(conn: &Connection, id: &str, guidance: &[String]) -> Result<
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn update_postmortem(conn: &Connection, id: &str, text: Option<&str>) -> Result<()> {
     conn.execute(
         "UPDATE tasks SET postmortem = ?1 WHERE id = ?2",
@@ -621,21 +624,21 @@ pub fn list_nits(conn: &Connection, include_all: bool) -> Result<Vec<Nit>> {
     };
 
     let mut stmt = conn.prepare(sql)?;
-    let rows: Vec<(String, String, String, i64, String, String, String, Option<String>, i64)> =
-        stmt.query_map([], |row| {
+    let rows = stmt
+        .query_map([], |row| {
             Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })?
-        .collect::<rusqlite::Result<_>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     rows.into_iter()
         .map(
@@ -690,6 +693,7 @@ pub fn id_ranges_summary(conn: &Connection) -> Result<String> {
 }
 
 /// Return the next available GEN-N ID.
+#[allow(dead_code)]
 pub fn next_generated_id(conn: &Connection) -> Result<String> {
     let max: Option<i64> = conn.query_row(
         "SELECT MAX(CAST(SUBSTR(id, 5) AS INTEGER)) FROM tasks WHERE id LIKE 'GEN-%'",

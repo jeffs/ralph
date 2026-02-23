@@ -780,10 +780,10 @@ async fn resume_inflight(
             match result {
                 Ok(r) => {
                     *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
-                        if let Err(e) = record_nit(conn, &id, "tester", attempts, suggestions) {
-                            eprintln!("[ralph] failed to record nit: {e}");
-                        }
+                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                        && let Err(e) = record_nit(conn, &id, "tester", attempts, suggestions)
+                    {
+                        eprintln!("[ralph] failed to record nit: {e}");
                     }
                     // Ingest any new tasks proposed by the tester.
                     if let Err(e) = ingest_new_tasks(&r, conn, &format!("tester/{id}")) {
@@ -870,10 +870,10 @@ async fn resume_inflight(
             match result {
                 Ok(r) => {
                     *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
-                        if let Err(e) = record_nit(conn, &id, "reviewer", attempts, suggestions) {
-                            eprintln!("[ralph] failed to record nit: {e}");
-                        }
+                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                        && let Err(e) = record_nit(conn, &id, "reviewer", attempts, suggestions)
+                    {
+                        eprintln!("[ralph] failed to record nit: {e}");
                     }
                     // Ingest any new tasks proposed by the reviewer.
                     if let Err(e) = ingest_new_tasks(&r, conn, &format!("reviewer/{id}")) {
@@ -1180,11 +1180,10 @@ async fn run_group_with_workspaces(
         let success = match result {
             Ok(r) => {
                 *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-                if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
-                    if let Err(e) = record_nit(conn, &id, "implementer", new_attempts, suggestions)
-                    {
-                        eprintln!("[ralph] failed to record nit: {e}");
-                    }
+                if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                    && let Err(e) = record_nit(conn, &id, "implementer", new_attempts, suggestions)
+                {
+                    eprintln!("[ralph] failed to record nit: {e}");
                 }
                 // Ingest any new tasks proposed by the implementer.
                 if let Err(e) = ingest_new_tasks(&r, conn, &format!("implementer/{id}")) {
@@ -1300,10 +1299,10 @@ async fn run_group_singleton(
     match result {
         Ok(r) => {
             *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-            if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
-                if let Err(e) = record_nit(conn, &t.id, "implementer", new_attempts, suggestions) {
-                    eprintln!("[ralph] failed to record nit: {e}");
-                }
+            if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                && let Err(e) = record_nit(conn, &t.id, "implementer", new_attempts, suggestions)
+            {
+                eprintln!("[ralph] failed to record nit: {e}");
             }
             // Ingest any new tasks proposed by the implementer.
             if let Err(e) = ingest_new_tasks(&r, conn, &format!("implementer/{}", t.id)) {
