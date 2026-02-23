@@ -97,7 +97,7 @@ Each task tracks:
 - **attempts**: number of implementation cycles
 - **files_changed**: paths modified by the implementer
 - **feedback**: full agent output from failed test/review runs, forwarded
-  to the implementer on retry (truncated to 8 KB)
+  to the implementer on retry (truncated to 16 KB)
 - **timestamps**: `started_at`, `completed_at`, `phase_entered_at`
 - **last_error**: most recent failure reason
 
@@ -340,7 +340,7 @@ full agent output and stores it as feedback. On the next attempt, the
 feedback is injected into the implementer's prompt under a
 "Previous Attempt Feedback" heading. This gives the implementer
 actionable context about what went wrong, without requiring it to
-re-discover the problem from scratch. Feedback is truncated to 8 KB.
+re-discover the problem from scratch. Feedback is truncated to 16 KB.
 
 ## Cost tracking
 

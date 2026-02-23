@@ -256,7 +256,7 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
     isolate_dirty_tree().await;
     cleanup_stale_workspaces().await;
     let mut cumulative_cost: f64 = 0.0;
-    let mut triage_rounds: u32;
+    let mut triage_rounds: u32 = 0;
 
     for iteration in 1..=max_iterations {
         if registry.is_shutdown() {
@@ -362,7 +362,6 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
                         }
                     }
 
-                    triage_rounds = 0;
                     if config.auto_triage && triage_rounds < config.max_triage_rounds {
                         let promoted =
                             triage_open_nits(conn, config, &registry, &mut cumulative_cost)
