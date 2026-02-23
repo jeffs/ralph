@@ -337,30 +337,21 @@ async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
     match (task_id, failed) {
         (Some(id), false) => cmd_override_task(&id, "reset").await,
         (None, true) => {
-            let tasks_path = PathBuf::from(".ralph/tasks.jsonl");
-            let state_path = PathBuf::from(".ralph/state.json");
-            if !tasks_path.exists() {
-                anyhow::bail!("No tasks found. Run `ralph plan` first.");
-            }
-            let tasks = task::load_tasks(&tasks_path).await?;
-            let exec_state = state::ExecutionState::load(&state_path).await?;
-            let failed_ids: Vec<&str> = tasks
+            check_legacy_files()?;
+            std::fs::create_dir_all(".ralph")?;
+            let conn = db::open(&db::db_path())?;
+            let tasks = db::list_all_tasks(&conn)?;
+            let failed_ids: Vec<String> = tasks
                 .iter()
-                .filter(|t| {
-                    exec_state.tasks.get(&t.id)
-                        .is_some_and(|e| matches!(e.phase, state::Phase::Failed))
-                })
-                .map(|t| t.id.as_str())
+                .filter(|t| !t.archived && matches!(t.phase, task::Phase::Failed))
+                .map(|t| t.id.clone())
                 .collect();
             if failed_ids.is_empty() {
                 eprintln!("No failed tasks to reset.");
                 return Ok(());
             }
             for id in &failed_ids {
-                state::append_directive(&state::Directive {
-                    task_id: id.to_string(),
-                    action: state::DirectiveAction::Reset,
-                }).await?;
+                db::insert_directive(&conn, id, task::DirectiveAction::Reset)?;
             }
             eprintln!("Queued reset for {} task(s): {}", failed_ids.len(), failed_ids.join(", "));
             Ok(())
@@ -861,7 +852,8 @@ async fn cmd_import(dir: PathBuf) -> Result<()> {
     // ── Step 1: tasks.jsonl → active TaskDefs ─────────────────
     let tasks_path = dir.join("tasks.jsonl");
     let active_defs = if tasks_path.exists() {
-        task::load_tasks(&tasks_path).await?
+        let contents = tokio::fs::read_to_string(&tasks_path).await?;
+        task::parse_tasks(&contents)?
     } else {
         Vec::new()
     };
@@ -876,7 +868,12 @@ async fn cmd_import(dir: PathBuf) -> Result<()> {
 
     // ── Step 3: archive.jsonl → archived TaskDefs ─────────────
     let archive_path = dir.join("archive.jsonl");
-    let archive_defs = task::load_archive(&archive_path).await?;
+    let archive_defs = if archive_path.exists() {
+        let contents = tokio::fs::read_to_string(&archive_path).await?;
+        task::parse_tasks(&contents)?
+    } else {
+        Vec::new()
+    };
 
     // ── Step 4: directives.json → Vec<Directive> (JSONL) ──────
     let directives_path = dir.join("directives.json");
@@ -898,7 +895,16 @@ async fn cmd_import(dir: PathBuf) -> Result<()> {
 
     // ── Step 5: nits.jsonl → Vec<Nit> ────────────────────────
     let nits_path = dir.join("nits.jsonl");
-    let nits_list = nit::load_nits(&nits_path).await?;
+    let nits_list: Vec<nit::Nit> = if nits_path.exists() {
+        let contents = tokio::fs::read_to_string(&nits_path).await?;
+        contents
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|line| Ok(serde_json::from_str::<nit::Nit>(line)?))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
 
     // ── Merge execution state into Task objects ───────────────
     let apply_exec = |def: &task::TaskDef, archived: bool| -> task::Task {

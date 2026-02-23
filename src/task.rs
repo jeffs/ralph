@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -117,14 +117,6 @@ impl Task {
     }
 }
 
-/// Read tasks from a JSONL file: one JSON object per line.
-pub async fn load_tasks(path: &Path) -> Result<Vec<TaskDef>> {
-    let contents = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("reading {}", path.display()))?;
-    parse_tasks(&contents)
-}
-
 /// Parse JSONL text into tasks. Blank lines are skipped.
 /// Provides clear error messages pointing at the offending line.
 pub fn parse_tasks(contents: &str) -> Result<Vec<TaskDef>> {
@@ -203,88 +195,11 @@ pub fn validate_deps(tasks: &[TaskDef], extra_ids: &std::collections::HashSet<&s
     }
 }
 
-/// Write tasks to a JSONL file.
-#[allow(dead_code)]
-pub async fn write_tasks(path: &Path, tasks: &[TaskDef]) -> Result<()> {
-    let mut buf = String::new();
-    for t in tasks {
-        let line = serde_json::to_string(t)?;
-        buf.push_str(&line);
-        buf.push('\n');
-    }
-    tokio::fs::write(path, buf).await?;
-    Ok(())
-}
-
-/// Load tasks from the archive file, returning an empty vec if missing.
-pub async fn load_archive(path: &Path) -> Result<Vec<TaskDef>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    load_tasks(path).await
-}
-
-/// Move tasks from `tasks_path` to `archive_path`.
-/// The caller must ensure all IDs exist and are eligible.
-pub async fn archive_tasks(
-    tasks_path: &Path,
-    archive_path: &Path,
-    ids: &std::collections::HashSet<&str>,
-) -> Result<()> {
-    let all = load_tasks(tasks_path).await?;
-    let (to_archive, remaining): (Vec<TaskDef>, Vec<TaskDef>) =
-        all.into_iter().partition(|t| ids.contains(t.id.as_str()));
-    append_tasks(archive_path, &to_archive).await?;
-    write_tasks(tasks_path, &remaining).await?;
-    Ok(())
-}
-
-/// Move a task from `archive_path` back to `tasks_path`.
-pub async fn restore_task(tasks_path: &Path, archive_path: &Path, task_id: &str) -> Result<()> {
-    let archived = load_archive(archive_path).await?;
-    let (to_restore, remaining): (Vec<TaskDef>, Vec<TaskDef>) =
-        archived.into_iter().partition(|t| t.id == task_id);
-    if to_restore.is_empty() {
-        anyhow::bail!("task '{}' not found in archive", task_id);
-    }
-    append_tasks(tasks_path, &to_restore).await?;
-    if remaining.is_empty() {
-        tokio::fs::remove_file(archive_path).await?;
-    } else {
-        write_tasks(archive_path, &remaining).await?;
-    }
-    Ok(())
-}
-
-/// Append tasks to a JSONL file without rewriting existing content.
-pub async fn append_tasks(path: &Path, tasks: &[TaskDef]) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut buf = String::new();
-    for t in tasks {
-        buf.push_str(&serde_json::to_string(t)?);
-        buf.push('\n');
-    }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    file.write_all(buf.as_bytes()).await?;
-    Ok(())
-}
-
-/// Scan tasks for `PREFIX-N` ID patterns and return a human-readable
-/// summary of taken ID ranges. Used to tell the planner which IDs
-/// are already in use so it can avoid collisions.
+/// Scan a slice of ID strings for `PREFIX-N` patterns and return a
+/// human-readable summary of taken ID ranges. Used to tell the planner
+/// which IDs are already in use so it can avoid collisions.
 ///
-/// Returns an empty string when there are no tasks.
-pub fn id_ranges_summary(tasks: &[TaskDef]) -> String {
-    let ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
-    id_ranges_summary_from_ids(&ids)
-}
-
-/// Same as `id_ranges_summary` but accepts a plain slice of ID strings.
-/// Used by `db::id_ranges_summary` which queries IDs from SQLite.
+/// Returns an empty string when there are no IDs.
 pub fn id_ranges_summary_from_ids(ids: &[String]) -> String {
     if ids.is_empty() {
         return String::new();
@@ -404,18 +319,6 @@ pub fn renumber_collisions(
     renames
 }
 
-/// Generate the next auto-ID for dynamically discovered tasks.
-/// Scans existing IDs for the `GEN-N` pattern and increments.
-#[allow(dead_code)]
-pub fn next_generated_id(existing: &[TaskDef]) -> String {
-    let max = existing
-        .iter()
-        .filter_map(|t| t.id.strip_prefix("GEN-")?.parse::<u32>().ok())
-        .max()
-        .unwrap_or(0);
-    format!("GEN-{}", max + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,44 +425,6 @@ mod tests {
     }
 
     #[test]
-    fn next_generated_id_empty() {
-        assert_eq!(next_generated_id(&[]), "GEN-1");
-    }
-
-    #[test]
-    fn next_generated_id_increments() {
-        let tasks = vec![
-            TaskDef {
-                id: "GEN-3".into(),
-                title: "A".into(),
-                description: String::new(),
-                priority: 1,
-                blocked_by: vec![],
-            },
-            TaskDef {
-                id: "T1".into(),
-                title: "B".into(),
-                description: String::new(),
-                priority: 2,
-                blocked_by: vec![],
-            },
-        ];
-        assert_eq!(next_generated_id(&tasks), "GEN-4");
-    }
-
-    #[test]
-    fn next_generated_id_ignores_non_gen() {
-        let tasks = vec![TaskDef {
-            id: "FIX-10".into(),
-            title: "A".into(),
-            description: String::new(),
-            priority: 1,
-            blocked_by: vec![],
-        }];
-        assert_eq!(next_generated_id(&tasks), "GEN-1");
-    }
-
-    #[test]
     fn renumber_no_collisions() {
         let taken: std::collections::HashSet<String> =
             ["REPL-1", "REPL-2"].iter().map(|s| s.to_string()).collect();
@@ -641,49 +506,16 @@ mod tests {
 
     #[test]
     fn id_ranges_summary_empty() {
-        assert_eq!(id_ranges_summary(&[]), "");
+        assert_eq!(id_ranges_summary_from_ids(&[]), "");
     }
 
     #[test]
     fn id_ranges_summary_mixed_prefixes() {
-        let tasks = vec![
-            TaskDef {
-                id: "REPL-1".into(),
-                title: "A".into(),
-                description: String::new(),
-                priority: 1,
-                blocked_by: vec![],
-            },
-            TaskDef {
-                id: "REPL-3".into(),
-                title: "B".into(),
-                description: String::new(),
-                priority: 2,
-                blocked_by: vec![],
-            },
-            TaskDef {
-                id: "REPL-5".into(),
-                title: "C".into(),
-                description: String::new(),
-                priority: 3,
-                blocked_by: vec![],
-            },
-            TaskDef {
-                id: "GETVAR-1".into(),
-                title: "D".into(),
-                description: String::new(),
-                priority: 4,
-                blocked_by: vec![],
-            },
-            TaskDef {
-                id: "GETVAR-3".into(),
-                title: "E".into(),
-                description: String::new(),
-                priority: 5,
-                blocked_by: vec![],
-            },
-        ];
-        let summary = id_ranges_summary(&tasks);
+        let ids: Vec<String> = ["REPL-1", "REPL-3", "REPL-5", "GETVAR-1", "GETVAR-3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let summary = id_ranges_summary_from_ids(&ids);
         assert!(
             summary.contains("REPL: 1 through 5 (next available: REPL-6)"),
             "got: {summary}"
@@ -697,23 +529,8 @@ mod tests {
 
     #[test]
     fn id_ranges_summary_non_prefix_ids() {
-        let tasks = vec![
-            TaskDef {
-                id: "T1".into(),
-                title: "A".into(),
-                description: String::new(),
-                priority: 1,
-                blocked_by: vec![],
-            },
-            TaskDef {
-                id: "T2".into(),
-                title: "B".into(),
-                description: String::new(),
-                priority: 2,
-                blocked_by: vec![],
-            },
-        ];
-        let summary = id_ranges_summary(&tasks);
+        let ids: Vec<String> = ["T1", "T2"].iter().map(|s| s.to_string()).collect();
+        let summary = id_ranges_summary_from_ids(&ids);
         // No PREFIX-N pattern, so falls back to listing raw IDs.
         assert!(summary.contains("T1"), "got: {summary}");
         assert!(summary.contains("T2"), "got: {summary}");
@@ -722,30 +539,11 @@ mod tests {
 
     #[test]
     fn id_ranges_summary_mix_of_prefixed_and_plain() {
-        let tasks = vec![
-            TaskDef {
-                id: "AUTH-1".into(),
-                title: "A".into(),
-                description: String::new(),
-                priority: 1,
-                blocked_by: vec![],
-            },
-            TaskDef {
-                id: "AUTH-2".into(),
-                title: "B".into(),
-                description: String::new(),
-                priority: 2,
-                blocked_by: vec![],
-            },
-            TaskDef {
-                id: "PLAIN".into(),
-                title: "C".into(),
-                description: String::new(),
-                priority: 3,
-                blocked_by: vec![],
-            },
-        ];
-        let summary = id_ranges_summary(&tasks);
+        let ids: Vec<String> = ["AUTH-1", "AUTH-2", "PLAIN"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let summary = id_ranges_summary_from_ids(&ids);
         // The PREFIX-N ones are recognized; PLAIN is not PREFIX-N so won't appear as a range.
         assert!(
             summary.contains("AUTH: 1 through 2 (next available: AUTH-3)"),
@@ -765,62 +563,5 @@ mod tests {
         let mut extra = std::collections::HashSet::new();
         extra.insert("ARCHIVED-1");
         assert!(validate_deps(&tasks, &extra).is_ok());
-    }
-
-    #[tokio::test]
-    async fn archive_restore_roundtrip() {
-        let dir = std::env::temp_dir()
-            .join("ralph_task_tests")
-            .join("archive_roundtrip")
-            .join(format!("{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let tasks_path = dir.join("tasks.jsonl");
-        let archive_path = dir.join("archive.jsonl");
-
-        let tasks = vec![
-            TaskDef {
-                id: "T1".into(),
-                title: "Done task".into(),
-                description: String::new(),
-                priority: 1,
-                blocked_by: vec![],
-            },
-            TaskDef {
-                id: "T2".into(),
-                title: "Active task".into(),
-                description: String::new(),
-                priority: 2,
-                blocked_by: vec![],
-            },
-        ];
-        write_tasks(&tasks_path, &tasks).await.unwrap();
-
-        // Archive T1
-        let mut ids = std::collections::HashSet::new();
-        ids.insert("T1");
-        archive_tasks(&tasks_path, &archive_path, &ids)
-            .await
-            .unwrap();
-
-        let remaining = load_tasks(&tasks_path).await.unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, "T2");
-
-        let archived = load_archive(&archive_path).await.unwrap();
-        assert_eq!(archived.len(), 1);
-        assert_eq!(archived[0].id, "T1");
-
-        // Restore T1
-        restore_task(&tasks_path, &archive_path, "T1")
-            .await
-            .unwrap();
-
-        let restored = load_tasks(&tasks_path).await.unwrap();
-        assert_eq!(restored.len(), 2);
-        assert!(restored.iter().any(|t| t.id == "T1"));
-        assert!(!archive_path.exists()); // archive removed when empty
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
