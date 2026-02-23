@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -58,12 +58,12 @@ pub enum DirectiveAction {
     Reset,
 }
 
-/// Ralph's canonical task format. One JSON object per line
+/// Ralph's canonical task definition format. One JSON object per line
 /// in a JSONL file. The planner produces these; `run` consumes
 /// them. Execution metadata (attempts, phase) lives separately
 /// in state.rs so this file stays clean for human review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Task {
+pub struct TaskDef {
     pub id: String,
     pub title: String,
     #[serde(default)]
@@ -73,8 +73,52 @@ pub struct Task {
     pub blocked_by: Vec<String>,
 }
 
+/// Unified task: definition fields merged with execution state.
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub priority: u32,
+    pub blocked_by: Vec<String>,
+    pub phase: Phase,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub files_changed: Vec<PathBuf>,
+    pub feedback: Vec<String>,
+    pub guidance: Vec<String>,
+    pub phase_entered_at: Option<u64>,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+    pub postmortem: Option<String>,
+    pub archived: bool,
+}
+
+impl Task {
+    pub fn from_def(def: &TaskDef) -> Self {
+        Self {
+            id: def.id.clone(),
+            title: def.title.clone(),
+            description: def.description.clone(),
+            priority: def.priority,
+            blocked_by: def.blocked_by.clone(),
+            phase: Phase::Pending,
+            attempts: 0,
+            last_error: None,
+            files_changed: Vec::new(),
+            feedback: Vec::new(),
+            guidance: Vec::new(),
+            phase_entered_at: None,
+            started_at: None,
+            completed_at: None,
+            postmortem: None,
+            archived: false,
+        }
+    }
+}
+
 /// Read tasks from a JSONL file: one JSON object per line.
-pub async fn load_tasks(path: &Path) -> Result<Vec<Task>> {
+pub async fn load_tasks(path: &Path) -> Result<Vec<TaskDef>> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
@@ -83,13 +127,13 @@ pub async fn load_tasks(path: &Path) -> Result<Vec<Task>> {
 
 /// Parse JSONL text into tasks. Blank lines are skipped.
 /// Provides clear error messages pointing at the offending line.
-pub fn parse_tasks(contents: &str) -> Result<Vec<Task>> {
-    let tasks: Vec<Task> = contents
+pub fn parse_tasks(contents: &str) -> Result<Vec<TaskDef>> {
+    let tasks: Vec<TaskDef> = contents
         .lines()
         .filter(|line| !line.trim().is_empty())
         .enumerate()
         .map(|(i, line)| {
-            serde_json::from_str::<Task>(line).with_context(|| {
+            serde_json::from_str::<TaskDef>(line).with_context(|| {
                 let preview = if line.len() > 120 {
                     format!("{}...", &line[..120])
                 } else {
@@ -105,7 +149,7 @@ pub fn parse_tasks(contents: &str) -> Result<Vec<Task>> {
 }
 
 /// Validate task fields beyond what serde enforces.
-fn validate_tasks(tasks: &[Task]) -> Result<()> {
+fn validate_tasks(tasks: &[TaskDef]) -> Result<()> {
     let mut errors = Vec::new();
 
     for (i, t) in tasks.iter().enumerate() {
@@ -142,7 +186,7 @@ fn validate_tasks(tasks: &[Task]) -> Result<()> {
 /// actual task or a known extra ID (e.g. archived tasks).
 /// Returns an error listing the dangling references,
 /// preventing silent deadlocks.
-pub fn validate_deps(tasks: &[Task], extra_ids: &std::collections::HashSet<&str>) -> Result<()> {
+pub fn validate_deps(tasks: &[TaskDef], extra_ids: &std::collections::HashSet<&str>) -> Result<()> {
     let ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
     let mut bad = Vec::new();
     for t in tasks {
@@ -161,7 +205,7 @@ pub fn validate_deps(tasks: &[Task], extra_ids: &std::collections::HashSet<&str>
 
 /// Write tasks to a JSONL file.
 #[allow(dead_code)]
-pub async fn write_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
+pub async fn write_tasks(path: &Path, tasks: &[TaskDef]) -> Result<()> {
     let mut buf = String::new();
     for t in tasks {
         let line = serde_json::to_string(t)?;
@@ -173,7 +217,7 @@ pub async fn write_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
 }
 
 /// Load tasks from the archive file, returning an empty vec if missing.
-pub async fn load_archive(path: &Path) -> Result<Vec<Task>> {
+pub async fn load_archive(path: &Path) -> Result<Vec<TaskDef>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -188,7 +232,7 @@ pub async fn archive_tasks(
     ids: &std::collections::HashSet<&str>,
 ) -> Result<()> {
     let all = load_tasks(tasks_path).await?;
-    let (to_archive, remaining): (Vec<Task>, Vec<Task>) =
+    let (to_archive, remaining): (Vec<TaskDef>, Vec<TaskDef>) =
         all.into_iter().partition(|t| ids.contains(t.id.as_str()));
     append_tasks(archive_path, &to_archive).await?;
     write_tasks(tasks_path, &remaining).await?;
@@ -198,7 +242,7 @@ pub async fn archive_tasks(
 /// Move a task from `archive_path` back to `tasks_path`.
 pub async fn restore_task(tasks_path: &Path, archive_path: &Path, task_id: &str) -> Result<()> {
     let archived = load_archive(archive_path).await?;
-    let (to_restore, remaining): (Vec<Task>, Vec<Task>) =
+    let (to_restore, remaining): (Vec<TaskDef>, Vec<TaskDef>) =
         archived.into_iter().partition(|t| t.id == task_id);
     if to_restore.is_empty() {
         anyhow::bail!("task '{}' not found in archive", task_id);
@@ -213,7 +257,7 @@ pub async fn restore_task(tasks_path: &Path, archive_path: &Path, task_id: &str)
 }
 
 /// Append tasks to a JSONL file without rewriting existing content.
-pub async fn append_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
+pub async fn append_tasks(path: &Path, tasks: &[TaskDef]) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut buf = String::new();
     for t in tasks {
@@ -234,7 +278,7 @@ pub async fn append_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
 /// are already in use so it can avoid collisions.
 ///
 /// Returns an empty string when there are no tasks.
-pub fn id_ranges_summary(tasks: &[Task]) -> String {
+pub fn id_ranges_summary(tasks: &[TaskDef]) -> String {
     if tasks.is_empty() {
         return String::new();
     }
@@ -289,7 +333,7 @@ pub fn id_ranges_summary(tasks: &[Task]) -> String {
 /// Updates `blocked_by` references within `tasks` to match.
 /// Returns the list of `(old_id, new_id)` renames performed.
 pub fn renumber_collisions(
-    tasks: &mut [Task],
+    tasks: &mut [TaskDef],
     taken_ids: &std::collections::HashSet<String>,
 ) -> Vec<(String, String)> {
     let mut prefix_max: std::collections::HashMap<String, u32> =
@@ -356,7 +400,7 @@ pub fn renumber_collisions(
 /// Generate the next auto-ID for dynamically discovered tasks.
 /// Scans existing IDs for the `GEN-N` pattern and increments.
 #[allow(dead_code)]
-pub fn next_generated_id(existing: &[Task]) -> String {
+pub fn next_generated_id(existing: &[TaskDef]) -> String {
     let max = existing
         .iter()
         .filter_map(|t| t.id.strip_prefix("GEN-")?.parse::<u32>().ok())
@@ -397,14 +441,14 @@ mod tests {
     #[test]
     fn roundtrip() {
         let tasks = vec![
-            Task {
+            TaskDef {
                 id: "A".into(),
                 title: "Alpha".into(),
                 description: "desc".into(),
                 priority: 1,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "B".into(),
                 title: "Beta".into(),
                 description: String::new(),
@@ -426,14 +470,14 @@ mod tests {
     #[test]
     fn validate_deps_ok() {
         let tasks = vec![
-            Task {
+            TaskDef {
                 id: "A".into(),
                 title: "A".into(),
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "B".into(),
                 title: "B".into(),
                 description: String::new(),
@@ -478,14 +522,14 @@ mod tests {
     #[test]
     fn next_generated_id_increments() {
         let tasks = vec![
-            Task {
+            TaskDef {
                 id: "GEN-3".into(),
                 title: "A".into(),
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "T1".into(),
                 title: "B".into(),
                 description: String::new(),
@@ -498,7 +542,7 @@ mod tests {
 
     #[test]
     fn next_generated_id_ignores_non_gen() {
-        let tasks = vec![Task {
+        let tasks = vec![TaskDef {
             id: "FIX-10".into(),
             title: "A".into(),
             description: String::new(),
@@ -512,7 +556,7 @@ mod tests {
     fn renumber_no_collisions() {
         let taken: std::collections::HashSet<String> =
             ["REPL-1", "REPL-2"].iter().map(|s| s.to_string()).collect();
-        let mut tasks = vec![Task {
+        let mut tasks = vec![TaskDef {
             id: "REPL-3".into(),
             title: "A".into(),
             description: String::new(),
@@ -532,14 +576,14 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect();
         let mut tasks = vec![
-            Task {
+            TaskDef {
                 id: "GEN-1".into(),
                 title: "A".into(),
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "GEN-2".into(),
                 title: "B".into(),
                 description: String::new(),
@@ -559,7 +603,7 @@ mod tests {
     fn renumber_non_prefixed_collisions() {
         let taken: std::collections::HashSet<String> =
             ["T1"].iter().map(|s| s.to_string()).collect();
-        let mut tasks = vec![Task {
+        let mut tasks = vec![TaskDef {
             id: "T1".into(),
             title: "A".into(),
             description: String::new(),
@@ -573,7 +617,7 @@ mod tests {
 
     #[test]
     fn validate_deps_catches_dangling() {
-        let tasks = vec![Task {
+        let tasks = vec![TaskDef {
             id: "A".into(),
             title: "A".into(),
             description: String::new(),
@@ -596,35 +640,35 @@ mod tests {
     #[test]
     fn id_ranges_summary_mixed_prefixes() {
         let tasks = vec![
-            Task {
+            TaskDef {
                 id: "REPL-1".into(),
                 title: "A".into(),
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "REPL-3".into(),
                 title: "B".into(),
                 description: String::new(),
                 priority: 2,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "REPL-5".into(),
                 title: "C".into(),
                 description: String::new(),
                 priority: 3,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "GETVAR-1".into(),
                 title: "D".into(),
                 description: String::new(),
                 priority: 4,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "GETVAR-3".into(),
                 title: "E".into(),
                 description: String::new(),
@@ -647,14 +691,14 @@ mod tests {
     #[test]
     fn id_ranges_summary_non_prefix_ids() {
         let tasks = vec![
-            Task {
+            TaskDef {
                 id: "T1".into(),
                 title: "A".into(),
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "T2".into(),
                 title: "B".into(),
                 description: String::new(),
@@ -672,21 +716,21 @@ mod tests {
     #[test]
     fn id_ranges_summary_mix_of_prefixed_and_plain() {
         let tasks = vec![
-            Task {
+            TaskDef {
                 id: "AUTH-1".into(),
                 title: "A".into(),
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "AUTH-2".into(),
                 title: "B".into(),
                 description: String::new(),
                 priority: 2,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "PLAIN".into(),
                 title: "C".into(),
                 description: String::new(),
@@ -704,7 +748,7 @@ mod tests {
 
     #[test]
     fn validate_deps_accepts_archived_id() {
-        let tasks = vec![Task {
+        let tasks = vec![TaskDef {
             id: "B".into(),
             title: "B".into(),
             description: String::new(),
@@ -728,14 +772,14 @@ mod tests {
         let archive_path = dir.join("archive.jsonl");
 
         let tasks = vec![
-            Task {
+            TaskDef {
                 id: "T1".into(),
                 title: "Done task".into(),
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec![],
             },
-            Task {
+            TaskDef {
                 id: "T2".into(),
                 title: "Active task".into(),
                 description: String::new(),

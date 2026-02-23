@@ -2,15 +2,15 @@ use std::collections::HashSet;
 
 use crate::config::Config;
 use crate::state::{ExecutionState, Phase};
-use crate::task::Task;
+use crate::task::TaskDef;
 
 /// Return tasks that are ready to execute: not done/failed,
 /// all dependencies satisfied, within attempt budget.
 pub fn ready_tasks<'a>(
-    tasks: &'a [Task],
+    tasks: &'a [TaskDef],
     state: &ExecutionState,
     config: &Config,
-) -> Vec<&'a Task> {
+) -> Vec<&'a TaskDef> {
     let done_ids: HashSet<&str> = state
         .tasks
         .iter()
@@ -18,7 +18,7 @@ pub fn ready_tasks<'a>(
         .map(|(id, _)| id.as_str())
         .collect();
 
-    let mut ready: Vec<&Task> = tasks
+    let mut ready: Vec<&TaskDef> = tasks
         .iter()
         .filter(|t| {
             let exec = state.tasks.get(&t.id);
@@ -49,8 +49,8 @@ pub fn ready_tasks<'a>(
 /// overlap must be serialized. Tasks with no file history
 /// (first attempt) are placed in their own singleton group
 /// to establish their footprint.
-pub fn partition_independent<'a>(ready: &[&'a Task], state: &ExecutionState) -> Vec<Vec<&'a Task>> {
-    let mut groups: Vec<Vec<&'a Task>> = Vec::new();
+pub fn partition_independent<'a>(ready: &[&'a TaskDef], state: &ExecutionState) -> Vec<Vec<&'a TaskDef>> {
+    let mut groups: Vec<Vec<&'a TaskDef>> = Vec::new();
 
     for &task in ready {
         let exec = state.tasks.get(&task.id);
@@ -104,8 +104,8 @@ mod tests {
     use super::*;
     use crate::state::TaskExecution;
 
-    fn task(id: &str, priority: u32, blocked_by: Vec<&str>) -> Task {
-        Task {
+    fn task(id: &str, priority: u32, blocked_by: Vec<&str>) -> TaskDef {
+        TaskDef {
             id: id.to_string(),
             title: format!("Task {}", id),
             description: String::new(),
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn partition_first_attempts_are_singletons() {
         let tasks = vec![task("A", 1, vec![]), task("B", 2, vec![])];
-        let refs: Vec<&Task> = tasks.iter().collect();
+        let refs: Vec<&TaskDef> = tasks.iter().collect();
         let state = ExecutionState::default();
         let groups = partition_independent(&refs, &state);
         // Each first-attempt task gets its own group
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn partition_disjoint_files_grouped() {
         let tasks = vec![task("A", 1, vec![]), task("B", 2, vec![])];
-        let refs: Vec<&Task> = tasks.iter().collect();
+        let refs: Vec<&TaskDef> = tasks.iter().collect();
         let mut state = ExecutionState::default();
         state.tasks.insert(
             "A".into(),
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn partition_overlapping_files_separated() {
         let tasks = vec![task("A", 1, vec![]), task("B", 2, vec![])];
-        let refs: Vec<&Task> = tasks.iter().collect();
+        let refs: Vec<&TaskDef> = tasks.iter().collect();
         let mut state = ExecutionState::default();
         state.tasks.insert(
             "A".into(),

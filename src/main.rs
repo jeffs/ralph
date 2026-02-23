@@ -451,7 +451,7 @@ async fn cmd_status(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status_json(tasks: &[task::Task], exec_state: &state::ExecutionState) -> Result<()> {
+fn cmd_status_json(tasks: &[task::TaskDef], exec_state: &state::ExecutionState) -> Result<()> {
     #[derive(serde::Serialize)]
     struct TaskStatus<'a> {
         id: &'a str,
@@ -725,7 +725,7 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
     } else {
         nit_entry.summary.clone()
     };
-    let new_task = task::Task {
+    let new_task = task::TaskDef {
         id: task_id.clone(),
         title,
         description: nit_entry.content.clone(),

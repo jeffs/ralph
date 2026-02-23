@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::nit::truncate_with_ellipsis;
 use crate::scheduler;
 use crate::state::{ExecutionState, Phase};
-use crate::task::{self, Task};
+use crate::task::{self, TaskDef};
 
 use crate::state::TaskExecution;
 
@@ -222,7 +222,7 @@ async fn materialize_proposed_tasks(
             }
         };
         new_ids.insert(id.clone());
-        new_tasks.push(Task {
+        new_tasks.push(TaskDef {
             id,
             title: p.title.clone(),
             description: p.description.clone(),
@@ -740,7 +740,7 @@ fn group_by_disjoint_files(ids: &[String], state: &ExecutionState) -> Vec<Vec<St
 /// Testing tasks with disjoint file sets run in parallel.
 /// Reviewing tasks always run in parallel (read-only).
 async fn resume_inflight(
-    tasks: &[Task],
+    tasks: &[TaskDef],
     state: &mut ExecutionState,
     config: &Config,
     registry: &ProcessRegistry,
@@ -961,7 +961,7 @@ async fn resume_inflight(
 
 /// Build a checkpoint commit message summarizing what the
 /// group accomplished, e.g. "ralph: BUILD-1 (testing), UI-2 (done)".
-fn checkpoint_description(group: &[&Task], state: &ExecutionState) -> String {
+fn checkpoint_description(group: &[&TaskDef], state: &ExecutionState) -> String {
     let parts: Vec<String> = group
         .iter()
         .map(|t| {
@@ -1127,7 +1127,7 @@ async fn teardown_workspace(task_id: &str, abandon: bool) {
 /// completion, successful changes are squashed back into the
 /// default workspace.
 async fn run_group_with_workspaces(
-    group: &[&Task],
+    group: &[&TaskDef],
     state: &mut ExecutionState,
     config: &Config,
     registry: &ProcessRegistry,
@@ -1283,7 +1283,7 @@ async fn run_group_with_workspaces(
 /// Run a singleton group directly in the default workspace
 /// (no workspace overhead).
 async fn run_group_singleton(
-    group: &[&Task],
+    group: &[&TaskDef],
     state: &mut ExecutionState,
     config: &Config,
     registry: &ProcessRegistry,
