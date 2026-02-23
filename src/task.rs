@@ -279,30 +279,37 @@ pub async fn append_tasks(path: &Path, tasks: &[TaskDef]) -> Result<()> {
 ///
 /// Returns an empty string when there are no tasks.
 pub fn id_ranges_summary(tasks: &[TaskDef]) -> String {
-    if tasks.is_empty() {
+    let ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+    id_ranges_summary_from_ids(&ids)
+}
+
+/// Same as `id_ranges_summary` but accepts a plain slice of ID strings.
+/// Used by `db::id_ranges_summary` which queries IDs from SQLite.
+pub fn id_ranges_summary_from_ids(ids: &[String]) -> String {
+    if ids.is_empty() {
         return String::new();
     }
 
     // Collect (prefix, number) pairs from PREFIX-N patterns.
-    let mut prefix_numbers: std::collections::BTreeMap<&str, Vec<u32>> =
+    let mut prefix_numbers: std::collections::BTreeMap<String, Vec<u32>> =
         std::collections::BTreeMap::new();
-    for t in tasks {
-        if let Some((prefix, num_str)) = t.id.rsplit_once('-')
+    for id in ids {
+        if let Some((prefix, num_str)) = id.rsplit_once('-')
             && !prefix.is_empty()
             && let Ok(n) = num_str.parse::<u32>()
         {
-            prefix_numbers.entry(prefix).or_default().push(n);
+            prefix_numbers.entry(prefix.to_string()).or_default().push(n);
         }
     }
 
     if prefix_numbers.is_empty() {
         // No PREFIX-N IDs found — list the raw IDs so the planner
         // still knows they're taken.
-        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let id_list: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
         return format!(
             "The following task IDs are already in use: {}\n\n\
              You MUST NOT reuse any existing ID.\n",
-            ids.join(", ")
+            id_list.join(", ")
         );
     }
 
