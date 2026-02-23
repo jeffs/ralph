@@ -58,10 +58,9 @@ pub enum DirectiveAction {
     Reset,
 }
 
-/// Ralph's canonical task definition format. One JSON object per line
-/// in a JSONL file. The planner produces these; `run` consumes
-/// them. Execution metadata (attempts, phase) lives separately
-/// in state.rs so this file stays clean for human review.
+/// Lightweight task definition as produced by the planner (JSONL).
+/// Execution metadata lives in the unified `Task` struct, persisted
+/// via `db.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDef {
     pub id: String,
