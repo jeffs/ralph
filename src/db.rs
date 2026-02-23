@@ -227,6 +227,12 @@ fn all_deps(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
     Ok(map)
 }
 
+/// Upsert a single task without starting a new transaction.
+/// Use within an already-open transaction for batch imports.
+pub fn upsert_task_no_tx(conn: &Connection, task: &Task) -> Result<()> {
+    upsert_task_in(conn, task)
+}
+
 /// Execute the upsert + deps replacement for a single task.
 /// Caller must wrap this in a transaction if atomicity is needed.
 fn upsert_task_in(conn: &Connection, task: &Task) -> Result<()> {

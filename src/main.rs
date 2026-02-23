@@ -101,6 +101,12 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Import flat files (.ralph/) into the SQLite database
+    Import {
+        /// Source directory containing tasks.jsonl, state.json, etc.
+        #[arg(long, default_value = ".ralph")]
+        dir: PathBuf,
+    },
     /// Manage captured nits (improvement suggestions)
     Nits {
         /// Show all nits (including dismissed/promoted)
@@ -150,6 +156,7 @@ async fn main() -> Result<()> {
         Command::Archive { task_id, done } => cmd_archive(task_id, done).await,
         Command::Restore { task_id } => cmd_restore(&task_id).await,
         Command::Dump { json, all } => cmd_dump(json, all).await,
+        Command::Import { dir } => cmd_import(dir).await,
         Command::Nits { all, action } => match action {
             None => cmd_nits_list(all).await,
             Some(NitsAction::Promote { nit_id }) => cmd_nits_promote(&nit_id).await,
@@ -822,6 +829,119 @@ async fn cmd_dump(json: bool, all: bool) -> Result<()> {
     } else {
         cmd_dump_markdown(&tasks, &directives, &nits, all)
     }
+}
+
+async fn cmd_import(dir: PathBuf) -> Result<()> {
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
+
+    // ── Step 1: tasks.jsonl → active TaskDefs ─────────────────
+    let tasks_path = dir.join("tasks.jsonl");
+    let active_defs = if tasks_path.exists() {
+        task::load_tasks(&tasks_path).await?
+    } else {
+        Vec::new()
+    };
+
+    // ── Step 2: state.json → ExecutionState ───────────────────
+    let state_path = dir.join("state.json");
+    let exec_state = if state_path.exists() {
+        Some(state::ExecutionState::load(&state_path).await?)
+    } else {
+        None
+    };
+
+    // ── Step 3: archive.jsonl → archived TaskDefs ─────────────
+    let archive_path = dir.join("archive.jsonl");
+    let archive_defs = task::load_archive(&archive_path).await?;
+
+    // ── Step 4: directives.json → Vec<Directive> (JSONL) ──────
+    let directives_path = dir.join("directives.json");
+    let directives_list: Vec<task::Directive> = if directives_path.exists() {
+        let contents = tokio::fs::read_to_string(&directives_path).await?;
+        contents
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .enumerate()
+            .map(|(i, line)| {
+                serde_json::from_str::<task::Directive>(line).map_err(|e| {
+                    anyhow::anyhow!("parsing directive on line {}: {e}", i + 1)
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    // ── Step 5: nits.jsonl → Vec<Nit> ────────────────────────
+    let nits_path = dir.join("nits.jsonl");
+    let nits_list = nit::load_nits(&nits_path).await?;
+
+    // ── Merge execution state into Task objects ───────────────
+    let apply_exec = |def: &task::TaskDef, archived: bool| -> task::Task {
+        let mut t = task::Task::from_def(def);
+        t.archived = archived;
+        if let Some(ref es) = exec_state {
+            if let Some(exec) = es.tasks.get(&def.id) {
+                t.phase = exec.phase;
+                t.attempts = exec.attempts;
+                t.last_error = exec.last_error.clone();
+                t.files_changed = exec.files_changed.clone();
+                t.feedback = exec.feedback.clone();
+                t.guidance = exec.guidance.clone();
+                t.phase_entered_at = exec.phase_entered_at;
+                t.started_at = exec.started_at;
+                t.completed_at = exec.completed_at;
+                t.postmortem = exec.postmortem.clone();
+            }
+        }
+        t
+    };
+
+    let active_tasks: Vec<task::Task> =
+        active_defs.iter().map(|d| apply_exec(d, false)).collect();
+    let archived_tasks: Vec<task::Task> =
+        archive_defs.iter().map(|d| apply_exec(d, true)).collect();
+
+    // Warn about state entries with no corresponding task definition.
+    if let Some(ref es) = exec_state {
+        let known_ids: std::collections::HashSet<&str> = active_defs
+            .iter()
+            .chain(archive_defs.iter())
+            .map(|d| d.id.as_str())
+            .collect();
+        for id in es.tasks.keys() {
+            if !known_ids.contains(id.as_str()) {
+                eprintln!("[ralph] warning: state.json references unknown task '{id}'");
+            }
+        }
+    }
+
+    // ── Atomic insert ─────────────────────────────────────────
+    let tx = conn.unchecked_transaction()?;
+
+    for t in active_tasks.iter().chain(archived_tasks.iter()) {
+        db::upsert_task_no_tx(&tx, t)?;
+    }
+    for d in &directives_list {
+        db::insert_directive(&tx, &d.task_id, d.action)?;
+    }
+    for n in &nits_list {
+        db::insert_nit(&tx, n)?;
+    }
+
+    tx.commit()?;
+
+    let archived_count = archived_tasks.len();
+    let total_tasks = active_tasks.len() + archived_count;
+    println!(
+        "Imported {} tasks ({} archived), {} directives, {} nits.",
+        total_tasks,
+        archived_count,
+        directives_list.len(),
+        nits_list.len()
+    );
+    Ok(())
 }
 
 async fn cmd_nits_list(all: bool) -> Result<()> {
