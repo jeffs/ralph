@@ -334,16 +334,20 @@ async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
 }
 
 async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
+    check_legacy_files()?;
     match (task_id, failed) {
         (Some(id), false) => cmd_override_task(&id, "reset").await,
         (None, true) => {
-            check_legacy_files()?;
+            let db_path = db::db_path();
+            if !db_path.exists() {
+                anyhow::bail!("No database found. Run `ralph init` or `ralph plan` first.");
+            }
             std::fs::create_dir_all(".ralph")?;
-            let conn = db::open(&db::db_path())?;
-            let tasks = db::list_all_tasks(&conn)?;
+            let conn = db::open(&db_path)?;
+            let tasks = db::list_active_tasks(&conn)?;
             let failed_ids: Vec<String> = tasks
                 .iter()
-                .filter(|t| !t.archived && matches!(t.phase, task::Phase::Failed))
+                .filter(|t| matches!(t.phase, task::Phase::Failed))
                 .map(|t| t.id.clone())
                 .collect();
             if failed_ids.is_empty() {
