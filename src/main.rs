@@ -92,6 +92,15 @@ enum Command {
         /// Task ID to restore
         task_id: String,
     },
+    /// Dump full project state (tasks, directives, nits)
+    Dump {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Include archived tasks
+        #[arg(long)]
+        all: bool,
+    },
     /// Manage captured nits (improvement suggestions)
     Nits {
         /// Show all nits (including dismissed/promoted)
@@ -140,6 +149,7 @@ async fn main() -> Result<()> {
         Command::Unhint { task_id } => cmd_unhint(&task_id).await,
         Command::Archive { task_id, done } => cmd_archive(task_id, done).await,
         Command::Restore { task_id } => cmd_restore(&task_id).await,
+        Command::Dump { json, all } => cmd_dump(json, all).await,
         Command::Nits { all, action } => match action {
             None => cmd_nits_list(all).await,
             Some(NitsAction::Promote { nit_id }) => cmd_nits_promote(&nit_id).await,
@@ -571,6 +581,247 @@ async fn cmd_restore(task_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Format a Unix timestamp as RFC 3339 UTC (e.g. "2025-01-15T10:30:00Z").
+fn fmt_rfc3339_utc(ts: u64) -> String {
+    let time_of_day = ts % 86400;
+    let days = ts / 86400;
+    let h = time_of_day / 3600;
+    let m = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+
+    // civil_from_days algorithm: https://howardhinnant.github.io/date_algorithms.html
+    let z = days as i64 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe as i64 + era * 400 + if month <= 2 { 1 } else { 0 };
+
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn format_task_md(out: &mut String, t: &task::Task) {
+    let phase_name = format!("{:?}", t.phase);
+    let attempt_word = if t.attempts == 1 { "attempt" } else { "attempts" };
+    out.push_str(&format!(
+        "\n### [{}] {} ({}, {} {})\n",
+        t.id, t.title, phase_name, t.attempts, attempt_word
+    ));
+
+    let mut meta = format!("Priority: {}", t.priority);
+    if let Some(s) = t.started_at {
+        meta.push_str(&format!(" | Started: {}", fmt_rfc3339_utc(s)));
+    }
+    if let Some(c) = t.completed_at {
+        meta.push_str(&format!(" | Completed: {}", fmt_rfc3339_utc(c)));
+    }
+    out.push_str(&meta);
+    out.push('\n');
+
+    if !t.blocked_by.is_empty() {
+        out.push_str(&format!("Blocked by: {}\n", t.blocked_by.join(", ")));
+    }
+
+    if !t.description.is_empty() {
+        out.push('\n');
+        out.push_str(&t.description);
+        out.push('\n');
+    }
+
+    if !t.files_changed.is_empty() {
+        out.push_str("\nFiles changed:\n");
+        for f in &t.files_changed {
+            out.push_str(&format!("- {}\n", f.display()));
+        }
+    }
+
+    if !t.feedback.is_empty() {
+        out.push_str("\nFeedback:\n");
+        for fb in &t.feedback {
+            out.push_str(&format!("- {fb}\n"));
+        }
+    }
+
+    if !t.guidance.is_empty() {
+        out.push_str("\nGuidance:\n");
+        for g in &t.guidance {
+            out.push_str(&format!("- {g}\n"));
+        }
+    }
+
+    if let Some(err) = &t.last_error {
+        out.push_str(&format!("\nLast error: {err}\n"));
+    }
+
+    if let Some(pm) = &t.postmortem {
+        out.push_str(&format!("\nPostmortem: {pm}\n"));
+    }
+}
+
+fn cmd_dump_markdown(
+    tasks: &[task::Task],
+    directives: &[task::Directive],
+    nits: &[nit::Nit],
+    all: bool,
+) -> Result<()> {
+    let mut out = String::new();
+    out.push_str("# Ralph Project State\n");
+
+    let active: Vec<&task::Task> = tasks.iter().filter(|t| !t.archived).collect();
+    out.push_str("\n## Active Tasks\n");
+    if active.is_empty() {
+        out.push_str("\n_(none)_\n");
+    } else {
+        for t in &active {
+            format_task_md(&mut out, t);
+        }
+    }
+
+    if all {
+        let archived: Vec<&task::Task> = tasks.iter().filter(|t| t.archived).collect();
+        out.push_str("\n## Archived Tasks\n");
+        if archived.is_empty() {
+            out.push_str("\n_(none)_\n");
+        } else {
+            for t in &archived {
+                format_task_md(&mut out, t);
+            }
+        }
+    }
+
+    if !directives.is_empty() {
+        out.push_str("\n## Directives (pending)\n");
+        for d in directives {
+            let action = match d.action {
+                task::DirectiveAction::Skip => "Skip",
+                task::DirectiveAction::Fail => "Fail",
+                task::DirectiveAction::Reset => "Reset",
+            };
+            out.push_str(&format!("- {action} {}\n", d.task_id));
+        }
+    }
+
+    if !nits.is_empty() {
+        out.push_str("\n## Open Nits\n");
+        for n in nits {
+            out.push_str(&format!(
+                "\n### {} (from {} on {}, attempt {})\n",
+                n.id, n.source_role, n.source_task, n.attempt
+            ));
+            out.push_str(&n.content);
+            out.push('\n');
+        }
+    }
+
+    print!("{out}");
+    Ok(())
+}
+
+fn cmd_dump_json(
+    tasks: &[task::Task],
+    directives: &[task::Directive],
+    nits: &[nit::Nit],
+) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct DumpTask<'a> {
+        id: &'a str,
+        title: &'a str,
+        description: &'a str,
+        priority: u32,
+        blocked_by: &'a [String],
+        phase: &'a task::Phase,
+        attempts: u32,
+        last_error: Option<&'a str>,
+        files_changed: &'a [std::path::PathBuf],
+        feedback: &'a [String],
+        guidance: &'a [String],
+        phase_entered_at: Option<u64>,
+        started_at: Option<u64>,
+        completed_at: Option<u64>,
+        postmortem: Option<&'a str>,
+        archived: bool,
+    }
+
+    #[derive(serde::Serialize)]
+    struct DumpDirective<'a> {
+        task_id: &'a str,
+        action: &'a task::DirectiveAction,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Dump<'a> {
+        tasks: Vec<DumpTask<'a>>,
+        directives: Vec<DumpDirective<'a>>,
+        nits: &'a [nit::Nit],
+    }
+
+    let dump = Dump {
+        tasks: tasks
+            .iter()
+            .map(|t| DumpTask {
+                id: &t.id,
+                title: &t.title,
+                description: &t.description,
+                priority: t.priority,
+                blocked_by: &t.blocked_by,
+                phase: &t.phase,
+                attempts: t.attempts,
+                last_error: t.last_error.as_deref(),
+                files_changed: &t.files_changed,
+                feedback: &t.feedback,
+                guidance: &t.guidance,
+                phase_entered_at: t.phase_entered_at,
+                started_at: t.started_at,
+                completed_at: t.completed_at,
+                postmortem: t.postmortem.as_deref(),
+                archived: t.archived,
+            })
+            .collect(),
+        directives: directives
+            .iter()
+            .map(|d| DumpDirective {
+                task_id: &d.task_id,
+                action: &d.action,
+            })
+            .collect(),
+        nits,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&dump)?);
+    Ok(())
+}
+
+async fn cmd_dump(json: bool, all: bool) -> Result<()> {
+    let db_path = db::db_path();
+    if !db_path.exists() {
+        if json {
+            println!(r#"{{"tasks":[],"directives":[],"nits":[]}}"#);
+        } else {
+            println!("No tasks found. Run `ralph plan` first.");
+        }
+        return Ok(());
+    }
+
+    let conn = db::open(&db_path)?;
+    let tasks = if all {
+        db::list_all_tasks(&conn)?
+    } else {
+        db::list_active_tasks(&conn)?
+    };
+    let directives = db::peek_directives(&conn)?;
+    // Markdown shows open nits; JSON shows all nits for a complete snapshot.
+    let nits = db::list_nits(&conn, json)?;
+
+    if json {
+        cmd_dump_json(&tasks, &directives, &nits)
+    } else {
+        cmd_dump_markdown(&tasks, &directives, &nits, all)
+    }
 }
 
 async fn cmd_nits_list(all: bool) -> Result<()> {
