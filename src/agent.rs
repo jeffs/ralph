@@ -427,6 +427,246 @@ struct ClaudeJsonOutput {
     total_cost_usd: Option<f64>,
 }
 
+/// JSONL event from `codex -q` output stream.
+#[derive(Deserialize)]
+struct CodexEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    item: Option<CodexItem>,
+}
+
+/// Content item within a Codex output event.
+#[derive(Deserialize)]
+struct CodexItem {
+    content: Option<Vec<CodexContent>>,
+}
+
+/// Text content element within a Codex item.
+#[derive(Deserialize)]
+struct CodexContent {
+    text: Option<String>,
+}
+
+/// JSON response envelope from `gemini`.
+#[derive(Deserialize)]
+struct GeminiJsonOutput {
+    candidates: Option<Vec<GeminiCandidate>>,
+}
+
+/// Candidate response from Gemini.
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: Option<GeminiContent>,
+}
+
+/// Content block within a Gemini candidate.
+#[derive(Deserialize)]
+struct GeminiContent {
+    parts: Option<Vec<GeminiPart>>,
+}
+
+/// A single content part from a Gemini response.
+#[derive(Deserialize)]
+struct GeminiPart {
+    text: Option<String>,
+}
+
+/// JSONL event from `opencode run` output stream.
+#[derive(Deserialize)]
+struct OpenCodeEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    part: Option<OpenCodePart>,
+    #[serde(rename = "totalCost")]
+    total_cost: Option<f64>,
+}
+
+/// Text part within an OpenCode output event.
+#[derive(Deserialize)]
+struct OpenCodePart {
+    text: Option<String>,
+}
+
+/// Translate a Ralph model string to the `provider/model` format used by OpenCode.
+fn opencode_model(model: &str) -> String {
+    match model {
+        "deepseek-chat" => "deepseek/deepseek-chat".to_string(),
+        "deepseek-reasoner" => "deepseek/deepseek-reasoner".to_string(),
+        _ if model.starts_with("deepseek-") => format!("deepseek/{model}"),
+        _ => model.to_string(),
+    }
+}
+
+/// Which backend CLI to invoke for a given model string.
+pub enum AgentBackend {
+    Claude,
+    Codex,
+    Gemini,
+    OpenCode,
+}
+
+impl AgentBackend {
+    /// Human-readable name for logs.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AgentBackend::Claude => "Claude",
+            AgentBackend::Codex => "Codex",
+            AgentBackend::Gemini => "Gemini",
+            AgentBackend::OpenCode => "OpenCode",
+        }
+    }
+
+    /// Executable name for spawning the backend process.
+    pub fn binary(&self) -> &'static str {
+        match self {
+            AgentBackend::Claude => "claude",
+            AgentBackend::Codex => "codex",
+            AgentBackend::Gemini => "gemini",
+            AgentBackend::OpenCode => "opencode",
+        }
+    }
+
+    /// Append backend-specific CLI arguments to `cmd`.
+    pub fn build_args(&self, cmd: &mut TokioCommand, prompt: &str, model: &str) {
+        match self {
+            AgentBackend::Claude => {
+                cmd.arg("-p")
+                    .arg(prompt)
+                    .arg("--output-format")
+                    .arg("json")
+                    .arg("--model")
+                    .arg(model)
+                    .arg("--dangerously-skip-permissions")
+                    .arg("--no-session-persistence")
+                    .arg("--strict-mcp-config")
+                    .arg("--mcp-config")
+                    .arg(r#"{"mcpServers":{}}"#)
+                    .arg("--settings")
+                    .arg(r#"{"enabledPlugins":{"rust-analyzer-lsp@claude-plugins-official":false,"typescript-lsp@claude-plugins-official":false,"pyright-lsp@claude-plugins-official":false}}"#);
+            }
+            AgentBackend::Codex => {
+                cmd.arg("--model").arg(model).arg("-q").arg(prompt);
+            }
+            AgentBackend::Gemini => {
+                cmd.arg("--model").arg(model).arg("-p").arg(prompt);
+            }
+            AgentBackend::OpenCode => {
+                cmd.arg("run")
+                    .arg("-m")
+                    .arg(opencode_model(model))
+                    .arg("-p")
+                    .arg(prompt);
+            }
+        }
+    }
+
+    /// Parse raw `stdout` bytes into `(response_text, cost_usd)`.
+    pub fn parse_output(&self, stdout: &[u8]) -> (String, Option<f64>) {
+        match self {
+            AgentBackend::Claude => {
+                let raw = String::from_utf8_lossy(stdout);
+                match serde_json::from_str::<ClaudeJsonOutput>(&raw) {
+                    Ok(parsed) => (parsed.result.unwrap_or_default(), parsed.total_cost_usd),
+                    Err(_) => (raw.into_owned(), None),
+                }
+            }
+            AgentBackend::Codex => {
+                let mut text = String::new();
+                for line in String::from_utf8_lossy(stdout).lines() {
+                    if let Ok(event) = serde_json::from_str::<CodexEvent>(line) {
+                        if event.event_type == "message" {
+                            if let Some(item) = event.item {
+                                for content in item.content.unwrap_or_default() {
+                                    if let Some(t) = content.text {
+                                        text.push_str(&t);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                (text, None)
+            }
+            AgentBackend::Gemini => {
+                let raw = String::from_utf8_lossy(stdout);
+                match serde_json::from_str::<GeminiJsonOutput>(&raw) {
+                    Ok(parsed) => {
+                        let text = parsed
+                            .candidates
+                            .unwrap_or_default()
+                            .into_iter()
+                            .flat_map(|c| c.content.into_iter())
+                            .flat_map(|c| c.parts.unwrap_or_default())
+                            .filter_map(|p| p.text)
+                            .collect::<Vec<_>>()
+                            .join("");
+                        (text, None)
+                    }
+                    Err(_) => (raw.into_owned(), None),
+                }
+            }
+            AgentBackend::OpenCode => {
+                let mut text = String::new();
+                let mut cost: Option<f64> = None;
+                for line in String::from_utf8_lossy(stdout).lines() {
+                    if let Ok(event) = serde_json::from_str::<OpenCodeEvent>(line) {
+                        match event.event_type.as_str() {
+                            "PartText" => {
+                                if let Some(part) = event.part {
+                                    if let Some(t) = part.text {
+                                        text.push_str(&t);
+                                    }
+                                }
+                            }
+                            "FinishMessage" => {
+                                cost = event.total_cost;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                (text, cost)
+            }
+        }
+    }
+}
+
+/// Select the appropriate [`AgentBackend`] for the given model string.
+///
+/// Uses two-tier matching:
+/// 1. Exact aliases: `opus`/`sonnet`/`haiku` → Claude; `o3`/`o3-pro`/`o3-mini`/`o4-mini` → Codex;
+///    `deepseek-chat`/`deepseek-reasoner` → OpenCode.
+/// 2. Vendor-prefix patterns: `claude-*` → Claude; `gpt-*`/`codex-*` → Codex;
+///    `gemini-*` → Gemini; `deepseek-*` → OpenCode.
+///
+/// Returns an error for unrecognized model strings.
+pub fn backend_for_model(model: &str) -> Result<AgentBackend> {
+    // Tier 1: exact aliases.
+    match model {
+        "opus" | "sonnet" | "haiku" => return Ok(AgentBackend::Claude),
+        "o3" | "o3-pro" | "o3-mini" | "o4-mini" => return Ok(AgentBackend::Codex),
+        "deepseek-chat" | "deepseek-reasoner" => return Ok(AgentBackend::OpenCode),
+        _ => {}
+    }
+    // Tier 2: vendor-prefix patterns.
+    if model.starts_with("claude-") {
+        return Ok(AgentBackend::Claude);
+    }
+    if model.starts_with("gpt-") || model.starts_with("codex-") {
+        return Ok(AgentBackend::Codex);
+    }
+    if model.starts_with("gemini-") {
+        return Ok(AgentBackend::Gemini);
+    }
+    if model.starts_with("deepseek-") {
+        return Ok(AgentBackend::OpenCode);
+    }
+    anyhow::bail!(
+        "unrecognized model {model:?}; recognized aliases: opus, sonnet, haiku, \
+         o3, o3-pro, o3-mini, o4-mini, deepseek-chat, deepseek-reasoner; \
+         recognized prefixes: claude-*, gpt-*, codex-*, gemini-*, deepseek-*"
+    )
+}
 
 /// Sample total CPU% for all processes in a process group via `ps`.
 /// Returns 0.0 if the process group no longer exists or ps fails.
