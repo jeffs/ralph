@@ -498,6 +498,7 @@ fn opencode_model(model: &str) -> String {
 }
 
 /// Which backend CLI to invoke for a given model string.
+#[derive(Debug, PartialEq)]
 pub enum AgentBackend {
     Claude,
     Codex,
@@ -1814,5 +1815,72 @@ STATUS: FAILURE: issues found"#;
         // Recent entries are still returned even though they exceed budget.
         assert!(result.contains(&recent1));
         assert!(result.contains(&recent2));
+    }
+
+    // --- backend_for_model ---
+
+    #[test]
+    fn backend_for_model_exact_aliases_claude() {
+        assert_eq!(backend_for_model("opus").unwrap(), AgentBackend::Claude);
+        assert_eq!(backend_for_model("sonnet").unwrap(), AgentBackend::Claude);
+        assert_eq!(backend_for_model("haiku").unwrap(), AgentBackend::Claude);
+    }
+
+    #[test]
+    fn backend_for_model_exact_aliases_codex() {
+        assert_eq!(backend_for_model("o3").unwrap(), AgentBackend::Codex);
+        assert_eq!(backend_for_model("o3-pro").unwrap(), AgentBackend::Codex);
+        assert_eq!(backend_for_model("o3-mini").unwrap(), AgentBackend::Codex);
+        assert_eq!(backend_for_model("o4-mini").unwrap(), AgentBackend::Codex);
+    }
+
+    #[test]
+    fn backend_for_model_exact_aliases_opencode() {
+        assert_eq!(
+            backend_for_model("deepseek-chat").unwrap(),
+            AgentBackend::OpenCode
+        );
+        assert_eq!(
+            backend_for_model("deepseek-reasoner").unwrap(),
+            AgentBackend::OpenCode
+        );
+    }
+
+    #[test]
+    fn backend_for_model_vendor_prefix_claude() {
+        assert_eq!(
+            backend_for_model("claude-sonnet-4-6").unwrap(),
+            AgentBackend::Claude
+        );
+    }
+
+    #[test]
+    fn backend_for_model_vendor_prefix_codex() {
+        assert_eq!(
+            backend_for_model("gpt-5.1-codex-max").unwrap(),
+            AgentBackend::Codex
+        );
+        assert_eq!(
+            backend_for_model("codex-mini-latest").unwrap(),
+            AgentBackend::Codex
+        );
+    }
+
+    #[test]
+    fn backend_for_model_vendor_prefix_gemini() {
+        assert_eq!(
+            backend_for_model("gemini-2.5-pro").unwrap(),
+            AgentBackend::Gemini
+        );
+        assert_eq!(
+            backend_for_model("gemini-2.5-flash-preview-04-17").unwrap(),
+            AgentBackend::Gemini
+        );
+    }
+
+    #[test]
+    fn backend_for_model_unknown_returns_err() {
+        assert!(backend_for_model("unknown-thing").is_err());
+        assert!(backend_for_model("mistral-large").is_err());
     }
 }
