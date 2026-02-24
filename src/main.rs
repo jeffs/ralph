@@ -553,23 +553,12 @@ async fn cmd_archive(task_id: Option<String>, done: bool) -> Result<()> {
             }
         }
     } else if done {
-        let tasks = db::list_active_tasks(&conn)?;
-        let to_archive: Vec<String> = tasks
-            .iter()
-            .filter(|t| matches!(t.phase, task::Phase::Done | task::Phase::Skipped))
-            .map(|t| t.id.clone())
-            .collect();
-
-        if to_archive.is_empty() {
+        let count = db::archive_done_tasks(&conn)?;
+        if count == 0 {
             eprintln!("No tasks to archive.");
-            return Ok(());
+        } else {
+            eprintln!("Archived {} task(s)", count);
         }
-
-        let count = to_archive.len();
-        for id in &to_archive {
-            db::archive_task(&conn, id)?;
-        }
-        eprintln!("Archived {} task(s)", count);
     } else {
         anyhow::bail!("Provide a task ID or use --done to archive all completed tasks");
     }
