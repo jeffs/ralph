@@ -614,10 +614,13 @@ impl AgentBackend {
                 }
             }
             AgentBackend::OpenCode => {
+                let raw = String::from_utf8_lossy(stdout);
                 let mut text = String::new();
                 let mut cost: Option<f64> = None;
-                for line in String::from_utf8_lossy(stdout).lines() {
+                let mut found_json = false;
+                for line in raw.lines() {
                     if let Ok(event) = serde_json::from_str::<OpenCodeEvent>(line) {
+                        found_json = true;
                         match event.event_type.as_str() {
                             "PartText" => {
                                 if let Some(part) = event.part {
@@ -633,7 +636,11 @@ impl AgentBackend {
                         }
                     }
                 }
-                (text, cost)
+                if found_json {
+                    (text, cost)
+                } else {
+                    (raw.into_owned(), None)
+                }
             }
         }
     }
@@ -1929,6 +1936,29 @@ STATUS: FAILURE: issues found"#;
     fn gemini_parse_output_fallback_plain_text() {
         let input = "plain text output, not JSON";
         let (text, cost) = AgentBackend::Gemini.parse_output(input.as_bytes());
+        assert_eq!(text, input);
+        assert_eq!(cost, None);
+    }
+
+    // --- AgentBackend::OpenCode parse_output ---
+
+    #[test]
+    fn opencode_parse_output_structured_jsonl() {
+        // SessionStarted is ignored; PartText events contribute their text.
+        let jsonl = concat!(
+            "{\"type\":\"SessionStarted\"}\n",
+            "{\"type\":\"PartText\",\"part\":{\"text\":\"Hello from OpenCode\"}}\n",
+            "{\"type\":\"StepFinish\"}\n",
+        );
+        let (text, cost) = AgentBackend::OpenCode.parse_output(jsonl.as_bytes());
+        assert_eq!(text, "Hello from OpenCode");
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn opencode_parse_output_fallback_plain_text() {
+        let input = "plain text output, not JSONL";
+        let (text, cost) = AgentBackend::OpenCode.parse_output(input.as_bytes());
         assert_eq!(text, input);
         assert_eq!(cost, None);
     }
