@@ -126,7 +126,10 @@ fn ingest_new_tasks(
     if proposals.is_empty() {
         return Ok(0);
     }
-    materialize_proposed_tasks(&proposals, conn, source_label)
+    Ok(materialize_proposed_tasks(&proposals, conn, source_label)?
+        .into_iter()
+        .filter(|id| id.is_some())
+        .count())
 }
 
 /// Parse a numbered-list failure reason into tasks and insert them.
@@ -142,7 +145,10 @@ fn ingest_from_failure_reason(
     if proposals.is_empty() {
         return Ok(0);
     }
-    materialize_proposed_tasks(&proposals, conn, source_label)
+    Ok(materialize_proposed_tasks(&proposals, conn, source_label)?
+        .into_iter()
+        .filter(|id| id.is_some())
+        .count())
 }
 
 /// Extract the first sentence (or first ~120 chars) of a failure reason
@@ -160,11 +166,14 @@ fn truncate_for_title(reason: &str) -> String {
 }
 
 /// Shared logic: validate, deduplicate, assign IDs, and insert proposed tasks.
+///
+/// Returns a `Vec` positionally aligned with `proposals`: `Some(id)` for each proposal
+/// that was materialized as a new task, `None` for proposals skipped due to deduplication.
 fn materialize_proposed_tasks(
     proposals: &[agent::ProposedTask],
     conn: &Connection,
     source_label: &str,
-) -> Result<usize> {
+) -> Result<Vec<Option<String>>> {
     let existing = db::list_all_tasks(conn)?;
     let existing_ids: HashSet<&str> = existing.iter().map(|t| t.id.as_str()).collect();
     let existing_titles: HashSet<&str> = existing.iter().map(|t| t.title.as_str()).collect();
@@ -179,10 +188,12 @@ fn materialize_proposed_tasks(
 
     let mut new_tasks = Vec::new();
     let mut new_ids: HashSet<String> = HashSet::new();
+    let mut result_ids: Vec<Option<String>> = Vec::with_capacity(proposals.len());
 
     for p in proposals {
         // Deduplicate by title — skip if an identical task already exists.
         if existing_titles.contains(p.title.as_str()) {
+            result_ids.push(None);
             continue;
         }
 
@@ -200,6 +211,7 @@ fn materialize_proposed_tasks(
             }
         };
         new_ids.insert(id.clone());
+        result_ids.push(Some(id.clone()));
         new_tasks.push(Task::from_def(&TaskDef {
             id,
             title: p.title.clone(),
@@ -209,8 +221,7 @@ fn materialize_proposed_tasks(
         }));
     }
 
-    let count = new_tasks.len();
-    if count > 0 {
+    if !new_tasks.is_empty() {
         db::insert_tasks(conn, &new_tasks)?;
         for t in &new_tasks {
             eprintln!(
@@ -219,7 +230,7 @@ fn materialize_proposed_tasks(
             );
         }
     }
-    Ok(count)
+    Ok(result_ids)
 }
 
 /// Main orchestration loop. Iterates until convergence
@@ -350,7 +361,10 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
                             &fallback,
                             conn,
                             "final review (synthesized)",
-                        )?;
+                        )?
+                        .into_iter()
+                        .filter(|id| id.is_some())
+                        .count();
                     }
 
                     if added > 0 {
@@ -566,6 +580,7 @@ pub async fn triage_open_nits(
 
     let mut promoted_count = 0usize;
     let mut proposals = Vec::new();
+    let mut promoted_nit_ids: Vec<String> = Vec::new();
 
     for d in &decisions {
         let nit_entry = nits.iter().find(|n| n.id == d.nit_id);
@@ -594,12 +609,7 @@ pub async fn triage_open_nits(
                     priority: None,
                     blocked_by: vec![],
                 });
-                db::update_nit_status(
-                    conn,
-                    &d.nit_id,
-                    crate::nit::NitStatus::Promoted,
-                    None,
-                )?;
+                promoted_nit_ids.push(d.nit_id.clone());
                 promoted_count += 1;
                 eprintln!("[ralph] triager: promote {}", d.nit_id);
             }
@@ -622,14 +632,32 @@ pub async fn triage_open_nits(
         }
     }
 
-    // Materialize promoted nits as tasks
+    // Materialize promoted nits as tasks, then update each nit's promoted_to field.
     if !proposals.is_empty() {
         match materialize_proposed_tasks(&proposals, conn, "triager") {
-            Ok(added) => {
+            Ok(task_ids) => {
+                let added = task_ids.iter().filter(|id| id.is_some()).count();
                 eprintln!("[ralph] triager created {added} task(s)");
+                for (nit_id, task_id_opt) in promoted_nit_ids.iter().zip(task_ids.iter()) {
+                    db::update_nit_status(
+                        conn,
+                        nit_id,
+                        crate::nit::NitStatus::Promoted,
+                        task_id_opt.as_deref(),
+                    )?;
+                }
             }
             Err(e) => {
                 eprintln!("[ralph] failed to materialize triager tasks: {e}");
+                // Still mark nits as promoted even if materialization failed.
+                for nit_id in &promoted_nit_ids {
+                    db::update_nit_status(
+                        conn,
+                        nit_id,
+                        crate::nit::NitStatus::Promoted,
+                        None,
+                    )?;
+                }
             }
         }
     }
