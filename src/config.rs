@@ -4,59 +4,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "RawWorkspaceConfig")]
-pub struct WorkspaceConfig {
-    /// Paths to symlink from project root into each workspace
-    pub shared: Vec<String>,
-    /// Environment variables to isolate per workspace.
-    /// Each entry maps an env var name to a subdirectory
-    /// (e.g. `CARGO_TARGET_DIR` → `"target"`).
-    pub isolate_env: HashMap<String, String>,
-}
-
-/// Raw deserialization helper that supports both the legacy
-/// `isolate_target_dir` bool and the new `isolate_env` map.
-#[derive(Deserialize)]
-struct RawWorkspaceConfig {
-    #[serde(default)]
-    shared: Vec<String>,
-    #[serde(default = "default_isolate_target_dir")]
-    isolate_target_dir: bool,
-    isolate_env: Option<HashMap<String, String>>,
-}
-
-fn default_isolate_target_dir() -> bool {
-    true
-}
-
-fn default_isolate_env() -> HashMap<String, String> {
-    HashMap::from([("CARGO_TARGET_DIR".to_string(), "target".to_string())])
-}
-
-impl From<RawWorkspaceConfig> for WorkspaceConfig {
-    fn from(raw: RawWorkspaceConfig) -> Self {
-        let isolate_env = match raw.isolate_env {
-            Some(map) => map,
-            None if raw.isolate_target_dir => default_isolate_env(),
-            None => HashMap::new(),
-        };
-        Self {
-            shared: raw.shared,
-            isolate_env,
-        }
-    }
-}
-
-impl Default for WorkspaceConfig {
-    fn default() -> Self {
-        Self {
-            shared: Vec::new(),
-            isolate_env: default_isolate_env(),
-        }
-    }
-}
-
 /// Per-role model configuration. All fields are required — deserialization
 /// fails if any role is missing from the `[models]` section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,9 +53,6 @@ pub struct Config {
     /// Directory containing prompt templates
     #[serde(default = "default_prompts_dir")]
     pub prompts_dir: PathBuf,
-    /// Workspace isolation settings
-    #[serde(default)]
-    pub workspace: WorkspaceConfig,
     /// Environment variable forwarding and override configuration
     #[serde(default)]
     pub env: EnvConfig,
@@ -202,7 +146,6 @@ impl Default for Config {
             agent_timeout_secs: default_agent_timeout_secs(),
             agent_idle_timeout_secs: default_agent_idle_timeout_secs(),
             prompts_dir: default_prompts_dir(),
-            workspace: WorkspaceConfig::default(),
             env: EnvConfig::default(),
             kill_grace_secs: default_kill_grace_secs(),
             max_cost_usd: None,
@@ -340,87 +283,6 @@ reviewer = "opus"
     fn kill_grace_secs_defaults_to_5() {
         let config: Config = toml::from_str(MODELS_TOML).unwrap();
         assert_eq!(config.kill_grace_secs, 5);
-    }
-
-    #[test]
-    fn isolate_env_defaults_to_cargo_target() {
-        let config: Config = toml::from_str(MODELS_TOML).unwrap();
-        assert_eq!(
-            config
-                .workspace
-                .isolate_env
-                .get("CARGO_TARGET_DIR")
-                .map(|s| s.as_str()),
-            Some("target")
-        );
-    }
-
-    #[test]
-    fn isolate_env_from_legacy_false() {
-        let toml_str = format!(
-            "{MODELS_TOML}\n[workspace]\nisolate_target_dir = false\n"
-        );
-        let config: Config = toml::from_str(&toml_str).unwrap();
-        assert!(config.workspace.isolate_env.is_empty());
-    }
-
-    #[test]
-    fn isolate_env_explicit() {
-        let toml_str = format!(
-            "{MODELS_TOML}\n[workspace.isolate_env]\nCARGO_TARGET_DIR = \"target\"\nGOPATH = \".gopath\"\n"
-        );
-        let config: Config = toml::from_str(&toml_str).unwrap();
-        assert_eq!(config.workspace.isolate_env.len(), 2);
-        assert_eq!(
-            config
-                .workspace
-                .isolate_env
-                .get("CARGO_TARGET_DIR")
-                .map(|s| s.as_str()),
-            Some("target")
-        );
-        assert_eq!(
-            config
-                .workspace
-                .isolate_env
-                .get("GOPATH")
-                .map(|s| s.as_str()),
-            Some(".gopath")
-        );
-    }
-
-    #[test]
-    fn isolate_env_wins_over_legacy() {
-        let toml_str = format!(
-            "{MODELS_TOML}\n[workspace]\nisolate_target_dir = true\n\n[workspace.isolate_env]\nGOPATH = \".gopath\"\n"
-        );
-        let config: Config = toml::from_str(&toml_str).unwrap();
-        // isolate_env takes precedence — no CARGO_TARGET_DIR
-        assert_eq!(config.workspace.isolate_env.len(), 1);
-        assert_eq!(
-            config
-                .workspace
-                .isolate_env
-                .get("GOPATH")
-                .map(|s| s.as_str()),
-            Some(".gopath")
-        );
-    }
-
-    #[test]
-    fn isolate_env_legacy_true() {
-        let toml_str = format!(
-            "{MODELS_TOML}\n[workspace]\nisolate_target_dir = true\n"
-        );
-        let config: Config = toml::from_str(&toml_str).unwrap();
-        assert_eq!(
-            config
-                .workspace
-                .isolate_env
-                .get("CARGO_TARGET_DIR")
-                .map(|s| s.as_str()),
-            Some("target")
-        );
     }
 
     #[test]

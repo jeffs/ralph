@@ -39,6 +39,11 @@ pub fn ready_tasks<'a>(tasks: &'a [Task], config: &Config) -> Vec<&'a Task> {
 /// overlap must be serialized. Tasks with no file history
 /// (first attempt) are placed in their own singleton group
 /// to establish their footprint.
+///
+/// Not currently used by the orchestrator (implementers run
+/// serially), but retained for future parallel strategies
+/// that don't require workspace isolation.
+#[cfg(test)]
 pub fn partition_independent<'a>(ready: &[&'a Task]) -> Vec<Vec<&'a Task>> {
     let mut groups: Vec<Vec<&'a Task>> = Vec::new();
 

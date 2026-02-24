@@ -17,7 +17,7 @@ agent to write code, a **Tester** agent to run the test suite, and a
 **Reviewer** agent to check correctness. If testing or review fails, the
 failure feedback is forwarded to the implementer and the task retries (up
 to a configurable limit). When all tasks reach Done, a final review runs.
-Ralph commits progress to Jujutsu (`jj`) after each group of tasks.
+Ralph commits progress to Jujutsu (`jj`) after each task.
 
 ## Architecture
 
@@ -53,7 +53,7 @@ Ralph commits progress to Jujutsu (`jj`) after each group of tasks.
 | `config.rs`     | TOML configuration loading and defaults                |
 | `agent.rs`      | Agent invocation, process management, status parsing   |
 | `scheduler.rs`  | Dependency resolution, parallel partitioning           |
-| `orchestrator.rs`| Main loop, workspace management, checkpointing        |
+| `orchestrator.rs`| Main loop, checkpointing                              |
 
 ## Task format
 
@@ -166,38 +166,25 @@ Each iteration:
 
 1. Load tasks and state
 2. If all tasks are Done → run a **final review** of the entire diff
-3. Resume any in-flight tasks (stuck at Testing or Reviewing)
+3. Recover any tasks stuck in transient phases from a prior crash
 4. Find Pending tasks whose dependencies are satisfied
-5. Partition ready tasks into parallel groups (file-disjoint sets)
-6. Execute each group:
-   - **Singleton** (1 task): runs in the default working copy
-   - **Multi-task**: each task gets its own `jj workspace`; on success,
-     changes are squashed back into the default workspace
-7. Run testers and reviewers for completed implementations
-8. Commit progress with `jj commit`
-9. Repeat until convergence, stagnation, or iteration cap
+5. Execute each ready task through its full lifecycle serially:
+   - **Implement** → **Test** → **Review** → Done (or reset to Pending)
+   - Commit progress with `jj commit` after each task
+6. Repeat until convergence, stagnation, or iteration cap
+
+Each task completes its full implement → test → review lifecycle
+before the next task starts. This ensures later tasks build on
+verified work, not quicksand.
 
 The loop detects **stagnation** (all remaining tasks have failed) and
 **dependency deadlocks** (nothing is ready but nothing has failed).
 
 ## Parallelism
 
-- **Implementers** run in parallel when their file sets are disjoint
-  (based on files touched in prior attempts). First-attempt tasks run
-  alone to establish their file footprint.
-- **Testers** run in parallel when their file sets are disjoint.
-- **Reviewers** always run in parallel (read-only).
-
-Multi-task parallel groups use jj workspace isolation:
-
-```
-.ralph/ws-T1/     ← jj workspace "ralph-T1"
-.ralph/ws-T2/     ← jj workspace "ralph-T2"
-```
-
-Shared files (e.g. `Cargo.lock`) are symlinked from the project root.
-Each workspace can optionally get its own `CARGO_TARGET_DIR` to avoid
-cargo lock contention (`workspace.isolate_target_dir = true`, the default).
+Execution is fully serial: one agent runs at a time. This trades
+throughput for correctness — each task is verified before the next
+begins, so later tasks can build on proven changes.
 
 ## Version control integration (Jujutsu)
 
@@ -206,9 +193,8 @@ Ralph uses **Jujutsu (`jj`)** exclusively — never Git commands.
 - **Agents must never run** `jj commit`, `jj new`, or any state-changing
   jj command. Ralph handles all version control.
 - On startup, Ralph isolates any pre-existing dirty files with `jj new`.
-- After each task group, Ralph commits with a descriptive message like
-  `ralph: T1 (done), T2 (testing)`.
-- Stale workspaces from interrupted runs are cleaned up automatically.
+- After each task, Ralph commits with a descriptive message like
+  `ralph: T1 (testing)`.
 - File attribution uses `jj diff --summary` to track which files each
   task modified.
 
@@ -244,11 +230,6 @@ max_triage_rounds = 3
 
 # Directory containing prompt templates
 prompts_dir = "prompts"
-
-# Workspace settings
-[workspace]
-shared = ["Cargo.lock"]           # Symlinked into per-task workspaces
-isolate_target_dir = true         # Separate CARGO_TARGET_DIR per workspace
 
 # Environment variables forwarded to agents
 [env]
@@ -374,7 +355,7 @@ repo) respect the orchestration protocol.
 .ralph/
   config.toml       # Orchestration settings
   ralph.db          # SQLite database: tasks, execution state, archive, nits
-  ws-<task_id>/     # Temporary jj workspaces (auto-cleaned)
+  logs/             # Agent response logs (one file per invocation)
   .gitignore        # Contains "*" — nothing in .ralph/ is committed
 ```
 

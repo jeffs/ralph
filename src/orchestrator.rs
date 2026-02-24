@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use tokio::process::Command as TokioCommand;
 
@@ -34,8 +34,6 @@ pub(crate) fn spawn_signal_handler(registry: ProcessRegistry) {
         registry.kill_all().await;
     });
 }
-
-const WS_DIR: &str = ".ralph";
 
 /// Determine the post-failure phase. Returns Failed if the
 /// attempt budget is exhausted, otherwise Pending for retry.
@@ -240,7 +238,6 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
     let registry = ProcessRegistry::new(config.kill_grace_secs);
     spawn_signal_handler(registry.clone());
     isolate_dirty_tree().await;
-    cleanup_stale_workspaces().await;
     let mut cumulative_cost: f64 = 0.0;
     let mut triage_rounds: u32 = 0;
 
@@ -278,7 +275,6 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
                     diff: final_diff,
                 },
                 config,
-                None,
                 &registry,
                 0,
             )
@@ -383,16 +379,9 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
         let tasks = db::list_active_tasks(conn)?;
         db::validate_deps(conn)?;
 
-        // Resume interrupted in-flight tasks before
-        // scheduling new work.
-        let made_progress = resume_inflight(
-            &tasks,
-            conn,
-            config,
-            &registry,
-            &mut cumulative_cost,
-        )
-        .await?;
+        // Reset any tasks stuck in transient phases from a
+        // prior interrupted run.
+        let made_progress = recover_interrupted(&tasks, conn)?;
         if registry.is_shutdown() {
             eprintln!("[ralph] shutdown requested.");
             return Ok(());
@@ -433,31 +422,18 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
 
         eprintln!("[ralph] {} task(s) ready", ready.len());
 
-        // Partition into parallelizable groups
-        let groups = scheduler::partition_independent(&ready);
-
-        for group in groups {
-            let use_workspaces = group.len() > 1;
-
-            if use_workspaces {
-                run_group_with_workspaces(
-                    &group,
-                    conn,
-                    config,
-                    &registry,
-                    &mut cumulative_cost,
-                )
-                .await?;
-            } else {
-                run_group_singleton(
-                    &group,
-                    conn,
-                    config,
-                    &registry,
-                    &mut cumulative_cost,
-                )
-                .await?;
-            }
+        // Run each task through its full lifecycle serially.
+        // Each task completes implement → test → review before
+        // the next one starts, so later tasks build on verified work.
+        for task in &ready {
+            run_task(
+                task,
+                conn,
+                config,
+                &registry,
+                &mut cumulative_cost,
+            )
+            .await?;
 
             if config.max_cost_usd.is_some_and(|max| cumulative_cost > max) {
                 eprintln!(
@@ -472,27 +448,8 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
                 return Ok(());
             }
 
-            // Reload tasks from db to see updated phases,
-            // then advance any tasks now at Testing/Reviewing.
-            let fresh_tasks = db::list_active_tasks(conn)?;
-            resume_inflight(
-                &fresh_tasks,
-                conn,
-                config,
-                &registry,
-                &mut cumulative_cost,
-            )
-            .await?;
-
-            if registry.is_shutdown() {
-                eprintln!("[ralph] shutdown requested.");
-                return Ok(());
-            }
-
-            // Checkpoint: seal the current working-copy change
-            // and start a fresh one for the next group.
-            let group_ids: Vec<String> = group.iter().map(|t| t.id.clone()).collect();
-            let detail = checkpoint_description(&group_ids, conn);
+            // Checkpoint after each task's full lifecycle.
+            let detail = checkpoint_description(&[task.id.clone()], conn);
             if let Err(e) = jj_checkpoint(&detail).await {
                 eprintln!("[ralph] jj commit skipped: {e}");
             }
@@ -564,7 +521,7 @@ pub async fn triage_open_nits(
         .join("\n");
 
     let ctx = AgentContext::triage(nits_json, tasks_summary);
-    let result = agent::invoke_agent(AgentRole::Triager, &ctx, config, None, registry, 0).await?;
+    let result = agent::invoke_agent(AgentRole::Triager, &ctx, config, registry, 0).await?;
 
     *cumulative_cost += result.cost_usd.unwrap_or(0.0);
 
@@ -665,236 +622,23 @@ pub async fn triage_open_nits(
     Ok(promoted_count)
 }
 
-/// Group tasks by disjoint file sets for parallel execution.
-/// Tasks with overlapping files_changed are placed in the same group
-/// to avoid parallel work on the same files.
-fn group_by_disjoint_files<'a>(tasks: &[&'a Task]) -> Vec<Vec<&'a Task>> {
-    let mut groups: Vec<(HashSet<PathBuf>, Vec<&'a Task>)> = Vec::new();
-
-    for &task in tasks {
-        let files: HashSet<PathBuf> = task.files_changed.iter().cloned().collect();
-
-        let mut merged = false;
-        for (group_files, group_tasks) in &mut groups {
-            if files.is_disjoint(group_files) {
-                group_files.extend(files.iter().cloned());
-                group_tasks.push(task);
-                merged = true;
-                break;
-            }
-        }
-        if !merged {
-            groups.push((files, vec![task]));
-        }
-    }
-
-    groups.into_iter().map(|(_, tasks)| tasks).collect()
-}
-
-/// Advance all tasks stuck at Testing or Reviewing.
-/// Returns true if any task moved forward.
-///
-/// Testing tasks with disjoint file sets run in parallel.
-/// Reviewing tasks always run in parallel (read-only).
-async fn resume_inflight(
-    tasks: &[Task],
-    conn: &Connection,
-    config: &Config,
-    registry: &ProcessRegistry,
-    cumulative_cost: &mut f64,
-) -> Result<bool> {
+/// Reset any tasks stuck in transient phases from a prior
+/// interrupted run. Returns true if any task was reset.
+fn recover_interrupted(tasks: &[Task], conn: &Connection) -> Result<bool> {
     let mut progressed = false;
 
-    // Implementing phase → task was mid-implementation when Ralph
-    // restarted. Reset to Pending so the scheduler picks it up again.
-    let implementing: Vec<&Task> = tasks
-        .iter()
-        .filter(|t| t.phase == Phase::Implementing)
-        .collect();
-    for t in implementing {
-        eprintln!("[ralph] {} stuck in Implementing, resetting to Pending", t.id);
-        db::update_phase(conn, &t.id, Phase::Pending, unix_now())?;
-        progressed = true;
-    }
-
-    // Testing phase → run tester (parallel for disjoint file sets)
-    let testing: Vec<&Task> = tasks
-        .iter()
-        .filter(|t| t.phase == Phase::Testing)
-        .collect();
-
-    let test_groups = group_by_disjoint_files(&testing);
-    for group in test_groups {
-        let mut handles = Vec::new();
-        for t in &group {
-            let files = t.files_changed.clone();
-            let ctx = AgentContext::test(&t.id, &t.title, &t.description, files);
-            let cfg = config.clone();
-            let reg = registry.clone();
-            let id_owned = t.id.clone();
-            handles.push(tokio::spawn(async move {
-                let result =
-                    agent::invoke_agent(AgentRole::Tester, &ctx, &cfg, None, &reg, 0).await;
-                (id_owned, result)
-            }));
-        }
-
-        for handle in handles {
-            let (id, result) = handle.await?;
-            eprintln!("[ralph] resuming test for {id}...");
-            let attempts = tasks.iter().find(|t| t.id == id).map_or(0, |t| t.attempts);
-            match result {
-                Ok(r) => {
-                    *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
-                        && let Err(e) = record_nit(conn, &id, "tester", attempts, suggestions)
-                    {
-                        eprintln!("[ralph] failed to record nit: {e}");
-                    }
-                    // Ingest any new tasks proposed by the tester.
-                    if let Err(e) = ingest_new_tasks(&r, conn, &format!("tester/{id}")) {
-                        eprintln!("[ralph] failed to ingest new tasks from tester: {e}");
-                    }
-                    match r.status {
-                        AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
-                            db::update_phase(conn, &id, Phase::Reviewing, unix_now())?;
-                            db::update_last_error(conn, &id, None)?;
-                            progressed = true;
-                        }
-                        AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                            push_feedback(conn, &id, "Tester", attempts, &r.text, &r.stderr_lines)?;
-                            let new_phase = reset_or_fail_phase(attempts, config);
-                            db::update_phase(conn, &id, new_phase, unix_now())?;
-                            db::update_last_error(conn, &id, Some(&reason))?;
-                            progressed = true;
-                            eprintln!("[ralph] {id} tests failed: {reason}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    push_feedback(conn, &id, "Tester", attempts, &e.to_string(), &[])?;
-                    let new_phase = reset_or_fail_phase(attempts, config);
-                    db::update_phase(conn, &id, new_phase, unix_now())?;
-                    db::update_last_error(conn, &id, Some(&e.to_string()))?;
-                    progressed = true;
-                    eprintln!("[ralph] tester error for {id}: {e}");
-                }
-            }
-            if config
-                .max_cost_usd
-                .is_some_and(|max| *cumulative_cost > max)
-            {
-                eprintln!(
-                    "[ralph] cost budget exceeded (${:.4} > ${:.4}), stopping.",
-                    *cumulative_cost,
-                    config.max_cost_usd.unwrap()
-                );
-                return Ok(progressed);
-            }
-        }
-    }
-
-    // Reviewing phase → run reviewer (always parallel — read-only)
-    let reviewing: Vec<&Task> = tasks
-        .iter()
-        .filter(|t| t.phase == Phase::Reviewing)
-        .collect();
-
-    if !reviewing.is_empty() {
-        // Compute diff once for all reviewers.
-        let diff = agent::jj_diff_git().await.unwrap_or_default();
-
-        let mut handles = Vec::new();
-        for t in &reviewing {
-            let diff_summary = t
-                .files_changed
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let ctx = AgentContext::review(
-                &t.id,
-                &t.title,
-                &t.description,
-                diff_summary,
-                diff.clone(),
+    for t in tasks {
+        let reset = match t.phase {
+            Phase::Implementing | Phase::Testing | Phase::Reviewing => true,
+            _ => false,
+        };
+        if reset {
+            eprintln!(
+                "[ralph] {} stuck in {:?}, resetting to Pending",
+                t.id, t.phase
             );
-            let cfg = config.clone();
-            let reg = registry.clone();
-            let id_owned = t.id.clone();
-            handles.push(tokio::spawn(async move {
-                let result =
-                    agent::invoke_agent(AgentRole::Reviewer, &ctx, &cfg, None, &reg, 0).await;
-                (id_owned, result)
-            }));
-        }
-
-        for handle in handles {
-            let (id, result) = handle.await?;
-            eprintln!("[ralph] resuming review for {id}...");
-            let attempts = tasks.iter().find(|t| t.id == id).map_or(0, |t| t.attempts);
-            match result {
-                Ok(r) => {
-                    *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
-                        && let Err(e) = record_nit(conn, &id, "reviewer", attempts, suggestions)
-                    {
-                        eprintln!("[ralph] failed to record nit: {e}");
-                    }
-                    // Ingest any new tasks proposed by the reviewer.
-                    if let Err(e) = ingest_new_tasks(&r, conn, &format!("reviewer/{id}")) {
-                        eprintln!("[ralph] failed to ingest new tasks from reviewer: {e}");
-                    }
-                    match r.status {
-                        AgentStatus::Success => {
-                            db::update_phase(conn, &id, Phase::Done, unix_now())?;
-                            db::update_last_error(conn, &id, None)?;
-                            progressed = true;
-                            eprintln!("[ralph] {id} — done!");
-                        }
-                        AgentStatus::ApprovedWithNits { .. } => {
-                            db::update_phase(conn, &id, Phase::Done, unix_now())?;
-                            db::update_last_error(conn, &id, None)?;
-                            progressed = true;
-                            eprintln!("[ralph] {id} — done (with nits)");
-                        }
-                        AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                            push_feedback(
-                                conn,
-                                &id,
-                                "Reviewer",
-                                attempts,
-                                &r.text,
-                                &r.stderr_lines,
-                            )?;
-                            let new_phase = reset_or_fail_phase(attempts, config);
-                            db::update_phase(conn, &id, new_phase, unix_now())?;
-                            db::update_last_error(conn, &id, Some(&reason))?;
-                            progressed = true;
-                            eprintln!("[ralph] {id} review issues: {reason}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    push_feedback(conn, &id, "Reviewer", attempts, &e.to_string(), &[])?;
-                    let new_phase = reset_or_fail_phase(attempts, config);
-                    db::update_phase(conn, &id, new_phase, unix_now())?;
-                    db::update_last_error(conn, &id, Some(&e.to_string()))?;
-                    progressed = true;
-                    eprintln!("[ralph] reviewer error for {id}: {e}");
-                }
-            }
-            if config
-                .max_cost_usd
-                .is_some_and(|max| *cumulative_cost > max)
-            {
-                eprintln!(
-                    "[ralph] cost budget exceeded (${:.4} > ${:.4}), stopping.",
-                    *cumulative_cost,
-                    config.max_cost_usd.unwrap()
-                );
-                return Ok(progressed);
-            }
+            db::update_phase(conn, &t.id, Phase::Pending, unix_now())?;
+            progressed = true;
         }
     }
 
@@ -958,274 +702,17 @@ async fn isolate_dirty_tree() {
     }
 }
 
-// ── Workspace management ──────────────────────────────────
-
-/// Remove any `ralph-*` workspaces left over from interrupted
-/// runs. Parses `jj workspace list` and forgets/removes each.
-async fn cleanup_stale_workspaces() {
-    let Ok(output) = TokioCommand::new("jj")
-        .args(["workspace", "list"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-    else {
-        return;
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        // Format: "workspace-name: <change-id> <description>"
-        let Some(name) = line.split(':').next().map(str::trim) else {
-            continue;
-        };
-        if !name.starts_with("ralph-") {
-            continue;
-        }
-        eprintln!("[ralph] cleaning up stale workspace {name}");
-        let _ = TokioCommand::new("jj")
-            .args(["workspace", "forget", name])
-            .status()
-            .await;
-        let ws_dir = PathBuf::from(WS_DIR).join(format!("ws-{}", &name["ralph-".len()..]));
-        if ws_dir.exists() {
-            let _ = tokio::fs::remove_dir_all(&ws_dir).await;
-        }
-    }
-}
-
-/// Create a jj workspace for a task. Returns the workspace
-/// directory path. Symlinks `config.workspace.shared` entries
-/// from the project root.
-async fn create_workspace(task_id: &str, config: &Config) -> Result<PathBuf> {
-    let ws_name = format!("ralph-{task_id}");
-    let ws_dir = PathBuf::from(WS_DIR).join(format!("ws-{task_id}"));
-
-    let status = TokioCommand::new("jj")
-        .args([
-            "workspace",
-            "add",
-            &ws_dir.to_string_lossy(),
-            "--name",
-            &ws_name,
-        ])
-        .status()
-        .await
-        .context("jj workspace add")?;
-
-    if !status.success() {
-        bail!("jj workspace add failed for {ws_name}");
-    }
-
-    // Symlink shared paths from the project root
-    let project_root = std::env::current_dir().context("getting project root")?;
-    for shared in &config.workspace.shared {
-        let src = project_root.join(shared);
-        let dst = ws_dir.join(shared);
-        if src.exists() {
-            // Ensure parent dirs exist
-            if let Some(parent) = dst.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            // Remove existing entry if any (workspace add may
-            // have checked out the file)
-            let _ = tokio::fs::remove_file(&dst).await;
-            let _ = tokio::fs::remove_dir_all(&dst).await;
-            tokio::fs::symlink(&src, &dst)
-                .await
-                .with_context(|| format!("symlinking {} → {}", src.display(), dst.display()))?;
-        }
-    }
-
-    let abs = tokio::fs::canonicalize(&ws_dir)
-        .await
-        .unwrap_or_else(|_| project_root.join(&ws_dir));
-    Ok(abs)
-}
-
-/// Tear down a workspace: forget it and optionally abandon its
-/// changes, then remove the directory.
-async fn teardown_workspace(task_id: &str, abandon: bool) {
-    let ws_name = format!("ralph-{task_id}");
-    if abandon {
-        let _ = TokioCommand::new("jj")
-            .args(["abandon", &format!("{ws_name}@")])
-            .status()
-            .await;
-    }
-    let _ = TokioCommand::new("jj")
-        .args(["workspace", "forget", &ws_name])
-        .status()
-        .await;
-    let ws_dir = PathBuf::from(WS_DIR).join(format!("ws-{task_id}"));
-    if ws_dir.exists() {
-        let _ = tokio::fs::remove_dir_all(&ws_dir).await;
-    }
-}
-
-// ── Group execution strategies ────────────────────────────
-
-/// Run a multi-task group with per-task jj workspaces for
-/// isolation. Each agent gets its own working copy; after
-/// completion, successful changes are squashed back into the
-/// default workspace.
-async fn run_group_with_workspaces(
-    group: &[&Task],
+/// Run a single task through its full lifecycle:
+/// implement → test → review. Returns early if any phase
+/// fails (task is reset to Pending or marked Failed).
+async fn run_task(
+    t: &Task,
     conn: &Connection,
     config: &Config,
     registry: &ProcessRegistry,
     cumulative_cost: &mut f64,
 ) -> Result<()> {
-    // Create workspaces and spawn agents
-    let mut handles = Vec::new();
-    let mut created_ws: Vec<String> = Vec::new();
-
-    for &t in group {
-        let ws_path = match create_workspace(&t.id, config).await {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[ralph] workspace creation failed for {}: {e}", t.id);
-                db::update_attempts(conn, &t.id, t.attempts + 1)?;
-                let new_phase = reset_or_fail_phase(t.attempts + 1, config);
-                db::update_phase(conn, &t.id, new_phase, unix_now())?;
-                db::update_last_error(
-                    conn,
-                    &t.id,
-                    Some(&format!("workspace creation: {e}")),
-                )?;
-                continue;
-            }
-        };
-        created_ws.push(t.id.clone());
-
-        db::update_phase(conn, &t.id, Phase::Implementing, unix_now())?;
-
-        let id = t.id.clone();
-        let title = t.title.clone();
-        let desc = t.description.clone();
-        let guidance = build_guidance(&t.guidance);
-        let guidance = if guidance.is_empty() {
-            None
-        } else {
-            Some(guidance)
-        };
-        let fb = build_feedback_history(&t.feedback, FEEDBACK_MAX_LEN);
-        let fb = if fb.is_empty() { None } else { Some(fb) };
-        let attempt = t.attempts + 1;
-        let cfg = config.clone();
-        let reg = registry.clone();
-        handles.push(tokio::spawn(async move {
-            let ctx =
-                AgentContext::implement(&id, &title, &desc, guidance.as_deref(), fb.as_deref());
-            let result = agent::invoke_agent(
-                AgentRole::Implementer,
-                &ctx,
-                &cfg,
-                Some(&ws_path),
-                &reg,
-                attempt,
-            )
-            .await;
-            (id, result)
-        }));
-    }
-
-    // Collect results
-    struct Outcome {
-        id: String,
-        success: bool,
-    }
-    let mut outcomes = Vec::new();
-
-    for handle in handles {
-        let (id, result) = handle.await?;
-        let task = group.iter().find(|t| t.id == id);
-        let prev_attempts = task.map_or(0, |t| t.attempts);
-        let new_attempts = prev_attempts + 1;
-        db::update_attempts(conn, &id, new_attempts)?;
-
-        let success = match result {
-            Ok(r) => {
-                *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-                if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
-                    && let Err(e) = record_nit(conn, &id, "implementer", new_attempts, suggestions)
-                {
-                    eprintln!("[ralph] failed to record nit: {e}");
-                }
-                // Ingest any new tasks proposed by the implementer.
-                if let Err(e) = ingest_new_tasks(&r, conn, &format!("implementer/{id}")) {
-                    eprintln!("[ralph] failed to ingest new tasks from implementer: {e}");
-                }
-                match &r.status {
-                    AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
-                        db::update_phase(conn, &id, Phase::Testing, unix_now())?;
-                        db::update_last_error(conn, &id, None)?;
-                        true
-                    }
-                    AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                        let new_phase = reset_or_fail_phase(new_attempts, config);
-                        db::update_phase(conn, &id, new_phase, unix_now())?;
-                        db::update_last_error(conn, &id, Some(reason))?;
-                        eprintln!("[ralph] {id} implement failed: {reason}");
-                        false
-                    }
-                }
-            }
-            Err(e) => {
-                let new_phase = reset_or_fail_phase(new_attempts, config);
-                db::update_phase(conn, &id, new_phase, unix_now())?;
-                db::update_last_error(conn, &id, Some(&e.to_string()))?;
-                eprintln!("[ralph] agent error for {id}: {e}");
-                false
-            }
-        };
-        outcomes.push(Outcome { id, success });
-    }
-
-    // Merge successful workspaces, abandon failed ones.
-    // Always capture files_changed (even on failure) for diagnostics.
-    for outcome in &outcomes {
-        if !created_ws.contains(&outcome.id) {
-            continue;
-        }
-
-        // Attribute files from the workspace, regardless of outcome.
-        let rev = format!("ralph-{}@", outcome.id);
-        let files = agent::jj_changed_files_for(&rev).await.unwrap_or_default();
-        let task = group.iter().find(|t| t.id == outcome.id);
-        let mut all_files = task.map(|t| t.files_changed.clone()).unwrap_or_default();
-        all_files.extend(files);
-        all_files.sort();
-        all_files.dedup();
-        db::update_files_changed(conn, &outcome.id, &all_files)?;
-
-        if outcome.success {
-            // Squash workspace changes into default working copy
-            let squash_status = TokioCommand::new("jj")
-                .args(["squash", "--from", &rev, "--into", "@"])
-                .status()
-                .await;
-            if let Err(e) = squash_status {
-                eprintln!("[ralph] squash failed for {}: {e}", outcome.id);
-            }
-            teardown_workspace(&outcome.id, false).await;
-        } else {
-            teardown_workspace(&outcome.id, true).await;
-        }
-    }
-
-    Ok(())
-}
-
-/// Run a singleton group directly in the default workspace
-/// (no workspace overhead).
-async fn run_group_singleton(
-    group: &[&Task],
-    conn: &Connection,
-    config: &Config,
-    registry: &ProcessRegistry,
-    cumulative_cost: &mut f64,
-) -> Result<()> {
-    let t = group[0];
+    // ── Implement ──────────────────────────────────────────
     let pre_files = agent::jj_changed_files().await.unwrap_or_default();
 
     db::update_phase(conn, &t.id, Phase::Implementing, unix_now())?;
@@ -1254,7 +741,6 @@ async fn run_group_singleton(
         AgentRole::Implementer,
         &ctx,
         config,
-        None,
         registry,
         attempt,
     )
@@ -1262,7 +748,8 @@ async fn run_group_singleton(
 
     let new_attempts = t.attempts + 1;
     db::update_attempts(conn, &t.id, new_attempts)?;
-    match result {
+
+    let impl_ok = match result {
         Ok(r) => {
             *cumulative_cost += r.cost_usd.unwrap_or(0.0);
             if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
@@ -1270,20 +757,21 @@ async fn run_group_singleton(
             {
                 eprintln!("[ralph] failed to record nit: {e}");
             }
-            // Ingest any new tasks proposed by the implementer.
             if let Err(e) = ingest_new_tasks(&r, conn, &format!("implementer/{}", t.id)) {
                 eprintln!("[ralph] failed to ingest new tasks from implementer: {e}");
             }
             match &r.status {
                 AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
-                    db::update_phase(conn, &t.id, Phase::Testing, unix_now())?;
                     db::update_last_error(conn, &t.id, None)?;
+                    true
                 }
                 AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                    push_feedback(conn, &t.id, "Implementer", new_attempts, &r.text, &r.stderr_lines)?;
                     let new_phase = reset_or_fail_phase(new_attempts, config);
                     db::update_phase(conn, &t.id, new_phase, unix_now())?;
                     db::update_last_error(conn, &t.id, Some(reason))?;
                     eprintln!("[ralph] {} implement failed: {reason}", t.id);
+                    false
                 }
             }
         }
@@ -1292,22 +780,119 @@ async fn run_group_singleton(
             db::update_phase(conn, &t.id, new_phase, unix_now())?;
             db::update_last_error(conn, &t.id, Some(&e.to_string()))?;
             eprintln!("[ralph] agent error for {}: {e}", t.id);
+            false
         }
-    }
+    };
 
     // Attribute files via pre/post snapshot (even on failure,
     // so diagnostics can see what the agent changed).
-    {
-        let post_files = agent::jj_changed_files().await.unwrap_or_default();
-        let new_files: Vec<PathBuf> = post_files
-            .into_iter()
-            .filter(|f| !pre_files.contains(f))
-            .collect();
-        let mut all_files = t.files_changed.clone();
-        all_files.extend(new_files);
-        all_files.sort();
-        all_files.dedup();
-        db::update_files_changed(conn, &t.id, &all_files)?;
+    let post_files = agent::jj_changed_files().await.unwrap_or_default();
+    let new_files: Vec<PathBuf> = post_files
+        .into_iter()
+        .filter(|f| !pre_files.contains(f))
+        .collect();
+    let mut all_files = t.files_changed.clone();
+    all_files.extend(new_files);
+    all_files.sort();
+    all_files.dedup();
+    db::update_files_changed(conn, &t.id, &all_files)?;
+
+    if !impl_ok || registry.is_shutdown() {
+        return Ok(());
+    }
+
+    // ── Test ───────────────────────────────────────────────
+    db::update_phase(conn, &t.id, Phase::Testing, unix_now())?;
+
+    let files = all_files;
+    let ctx = AgentContext::test(&t.id, &t.title, &t.description, files.clone());
+    let test_result = agent::invoke_agent(AgentRole::Tester, &ctx, config, registry, 0).await;
+
+    let test_ok = match test_result {
+        Ok(r) => {
+            *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+            if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                && let Err(e) = record_nit(conn, &t.id, "tester", new_attempts, suggestions)
+            {
+                eprintln!("[ralph] failed to record nit: {e}");
+            }
+            if let Err(e) = ingest_new_tasks(&r, conn, &format!("tester/{}", t.id)) {
+                eprintln!("[ralph] failed to ingest new tasks from tester: {e}");
+            }
+            match r.status {
+                AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
+                    db::update_last_error(conn, &t.id, None)?;
+                    true
+                }
+                AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                    push_feedback(conn, &t.id, "Tester", new_attempts, &r.text, &r.stderr_lines)?;
+                    let new_phase = reset_or_fail_phase(new_attempts, config);
+                    db::update_phase(conn, &t.id, new_phase, unix_now())?;
+                    db::update_last_error(conn, &t.id, Some(&reason))?;
+                    eprintln!("[ralph] {} tests failed: {reason}", t.id);
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            push_feedback(conn, &t.id, "Tester", new_attempts, &e.to_string(), &[])?;
+            let new_phase = reset_or_fail_phase(new_attempts, config);
+            db::update_phase(conn, &t.id, new_phase, unix_now())?;
+            db::update_last_error(conn, &t.id, Some(&e.to_string()))?;
+            eprintln!("[ralph] tester error for {}: {e}", t.id);
+            false
+        }
+    };
+
+    if !test_ok || registry.is_shutdown() {
+        return Ok(());
+    }
+
+    // ── Review ─────────────────────────────────────────────
+    db::update_phase(conn, &t.id, Phase::Reviewing, unix_now())?;
+
+    let diff = agent::jj_diff_git().await.unwrap_or_default();
+    let diff_summary = files
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ctx = AgentContext::review(&t.id, &t.title, &t.description, diff_summary, diff);
+    let review_result = agent::invoke_agent(AgentRole::Reviewer, &ctx, config, registry, 0).await;
+
+    match review_result {
+        Ok(r) => {
+            *cumulative_cost += r.cost_usd.unwrap_or(0.0);
+            if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                && let Err(e) = record_nit(conn, &t.id, "reviewer", new_attempts, suggestions)
+            {
+                eprintln!("[ralph] failed to record nit: {e}");
+            }
+            if let Err(e) = ingest_new_tasks(&r, conn, &format!("reviewer/{}", t.id)) {
+                eprintln!("[ralph] failed to ingest new tasks from reviewer: {e}");
+            }
+            match r.status {
+                AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
+                    db::update_phase(conn, &t.id, Phase::Done, unix_now())?;
+                    db::update_last_error(conn, &t.id, None)?;
+                    eprintln!("[ralph] {} — done!", t.id);
+                }
+                AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
+                    push_feedback(conn, &t.id, "Reviewer", new_attempts, &r.text, &r.stderr_lines)?;
+                    let new_phase = reset_or_fail_phase(new_attempts, config);
+                    db::update_phase(conn, &t.id, new_phase, unix_now())?;
+                    db::update_last_error(conn, &t.id, Some(&reason))?;
+                    eprintln!("[ralph] {} review issues: {reason}", t.id);
+                }
+            }
+        }
+        Err(e) => {
+            push_feedback(conn, &t.id, "Reviewer", new_attempts, &e.to_string(), &[])?;
+            let new_phase = reset_or_fail_phase(new_attempts, config);
+            db::update_phase(conn, &t.id, new_phase, unix_now())?;
+            db::update_last_error(conn, &t.id, Some(&e.to_string()))?;
+            eprintln!("[ralph] reviewer error for {}: {e}", t.id);
+        }
     }
 
     Ok(())

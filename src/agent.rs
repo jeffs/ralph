@@ -664,7 +664,6 @@ async fn write_agent_log(
 }
 
 /// Invoke a claude agent with the given role and context.
-/// When `working_dir` is `Some`, the subprocess runs in that directory.
 ///
 /// The caller must install a centralized signal handler via
 /// [`ProcessRegistry`]; this function registers/deregisters the child
@@ -673,7 +672,6 @@ pub async fn invoke_agent(
     role: AgentRole,
     context: &AgentContext,
     config: &Config,
-    working_dir: Option<&Path>,
     registry: &ProcessRegistry,
     attempt: u32,
 ) -> Result<AgentResult> {
@@ -729,15 +727,6 @@ pub async fn invoke_agent(
     for (key, val) in &config.env.set {
         cmd.env(key, val);
     }
-    // Apply workspace environment isolation: compute absolute paths
-    // from the agent's working directory so each workspace gets its
-    // own isolated directories (e.g. CARGO_TARGET_DIR).
-    if let Some(dir) = working_dir {
-        for (var_name, subdir) in &config.workspace.isolate_env {
-            let path = dir.join(subdir);
-            cmd.env(var_name, &path);
-        }
-    }
     cmd.arg("-p")
         .arg(&prompt)
         .arg("--output-format")
@@ -754,9 +743,6 @@ pub async fn invoke_agent(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
-    }
     cmd.process_group(0);
     let mut child = cmd.spawn().context("spawning claude process")?;
     let child_pid = child.id().expect("child has pid immediately after spawn");
@@ -1123,20 +1109,6 @@ pub async fn jj_diff_git() -> Result<String> {
         .await?;
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-/// Get files changed in a specific revision (e.g. a workspace's
-/// working-copy commit viewed from the default workspace via
-/// `ralph-{id}@`).
-pub async fn jj_changed_files_for(revision: &str) -> Result<Vec<PathBuf>> {
-    let output = TokioCommand::new("jj")
-        .args(["diff", "--summary", "-r", revision])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await?;
-
-    Ok(parse_diff_summary(&String::from_utf8_lossy(&output.stdout)))
 }
 
 #[cfg(test)]
