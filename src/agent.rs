@@ -923,14 +923,17 @@ pub async fn invoke_agent(
     let prompt = context.interpolate(&template);
 
     let model = config.model_for_attempt(role.label(), attempt);
+    let backend = backend_for_model(model)?;
     match context.task_id() {
         Some(id) => eprintln!(
-            "[ralph] {id} — invoking {} agent (model: {model})...",
-            role.label()
+            "[ralph] {id} — invoking {} agent (model: {model}, backend: {})...",
+            role.label(),
+            backend.name()
         ),
         None => eprintln!(
-            "[ralph] invoking {} agent (model: {model})...",
-            role.label()
+            "[ralph] invoking {} agent (model: {model}, backend: {})...",
+            role.label(),
+            backend.name()
         ),
     }
 
@@ -938,7 +941,7 @@ pub async fn invoke_agent(
     // processes (rust-analyzer, LSP servers, cargo) are
     // cleaned up when the agent finishes, rather than being
     // reparented to PID 1 as orphans.
-    let mut cmd = TokioCommand::new("claude");
+    let mut cmd = TokioCommand::new(backend.binary());
     cmd.env_clear();
     // Forward essential vars if present in the current environment.
     for key in &[
@@ -967,24 +970,14 @@ pub async fn invoke_agent(
     for (key, val) in &config.env.set {
         cmd.env(key, val);
     }
-    cmd.arg("-p")
-        .arg(&prompt)
-        .arg("--output-format")
-        .arg("json")
-        .arg("--model")
-        .arg(model)
-        .arg("--dangerously-skip-permissions")
-        .arg("--no-session-persistence")
-        .arg("--strict-mcp-config")
-        .arg("--mcp-config")
-        .arg(r#"{"mcpServers":{}}"#)
-        .arg("--settings")
-        .arg(r#"{"enabledPlugins":{"rust-analyzer-lsp@claude-plugins-official":false,"typescript-lsp@claude-plugins-official":false,"pyright-lsp@claude-plugins-official":false}}"#)
-        .stdin(Stdio::null())
+    backend.build_args(&mut cmd, &prompt, model);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.process_group(0);
-    let mut child = cmd.spawn().context("spawning claude process")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning {} process", backend.name()))?;
     let child_pid = child.id().expect("child has pid immediately after spawn");
 
     // Take stderr and stdout handles before passing the child to the monitor.
@@ -1038,33 +1031,23 @@ pub async fn invoke_agent(
     let stdout_bytes = stdout_task.await.unwrap_or_default();
     let stderr_lines = stderr_task.await.unwrap_or_default();
 
-    /// Parse stdout bytes into (text, cost_usd) via the JSON envelope,
-    /// falling back to raw text if JSON parsing fails.
-    fn parse_stdout(bytes: &[u8]) -> (String, Option<f64>) {
-        let raw = String::from_utf8_lossy(bytes);
-        match serde_json::from_str::<ClaudeJsonOutput>(&raw) {
-            Ok(parsed) => (parsed.result.unwrap_or_default(), parsed.total_cost_usd),
-            Err(_) => (raw.into_owned(), None),
-        }
-    }
-
     let agent_result = match monitor_result {
         Ok(exit_status) => {
             kill_process_group(child_pid, 0).await;
             registry.deregister(child_pid);
 
             if !exit_status.success() {
-                let (text, cost_usd) = parse_stdout(&stdout_bytes);
+                let (text, cost_usd) = backend.parse_output(&stdout_bytes);
                 AgentResult {
                     text,
                     status: AgentStatus::Failure {
-                        reason: format!("claude exited with {}", exit_status),
+                        reason: format!("{} exited with {}", backend.name(), exit_status),
                     },
                     cost_usd,
                     stderr_lines,
                 }
             } else {
-                let (text, cost_usd) = parse_stdout(&stdout_bytes);
+                let (text, cost_usd) = backend.parse_output(&stdout_bytes);
                 if let Some(cost) = cost_usd {
                     eprintln!("[ralph] {} agent cost: ${cost:.4}", role.label());
                 }
@@ -1083,7 +1066,7 @@ pub async fn invoke_agent(
             eprintln!("[ralph] {} agent stopped: {:?}", role.label(), status);
             registry.deregister(child_pid);
 
-            let (text, cost_usd) = parse_stdout(&stdout_bytes);
+            let (text, cost_usd) = backend.parse_output(&stdout_bytes);
             AgentResult {
                 text,
                 status,
