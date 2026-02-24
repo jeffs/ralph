@@ -361,16 +361,6 @@ pub fn count_non_terminal(conn: &Connection) -> Result<u64> {
     Ok(count as u64)
 }
 
-/// Count archived tasks.
-pub fn count_archived(conn: &Connection) -> Result<u64> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tasks WHERE archived = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(count as u64)
-}
-
 /// Return the maximum priority among non-archived tasks, or `None` if there are none.
 pub fn max_priority(conn: &Connection) -> Result<Option<u32>> {
     let max: Option<i64> = conn.query_row(
@@ -1066,22 +1056,6 @@ mod tests {
 
         let count = count_non_terminal(&conn).unwrap();
         assert_eq!(count, 3); // Pending, Implementing, Failed
-    }
-
-    #[test]
-    fn count_archived_returns_correct_count() {
-        let conn = open_memory().unwrap();
-
-        insert_task(&conn, &make_task("T1")).unwrap();
-        insert_task(&conn, &make_task("T2")).unwrap();
-        insert_task(&conn, &make_task("T3")).unwrap();
-
-        assert_eq!(count_archived(&conn).unwrap(), 0);
-
-        archive_task(&conn, "T1").unwrap();
-        archive_task(&conn, "T3").unwrap();
-
-        assert_eq!(count_archived(&conn).unwrap(), 2);
     }
 
     // ── max_priority ────────────────────────────────────────
