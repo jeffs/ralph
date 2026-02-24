@@ -583,6 +583,13 @@ pub fn validate_deps(conn: &Connection) -> Result<()> {
 
 // ── Nit CRUD ──────────────────────────────────────────────────
 
+/// Counts of nits grouped by status.
+pub struct NitCounts {
+    pub open: u64,
+    pub promoted: u64,
+    pub dismissed: u64,
+}
+
 pub fn insert_nit(conn: &Connection, nit: &Nit) -> Result<()> {
     let status_str = nit_status_to_str(&nit.status);
     conn.execute(
@@ -714,6 +721,25 @@ pub fn update_nit_status(
         params![status_str, promoted_to, id],
     )?;
     Ok(())
+}
+
+/// Return counts of nits for each status. Missing statuses default to 0.
+pub fn nit_status_counts(conn: &Connection) -> Result<NitCounts> {
+    let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM nits GROUP BY status")?;
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut counts = NitCounts { open: 0, promoted: 0, dismissed: 0 };
+    for (status, count) in rows {
+        match status.as_str() {
+            "Open" => counts.open = count as u64,
+            "Promoted" => counts.promoted = count as u64,
+            "Dismissed" => counts.dismissed = count as u64,
+            _ => {}
+        }
+    }
+    Ok(counts)
 }
 
 /// Return the next available NIT-N ID.
@@ -1493,6 +1519,27 @@ mod tests {
         let conn = open_memory().unwrap();
         let result = get_nit(&conn, "NIT-999").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn nit_status_counts_returns_correct_counts() {
+        let conn = open_memory().unwrap();
+
+        // Empty table — all counts should be 0.
+        let counts = nit_status_counts(&conn).unwrap();
+        assert_eq!(counts.open, 0);
+        assert_eq!(counts.promoted, 0);
+        assert_eq!(counts.dismissed, 0);
+
+        insert_nit(&conn, &make_nit("NIT-1", NitStatus::Open)).unwrap();
+        insert_nit(&conn, &make_nit("NIT-2", NitStatus::Open)).unwrap();
+        insert_nit(&conn, &make_nit("NIT-3", NitStatus::Promoted)).unwrap();
+        // No Dismissed nits inserted — dismissed should remain 0.
+
+        let counts = nit_status_counts(&conn).unwrap();
+        assert_eq!(counts.open, 2);
+        assert_eq!(counts.promoted, 1);
+        assert_eq!(counts.dismissed, 0);
     }
 
     // ── ID helpers ──────────────────────────────────────────
