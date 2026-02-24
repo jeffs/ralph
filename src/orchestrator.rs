@@ -1,20 +1,19 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use rusqlite::Connection;
 use tokio::process::Command as TokioCommand;
 
 use crate::agent::{
-    self, AgentContext, AgentResult, AgentRole, AgentStatus, FEEDBACK_MAX_LEN, ProcessRegistry,
+    self, AgentContext, AgentRole, AgentStatus, FEEDBACK_MAX_LEN, ProcessRegistry,
     build_feedback_history, truncate_feedback,
 };
 use crate::config::Config;
+use crate::db;
 use crate::nit::truncate_with_ellipsis;
 use crate::scheduler;
-use crate::state::{ExecutionState, Phase};
-use crate::task::{self, Task};
-
-use crate::state::TaskExecution;
+use crate::task::{DirectiveAction, Phase, Task, TaskDef, unix_now};
 
 /// Install a background task that listens for SIGINT and SIGTERM,
 /// kills all registered process groups, then exits.
@@ -38,15 +37,13 @@ pub(crate) fn spawn_signal_handler(registry: ProcessRegistry) {
 
 const WS_DIR: &str = ".ralph";
 
-const STATE_PATH: &str = ".ralph/state.json";
-
-/// Set a task back to Pending, or to Failed if it has
-/// exhausted its attempt budget.
-fn reset_or_fail(exec: &mut TaskExecution, config: &Config) {
-    if exec.attempts >= config.max_attempts {
-        exec.phase = Phase::Failed;
+/// Determine the post-failure phase. Returns Failed if the
+/// attempt budget is exhausted, otherwise Pending for retry.
+fn reset_or_fail_phase(attempts: u32, config: &Config) -> Phase {
+    if attempts >= config.max_attempts {
+        Phase::Failed
     } else {
-        exec.phase = Phase::Pending;
+        Phase::Pending
     }
 }
 
@@ -64,16 +61,16 @@ fn should_retry(kind: agent::FailureKind) -> bool {
     }
 }
 
-/// Like `reset_or_fail` but consults failure classification.
+/// Like `reset_or_fail_phase` but consults failure classification.
 /// Non-retryable failures go straight to Failed regardless of
 /// attempt count.
 #[allow(dead_code)]
-fn reset_or_fail_classified(exec: &mut TaskExecution, config: &Config, reason: &str) {
+fn reset_or_fail_classified_phase(attempts: u32, config: &Config, reason: &str) -> Phase {
     let kind = agent::classify_failure(reason);
-    if !should_retry(kind) || exec.attempts >= config.max_attempts {
-        exec.phase = Phase::Failed;
+    if !should_retry(kind) || attempts >= config.max_attempts {
+        Phase::Failed
     } else {
-        exec.phase = Phase::Pending;
+        Phase::Pending
     }
 }
 
@@ -93,8 +90,15 @@ fn build_guidance(entries: &[String]) -> String {
 /// implementer can see what went wrong on the next attempt.
 /// When `stderr` is non-empty, appends it under a heading
 /// so the next attempt can see CLI diagnostics.
-fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str, stderr: &[String]) {
-    let prefix = format!("[{phase_label} · attempt {}]", exec.attempts);
+fn push_feedback(
+    conn: &Connection,
+    task_id: &str,
+    phase_label: &str,
+    attempts: u32,
+    full_text: &str,
+    stderr: &[String],
+) -> Result<()> {
+    let prefix = format!("[{phase_label} · attempt {attempts}]");
     let mut body = truncate_feedback(full_text, FEEDBACK_MAX_LEN);
     if !stderr.is_empty() {
         // Budget: leave room for the stderr section within FEEDBACK_MAX_LEN.
@@ -108,19 +112,18 @@ fn push_feedback(exec: &mut TaskExecution, phase_label: &str, full_text: &str, s
             body.push_str(&truncated);
         }
     }
-    exec.feedback.push(format!("{prefix}\n{body}"));
+    db::push_feedback(conn, task_id, &format!("{prefix}\n{body}"))
 }
 
-/// Record a nit to `.ralph/nits.jsonl`.
-async fn record_nit(
+/// Record a nit to the database.
+fn record_nit(
+    conn: &Connection,
     source_task: &str,
     source_role: &str,
     attempt: u32,
     suggestions: &str,
 ) -> Result<()> {
-    let path = PathBuf::from(".ralph/nits.jsonl");
-    let nits = crate::nit::load_nits(&path).await.unwrap_or_default();
-    let id = crate::nit::next_nit_id(&nits);
+    let id = db::next_nit_id(conn)?;
     let summary = crate::nit::summarize(suggestions);
     let nit = crate::nit::Nit {
         id,
@@ -131,41 +134,41 @@ async fn record_nit(
         summary,
         status: crate::nit::NitStatus::Open,
         promoted_to: None,
-        created_at: crate::state::unix_now(),
+        created_at: unix_now(),
     };
-    crate::nit::append_nit(&path, &nit).await
+    db::insert_nit(conn, &nit)
 }
 
 /// Extract proposed tasks from an agent result, assign IDs,
-/// deduplicate, and append to the task file.
+/// deduplicate, and insert into the database.
 ///
 /// Returns the number of tasks actually added.
-async fn ingest_new_tasks(
-    result: &AgentResult,
-    tasks_path: &Path,
+fn ingest_new_tasks(
+    result: &agent::AgentResult,
+    conn: &Connection,
     source_label: &str,
 ) -> Result<usize> {
     let proposals = result.parse_new_tasks();
     if proposals.is_empty() {
         return Ok(0);
     }
-    materialize_proposed_tasks(&proposals, tasks_path, source_label).await
+    materialize_proposed_tasks(&proposals, conn, source_label)
 }
 
-/// Parse a numbered-list failure reason into tasks and append them.
+/// Parse a numbered-list failure reason into tasks and insert them.
 ///
 /// Used as a fallback when the final reviewer returns a failure
 /// reason without structured `NEW_TASKS:` output.
-async fn ingest_from_failure_reason(
+fn ingest_from_failure_reason(
     reason: &str,
-    tasks_path: &Path,
+    conn: &Connection,
     source_label: &str,
 ) -> Result<usize> {
     let proposals = agent::tasks_from_numbered_list(reason);
     if proposals.is_empty() {
         return Ok(0);
     }
-    materialize_proposed_tasks(&proposals, tasks_path, source_label).await
+    materialize_proposed_tasks(&proposals, conn, source_label)
 }
 
 /// Extract the first sentence (or first ~120 chars) of a failure reason
@@ -182,13 +185,13 @@ fn truncate_for_title(reason: &str) -> String {
     truncate_with_ellipsis(&oneline, 120)
 }
 
-/// Shared logic: validate, deduplicate, assign IDs, and append proposed tasks.
-async fn materialize_proposed_tasks(
+/// Shared logic: validate, deduplicate, assign IDs, and insert proposed tasks.
+fn materialize_proposed_tasks(
     proposals: &[agent::ProposedTask],
-    tasks_path: &Path,
+    conn: &Connection,
     source_label: &str,
 ) -> Result<usize> {
-    let existing = task::load_tasks(tasks_path).await.unwrap_or_default();
+    let existing = db::list_all_tasks(conn)?;
     let existing_ids: HashSet<&str> = existing.iter().map(|t| t.id.as_str()).collect();
     let existing_titles: HashSet<&str> = existing.iter().map(|t| t.title.as_str()).collect();
     let max_priority = existing.iter().map(|t| t.priority).max().unwrap_or(0);
@@ -222,18 +225,18 @@ async fn materialize_proposed_tasks(
             }
         };
         new_ids.insert(id.clone());
-        new_tasks.push(Task {
+        new_tasks.push(Task::from_def(&TaskDef {
             id,
             title: p.title.clone(),
             description: p.description.clone(),
             priority: p.priority.unwrap_or(max_priority + 1),
             blocked_by: p.blocked_by.clone(),
-        });
+        }));
     }
 
     let count = new_tasks.len();
     if count > 0 {
-        task::append_tasks(tasks_path, &new_tasks).await?;
+        db::insert_tasks(conn, &new_tasks)?;
         for t in &new_tasks {
             eprintln!(
                 "[ralph] {source_label} → new task: [{}] {} (pri={})",
@@ -247,18 +250,17 @@ async fn materialize_proposed_tasks(
 /// Main orchestration loop. Iterates until convergence
 /// (all tasks done + reviewer approves), stagnation
 /// (max attempts exceeded), or iteration cap.
-pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config) -> Result<()> {
-    let state_path = PathBuf::from(STATE_PATH);
+pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config) -> Result<()> {
     let registry = ProcessRegistry::new(config.kill_grace_secs);
     spawn_signal_handler(registry.clone());
     isolate_dirty_tree().await;
     cleanup_stale_workspaces().await;
     let mut cumulative_cost: f64 = 0.0;
-    let mut triage_rounds: u32;
+    let mut triage_rounds: u32 = 0;
 
     for iteration in 1..=max_iterations {
         if registry.is_shutdown() {
-            eprintln!("[ralph] shutdown requested, saving state...");
+            eprintln!("[ralph] shutdown requested.");
             return Ok(());
         }
 
@@ -266,32 +268,50 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
         registry.audit_and_kill_orphans().await;
 
-        let tasks = task::load_tasks(tasks_path).await?;
-        let archive_path = std::path::PathBuf::from(".ralph/archive.jsonl");
-        let archived = task::load_archive(&archive_path).await?;
-        let archived_ids: std::collections::HashSet<&str> =
-            archived.iter().map(|t| t.id.as_str()).collect();
-        task::validate_deps(&tasks, &archived_ids)?;
-        let mut state = ExecutionState::load(&state_path).await?;
-        let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        let mut tasks = db::list_active_tasks(conn)?;
+        db::validate_deps(conn)?;
 
         // Drain sideband directives (from ralph skip/fail/reset)
-        match crate::state::drain_directives().await {
-            Ok(directives) if !directives.is_empty() => {
-                for d in &directives {
-                    eprintln!("[ralph] applying directive: {:?} {}", d.action, d.task_id);
+        let directives = db::drain_directives(conn)?;
+        if !directives.is_empty() {
+            let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+            for d in &directives {
+                eprintln!("[ralph] applying directive: {:?} {}", d.action, d.task_id);
+                if !task_ids.contains(d.task_id.as_str()) {
+                    eprintln!(
+                        "[ralph] directive for unknown task '{}', skipping",
+                        d.task_id
+                    );
+                    continue;
                 }
-                state.apply_directives(&directives, &task_ids);
-                state.save(&state_path).await?;
+                let now = unix_now();
+                match d.action {
+                    DirectiveAction::Skip => {
+                        db::update_phase(conn, &d.task_id, Phase::Skipped, now)?;
+                    }
+                    DirectiveAction::Fail => {
+                        db::update_phase(conn, &d.task_id, Phase::Failed, now)?;
+                        db::update_last_error(
+                            conn,
+                            &d.task_id,
+                            Some("manually failed via `ralph fail`"),
+                        )?;
+                    }
+                    DirectiveAction::Reset => {
+                        db::update_phase(conn, &d.task_id, Phase::Pending, now)?;
+                        db::update_attempts(conn, &d.task_id, 0)?;
+                        db::update_last_error(conn, &d.task_id, None)?;
+                        db::clear_feedback(conn, &d.task_id)?;
+                        // guidance is intentionally preserved
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("[ralph] failed to drain directives: {e}");
-            }
-            _ => {}
+            // Reload tasks since phases changed
+            tasks = db::list_active_tasks(conn)?;
         }
 
         // Check convergence: all done → final review
-        if state.all_done(&task_ids) {
+        if tasks.iter().all(|t| t.phase.satisfies_dep()) {
             eprintln!("[ralph] all tasks done, final review...");
             let final_diff = agent::jj_diff_git().await.unwrap_or_default();
             let final_summary = agent::jj_changed_files()
@@ -325,13 +345,11 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                     "[ralph] cost budget exceeded (${cumulative_cost:.4} > ${:.4}), stopping.",
                     config.max_cost_usd.unwrap()
                 );
-                state.save(&state_path).await?;
                 return Ok(());
             }
 
             if registry.is_shutdown() {
-                eprintln!("[ralph] shutdown requested, saving state...");
-                state.save(&state_path).await?;
+                eprintln!("[ralph] shutdown requested.");
                 return Ok(());
             }
 
@@ -339,15 +357,14 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                 AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
                     if let AgentStatus::ApprovedWithNits { suggestions } = &review.status {
                         eprintln!("[ralph] final review nits: {suggestions}");
-                        if let Err(e) = record_nit("final", "final_review", 1, suggestions).await {
+                        if let Err(e) = record_nit(conn, "final", "final_review", 1, suggestions) {
                             eprintln!("[ralph] failed to record nit: {e}");
                         }
                     }
 
-                    triage_rounds = 0;
                     if config.auto_triage && triage_rounds < config.max_triage_rounds {
                         let promoted =
-                            triage_open_nits(tasks_path, config, &registry, &mut cumulative_cost)
+                            triage_open_nits(conn, config, &registry, &mut cumulative_cost)
                                 .await?;
                         if promoted > 0 {
                             triage_rounds += 1;
@@ -369,7 +386,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                     eprintln!("[ralph] reviewer found issues: {reason}");
 
                     // First, try structured NEW_TASKS from the reviewer output.
-                    let mut added = ingest_new_tasks(&review, tasks_path, "final review").await?;
+                    let mut added = ingest_new_tasks(&review, conn, "final review")?;
 
                     // For Tiers 2 & 3, use the full reviewer output rather than
                     // the reason string, which may be a generic parse-failure
@@ -382,8 +399,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
 
                     // Tier 2: parse numbered items from reviewer findings.
                     if added == 0 {
-                        added = ingest_from_failure_reason(findings, tasks_path, "final review")
-                            .await?;
+                        added = ingest_from_failure_reason(findings, conn, "final review")?;
                     }
 
                     // Tier 3: wrap prose as a single task.
@@ -398,10 +414,9 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
                         }];
                         added = materialize_proposed_tasks(
                             &fallback,
-                            tasks_path,
+                            conn,
                             "final review (synthesized)",
-                        )
-                        .await?;
+                        )?;
                     }
 
                     if added > 0 {
@@ -419,20 +434,17 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         // scheduling new work.
         let made_progress = resume_inflight(
             &tasks,
-            &mut state,
+            conn,
             config,
             &registry,
             &mut cumulative_cost,
-            tasks_path,
         )
         .await?;
         if registry.is_shutdown() {
-            eprintln!("[ralph] shutdown requested, saving state...");
-            state.save(&state_path).await?;
+            eprintln!("[ralph] shutdown requested.");
             return Ok(());
         }
         if made_progress {
-            state.save(&state_path).await?;
             // Re-evaluate from the top — deps may have
             // unblocked.
             continue;
@@ -441,12 +453,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         // Check stagnation
         let stagnant: Vec<&str> = tasks
             .iter()
-            .filter(|t| {
-                state
-                    .tasks
-                    .get(&t.id)
-                    .is_some_and(|e| e.phase == Phase::Failed)
-            })
+            .filter(|t| t.phase == Phase::Failed)
             .map(|t| t.id.as_str())
             .collect();
 
@@ -458,7 +465,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         }
 
         // Find ready tasks (Pending phase only)
-        let ready = scheduler::ready_tasks(&tasks, &state, config);
+        let ready = scheduler::ready_tasks(&tasks, config);
         if ready.is_empty() {
             if stagnant.is_empty() {
                 eprintln!(
@@ -474,7 +481,7 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
         eprintln!("[ralph] {} task(s) ready", ready.len());
 
         // Partition into parallelizable groups
-        let groups = scheduler::partition_independent(&ready, &state);
+        let groups = scheduler::partition_independent(&ready);
 
         for group in groups {
             let use_workspaces = group.len() > 1;
@@ -482,26 +489,22 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             if use_workspaces {
                 run_group_with_workspaces(
                     &group,
-                    &mut state,
+                    conn,
                     config,
                     &registry,
                     &mut cumulative_cost,
-                    tasks_path,
                 )
                 .await?;
             } else {
                 run_group_singleton(
                     &group,
-                    &mut state,
+                    conn,
                     config,
                     &registry,
                     &mut cumulative_cost,
-                    tasks_path,
                 )
                 .await?;
             }
-
-            state.save(&state_path).await?;
 
             if config.max_cost_usd.is_some_and(|max| cumulative_cost > max) {
                 eprintln!(
@@ -512,30 +515,31 @@ pub async fn run_loop(tasks_path: &Path, max_iterations: usize, config: &Config)
             }
 
             if registry.is_shutdown() {
-                eprintln!("[ralph] shutdown requested, saving state...");
+                eprintln!("[ralph] shutdown requested.");
                 return Ok(());
             }
 
-            // Advance any tasks now at Testing/Reviewing
+            // Reload tasks from db to see updated phases,
+            // then advance any tasks now at Testing/Reviewing.
+            let fresh_tasks = db::list_active_tasks(conn)?;
             resume_inflight(
-                &tasks,
-                &mut state,
+                &fresh_tasks,
+                conn,
                 config,
                 &registry,
                 &mut cumulative_cost,
-                tasks_path,
             )
             .await?;
-            state.save(&state_path).await?;
 
             if registry.is_shutdown() {
-                eprintln!("[ralph] shutdown requested, saving state...");
+                eprintln!("[ralph] shutdown requested.");
                 return Ok(());
             }
 
             // Checkpoint: seal the current working-copy change
             // and start a fresh one for the next group.
-            let detail = checkpoint_description(&group, &state);
+            let group_ids: Vec<String> = group.iter().map(|t| t.id.clone()).collect();
+            let detail = checkpoint_description(&group_ids, conn);
             if let Err(e) = jj_checkpoint(&detail).await {
                 eprintln!("[ralph] jj commit skipped: {e}");
             }
@@ -579,45 +583,30 @@ pub(crate) fn parse_triage_decisions(text: &str) -> Vec<TriageDecision> {
 /// Invoke the triager agent on open nits, apply decisions,
 /// and return the number of promoted nits.
 pub async fn triage_open_nits(
-    tasks_path: &Path,
+    conn: &Connection,
     config: &Config,
     registry: &ProcessRegistry,
     cumulative_cost: &mut f64,
 ) -> Result<usize> {
-    let nits_path = PathBuf::from(".ralph/nits.jsonl");
-    let mut nits = crate::nit::load_nits(&nits_path).await.unwrap_or_default();
+    let nits = db::list_nits(conn, false)?;
 
-    let open: Vec<&crate::nit::Nit> = nits
-        .iter()
-        .filter(|n| n.status == crate::nit::NitStatus::Open)
-        .collect();
-
-    if open.is_empty() {
+    if nits.is_empty() {
         return Ok(0);
     }
 
-    eprintln!("[ralph] triaging {} open nit(s)...", open.len());
+    eprintln!("[ralph] triaging {} open nit(s)...", nits.len());
 
     // Build context for the triager
-    let nits_json = open
+    let nits_json = nits
         .iter()
         .map(|n| serde_json::to_string(n).unwrap_or_default())
         .collect::<Vec<_>>()
         .join("\n");
 
-    let tasks = task::load_tasks(tasks_path).await.unwrap_or_default();
-    let state_path = PathBuf::from(STATE_PATH);
-    let exec_state = ExecutionState::load(&state_path).await?;
+    let tasks = db::list_active_tasks(conn)?;
     let tasks_summary = tasks
         .iter()
-        .map(|t| {
-            let phase = exec_state
-                .tasks
-                .get(&t.id)
-                .map(|e| format!("{:?}", e.phase))
-                .unwrap_or_else(|| "Pending".to_string());
-            format!("[{}] {} ({})", t.id, t.title, phase)
-        })
+        .map(|t| format!("[{}] {} ({:?})", t.id, t.title, t.phase))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -640,7 +629,7 @@ pub async fn triage_open_nits(
     let mut proposals = Vec::new();
 
     for d in &decisions {
-        let nit_entry = nits.iter_mut().find(|n| n.id == d.nit_id);
+        let nit_entry = nits.iter().find(|n| n.id == d.nit_id);
         let Some(nit_entry) = nit_entry else {
             eprintln!("[ralph] triager referenced unknown nit '{}'", d.nit_id);
             continue;
@@ -666,12 +655,22 @@ pub async fn triage_open_nits(
                     priority: None,
                     blocked_by: vec![],
                 });
-                nit_entry.status = crate::nit::NitStatus::Promoted;
+                db::update_nit_status(
+                    conn,
+                    &d.nit_id,
+                    crate::nit::NitStatus::Promoted,
+                    None,
+                )?;
                 promoted_count += 1;
                 eprintln!("[ralph] triager: promote {}", d.nit_id);
             }
             "dismiss" => {
-                nit_entry.status = crate::nit::NitStatus::Dismissed;
+                db::update_nit_status(
+                    conn,
+                    &d.nit_id,
+                    crate::nit::NitStatus::Dismissed,
+                    None,
+                )?;
                 let reason = d.reason.as_deref().unwrap_or("triager dismissed");
                 eprintln!("[ralph] triager: dismiss {} — {reason}", d.nit_id);
             }
@@ -684,14 +683,9 @@ pub async fn triage_open_nits(
         }
     }
 
-    // Save nit status updates
-    if let Err(e) = crate::nit::save_nits(&nits_path, &nits).await {
-        eprintln!("[ralph] failed to save nit updates: {e}");
-    }
-
     // Materialize promoted nits as tasks
     if !proposals.is_empty() {
-        match materialize_proposed_tasks(&proposals, tasks_path, "triager").await {
+        match materialize_proposed_tasks(&proposals, conn, "triager") {
             Ok(added) => {
                 eprintln!("[ralph] triager created {added} task(s)");
             }
@@ -704,34 +698,30 @@ pub async fn triage_open_nits(
     Ok(promoted_count)
 }
 
-/// Group Testing tasks by disjoint file sets for parallel execution.
+/// Group tasks by disjoint file sets for parallel execution.
 /// Tasks with overlapping files_changed are placed in the same group
-/// to avoid parallel testing of the same files.
-fn group_by_disjoint_files(ids: &[String], state: &ExecutionState) -> Vec<Vec<String>> {
-    let mut groups: Vec<(std::collections::HashSet<PathBuf>, Vec<String>)> = Vec::new();
+/// to avoid parallel work on the same files.
+fn group_by_disjoint_files<'a>(tasks: &[&'a Task]) -> Vec<Vec<&'a Task>> {
+    let mut groups: Vec<(HashSet<PathBuf>, Vec<&'a Task>)> = Vec::new();
 
-    for id in ids {
-        let files: std::collections::HashSet<PathBuf> = state
-            .tasks
-            .get(id)
-            .map(|e| e.files_changed.iter().cloned().collect())
-            .unwrap_or_default();
+    for &task in tasks {
+        let files: HashSet<PathBuf> = task.files_changed.iter().cloned().collect();
 
         let mut merged = false;
-        for (group_files, group_ids) in &mut groups {
+        for (group_files, group_tasks) in &mut groups {
             if files.is_disjoint(group_files) {
                 group_files.extend(files.iter().cloned());
-                group_ids.push(id.clone());
+                group_tasks.push(task);
                 merged = true;
                 break;
             }
         }
         if !merged {
-            groups.push((files, vec![id.clone()]));
+            groups.push((files, vec![task]));
         }
     }
 
-    groups.into_iter().map(|(_, ids)| ids).collect()
+    groups.into_iter().map(|(_, tasks)| tasks).collect()
 }
 
 /// Advance all tasks stuck at Testing or Reviewing.
@@ -741,54 +731,40 @@ fn group_by_disjoint_files(ids: &[String], state: &ExecutionState) -> Vec<Vec<St
 /// Reviewing tasks always run in parallel (read-only).
 async fn resume_inflight(
     tasks: &[Task],
-    state: &mut ExecutionState,
+    conn: &Connection,
     config: &Config,
     registry: &ProcessRegistry,
     cumulative_cost: &mut f64,
-    tasks_path: &Path,
 ) -> Result<bool> {
     let mut progressed = false;
 
     // Implementing phase → task was mid-implementation when Ralph
     // restarted. Reset to Pending so the scheduler picks it up again.
-    let implementing: Vec<String> = state
-        .tasks
+    let implementing: Vec<&Task> = tasks
         .iter()
-        .filter(|(_, e)| e.phase == Phase::Implementing)
-        .map(|(id, _)| id.clone())
+        .filter(|t| t.phase == Phase::Implementing)
         .collect();
-    for id in implementing {
-        eprintln!("[ralph] {id} stuck in Implementing, resetting to Pending");
-        let exec = state.entry(&id);
-        exec.phase = Phase::Pending;
+    for t in implementing {
+        eprintln!("[ralph] {} stuck in Implementing, resetting to Pending", t.id);
+        db::update_phase(conn, &t.id, Phase::Pending, unix_now())?;
         progressed = true;
     }
 
     // Testing phase → run tester (parallel for disjoint file sets)
-    let testing: Vec<String> = state
-        .tasks
+    let testing: Vec<&Task> = tasks
         .iter()
-        .filter(|(_, e)| e.phase == Phase::Testing)
-        .map(|(id, _)| id.clone())
+        .filter(|t| t.phase == Phase::Testing)
         .collect();
 
-    let test_groups = group_by_disjoint_files(&testing, state);
+    let test_groups = group_by_disjoint_files(&testing);
     for group in test_groups {
         let mut handles = Vec::new();
-        for id in &group {
-            let files = state
-                .tasks
-                .get(id)
-                .map(|e| e.files_changed.clone())
-                .unwrap_or_default();
-            let t = tasks.iter().find(|t| t.id == *id);
-            let (title, desc) = t
-                .map(|t| (t.title.as_str(), t.description.as_str()))
-                .unwrap_or(("unknown", ""));
-            let ctx = AgentContext::test(id, title, desc, files);
+        for t in &group {
+            let files = t.files_changed.clone();
+            let ctx = AgentContext::test(&t.id, &t.title, &t.description, files);
             let cfg = config.clone();
             let reg = registry.clone();
-            let id_owned = id.clone();
+            let id_owned = t.id.clone();
             handles.push(tokio::spawn(async move {
                 let result =
                     agent::invoke_agent(AgentRole::Tester, &ctx, &cfg, None, &reg, 0).await;
@@ -799,41 +775,40 @@ async fn resume_inflight(
         for handle in handles {
             let (id, result) = handle.await?;
             eprintln!("[ralph] resuming test for {id}...");
+            let attempts = tasks.iter().find(|t| t.id == id).map_or(0, |t| t.attempts);
             match result {
                 Ok(r) => {
                     *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
-                        let attempts = state.tasks.get(&id).map_or(0, |e| e.attempts);
-                        if let Err(e) = record_nit(&id, "tester", attempts, suggestions).await {
-                            eprintln!("[ralph] failed to record nit: {e}");
-                        }
+                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                        && let Err(e) = record_nit(conn, &id, "tester", attempts, suggestions)
+                    {
+                        eprintln!("[ralph] failed to record nit: {e}");
                     }
                     // Ingest any new tasks proposed by the tester.
-                    if let Err(e) = ingest_new_tasks(&r, tasks_path, &format!("tester/{id}")).await
-                    {
+                    if let Err(e) = ingest_new_tasks(&r, conn, &format!("tester/{id}")) {
                         eprintln!("[ralph] failed to ingest new tasks from tester: {e}");
                     }
-                    let exec = state.entry(&id);
                     match r.status {
                         AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
-                            exec.phase = Phase::Reviewing;
-                            exec.last_error = None;
+                            db::update_phase(conn, &id, Phase::Reviewing, unix_now())?;
+                            db::update_last_error(conn, &id, None)?;
                             progressed = true;
                         }
                         AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                            push_feedback(exec, "Tester", &r.text, &r.stderr_lines);
-                            reset_or_fail(exec, config);
-                            exec.last_error = Some(reason.clone());
+                            push_feedback(conn, &id, "Tester", attempts, &r.text, &r.stderr_lines)?;
+                            let new_phase = reset_or_fail_phase(attempts, config);
+                            db::update_phase(conn, &id, new_phase, unix_now())?;
+                            db::update_last_error(conn, &id, Some(&reason))?;
                             progressed = true;
                             eprintln!("[ralph] {id} tests failed: {reason}");
                         }
                     }
                 }
                 Err(e) => {
-                    let exec = state.entry(&id);
-                    push_feedback(exec, "Tester", &e.to_string(), &[]);
-                    reset_or_fail(exec, config);
-                    exec.last_error = Some(e.to_string());
+                    push_feedback(conn, &id, "Tester", attempts, &e.to_string(), &[])?;
+                    let new_phase = reset_or_fail_phase(attempts, config);
+                    db::update_phase(conn, &id, new_phase, unix_now())?;
+                    db::update_last_error(conn, &id, Some(&e.to_string()))?;
                     progressed = true;
                     eprintln!("[ralph] tester error for {id}: {e}");
                 }
@@ -853,11 +828,9 @@ async fn resume_inflight(
     }
 
     // Reviewing phase → run reviewer (always parallel — read-only)
-    let reviewing: Vec<String> = state
-        .tasks
+    let reviewing: Vec<&Task> = tasks
         .iter()
-        .filter(|(_, e)| e.phase == Phase::Reviewing)
-        .map(|(id, _)| id.clone())
+        .filter(|t| t.phase == Phase::Reviewing)
         .collect();
 
     if !reviewing.is_empty() {
@@ -865,26 +838,23 @@ async fn resume_inflight(
         let diff = agent::jj_diff_git().await.unwrap_or_default();
 
         let mut handles = Vec::new();
-        for id in &reviewing {
-            let t = tasks.iter().find(|t| t.id == *id);
-            let (title, desc) = t
-                .map(|t| (t.title.as_str(), t.description.as_str()))
-                .unwrap_or(("unknown", ""));
-            let diff_summary = state
-                .tasks
-                .get(id)
-                .map(|e| {
-                    e.files_changed
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
-            let ctx = AgentContext::review(id, title, desc, diff_summary, diff.clone());
+        for t in &reviewing {
+            let diff_summary = t
+                .files_changed
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let ctx = AgentContext::review(
+                &t.id,
+                &t.title,
+                &t.description,
+                diff_summary,
+                diff.clone(),
+            );
             let cfg = config.clone();
             let reg = registry.clone();
-            let id_owned = id.clone();
+            let id_owned = t.id.clone();
             handles.push(tokio::spawn(async move {
                 let result =
                     agent::invoke_agent(AgentRole::Reviewer, &ctx, &cfg, None, &reg, 0).await;
@@ -895,49 +865,54 @@ async fn resume_inflight(
         for handle in handles {
             let (id, result) = handle.await?;
             eprintln!("[ralph] resuming review for {id}...");
+            let attempts = tasks.iter().find(|t| t.id == id).map_or(0, |t| t.attempts);
             match result {
                 Ok(r) => {
                     *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
-                        let attempts = state.tasks.get(&id).map_or(0, |e| e.attempts);
-                        if let Err(e) = record_nit(&id, "reviewer", attempts, suggestions).await {
-                            eprintln!("[ralph] failed to record nit: {e}");
-                        }
+                    if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                        && let Err(e) = record_nit(conn, &id, "reviewer", attempts, suggestions)
+                    {
+                        eprintln!("[ralph] failed to record nit: {e}");
                     }
                     // Ingest any new tasks proposed by the reviewer.
-                    if let Err(e) =
-                        ingest_new_tasks(&r, tasks_path, &format!("reviewer/{id}")).await
-                    {
+                    if let Err(e) = ingest_new_tasks(&r, conn, &format!("reviewer/{id}")) {
                         eprintln!("[ralph] failed to ingest new tasks from reviewer: {e}");
                     }
-                    let exec = state.entry(&id);
                     match r.status {
                         AgentStatus::Success => {
-                            exec.phase = Phase::Done;
-                            exec.last_error = None;
+                            db::update_phase(conn, &id, Phase::Done, unix_now())?;
+                            db::update_last_error(conn, &id, None)?;
                             progressed = true;
                             eprintln!("[ralph] {id} — done!");
                         }
                         AgentStatus::ApprovedWithNits { .. } => {
-                            exec.phase = Phase::Done;
-                            exec.last_error = None;
+                            db::update_phase(conn, &id, Phase::Done, unix_now())?;
+                            db::update_last_error(conn, &id, None)?;
                             progressed = true;
                             eprintln!("[ralph] {id} — done (with nits)");
                         }
                         AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                            push_feedback(exec, "Reviewer", &r.text, &r.stderr_lines);
-                            reset_or_fail(exec, config);
-                            exec.last_error = Some(reason.clone());
+                            push_feedback(
+                                conn,
+                                &id,
+                                "Reviewer",
+                                attempts,
+                                &r.text,
+                                &r.stderr_lines,
+                            )?;
+                            let new_phase = reset_or_fail_phase(attempts, config);
+                            db::update_phase(conn, &id, new_phase, unix_now())?;
+                            db::update_last_error(conn, &id, Some(&reason))?;
                             progressed = true;
                             eprintln!("[ralph] {id} review issues: {reason}");
                         }
                     }
                 }
                 Err(e) => {
-                    let exec = state.entry(&id);
-                    push_feedback(exec, "Reviewer", &e.to_string(), &[]);
-                    reset_or_fail(exec, config);
-                    exec.last_error = Some(e.to_string());
+                    push_feedback(conn, &id, "Reviewer", attempts, &e.to_string(), &[])?;
+                    let new_phase = reset_or_fail_phase(attempts, config);
+                    db::update_phase(conn, &id, new_phase, unix_now())?;
+                    db::update_last_error(conn, &id, Some(&e.to_string()))?;
                     progressed = true;
                     eprintln!("[ralph] reviewer error for {id}: {e}");
                 }
@@ -961,14 +936,14 @@ async fn resume_inflight(
 
 /// Build a checkpoint commit message summarizing what the
 /// group accomplished, e.g. "ralph: BUILD-1 (testing), UI-2 (done)".
-fn checkpoint_description(group: &[&Task], state: &ExecutionState) -> String {
-    let parts: Vec<String> = group
+fn checkpoint_description(group_ids: &[String], conn: &Connection) -> String {
+    let parts: Vec<String> = group_ids
         .iter()
-        .map(|t| {
-            let phase = state
-                .tasks
-                .get(&t.id)
-                .map(|e| match e.phase {
+        .map(|id| {
+            let phase_label = db::get_task(conn, id)
+                .ok()
+                .flatten()
+                .map(|t| match t.phase {
                     Phase::Pending => "pending",
                     Phase::Implementing => "implementing",
                     Phase::Testing => "testing",
@@ -978,7 +953,7 @@ fn checkpoint_description(group: &[&Task], state: &ExecutionState) -> String {
                     Phase::Skipped => "skipped",
                 })
                 .unwrap_or("unknown");
-            format!("{} ({})", t.id, phase)
+            format!("{id} ({phase_label})")
         })
         .collect();
     format!("ralph: {}", parts.join(", "))
@@ -1128,11 +1103,10 @@ async fn teardown_workspace(task_id: &str, abandon: bool) {
 /// default workspace.
 async fn run_group_with_workspaces(
     group: &[&Task],
-    state: &mut ExecutionState,
+    conn: &Connection,
     config: &Config,
     registry: &ProcessRegistry,
     cumulative_cost: &mut f64,
-    tasks_path: &Path,
 ) -> Result<()> {
     // Create workspaces and spawn agents
     let mut handles = Vec::new();
@@ -1143,39 +1117,33 @@ async fn run_group_with_workspaces(
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[ralph] workspace creation failed for {}: {e}", t.id);
-                let exec = state.entry(&t.id);
-                exec.attempts += 1;
-                reset_or_fail(exec, config);
-                exec.last_error = Some(format!("workspace creation: {e}"));
+                db::update_attempts(conn, &t.id, t.attempts + 1)?;
+                let new_phase = reset_or_fail_phase(t.attempts + 1, config);
+                db::update_phase(conn, &t.id, new_phase, unix_now())?;
+                db::update_last_error(
+                    conn,
+                    &t.id,
+                    Some(&format!("workspace creation: {e}")),
+                )?;
                 continue;
             }
         };
         created_ws.push(t.id.clone());
 
-        {
-            let exec = state.entry(&t.id);
-            exec.phase = Phase::Implementing;
-            if exec.started_at.is_none() {
-                exec.started_at = Some(crate::state::unix_now());
-            }
-            exec.phase_entered_at = Some(crate::state::unix_now());
-        }
-        state.save(&PathBuf::from(STATE_PATH)).await?;
+        db::update_phase(conn, &t.id, Phase::Implementing, unix_now())?;
 
         let id = t.id.clone();
         let title = t.title.clone();
         let desc = t.description.clone();
-        let (guidance, fb, attempt) = state
-            .tasks
-            .get(&t.id)
-            .map(|e| {
-                let g = build_guidance(&e.guidance);
-                let g = if g.is_empty() { None } else { Some(g) };
-                let fb = build_feedback_history(&e.feedback, FEEDBACK_MAX_LEN);
-                let fb = if fb.is_empty() { None } else { Some(fb) };
-                (g, fb, e.attempts + 1)
-            })
-            .unwrap_or((None, None, 1));
+        let guidance = build_guidance(&t.guidance);
+        let guidance = if guidance.is_empty() {
+            None
+        } else {
+            Some(guidance)
+        };
+        let fb = build_feedback_history(&t.feedback, FEEDBACK_MAX_LEN);
+        let fb = if fb.is_empty() { None } else { Some(fb) };
+        let attempt = t.attempts + 1;
         let cfg = config.clone();
         let reg = registry.clone();
         handles.push(tokio::spawn(async move {
@@ -1203,43 +1171,42 @@ async fn run_group_with_workspaces(
 
     for handle in handles {
         let (id, result) = handle.await?;
-        {
-            let exec = state.entry(&id);
-            exec.attempts += 1;
-        }
+        let task = group.iter().find(|t| t.id == id);
+        let prev_attempts = task.map_or(0, |t| t.attempts);
+        let new_attempts = prev_attempts + 1;
+        db::update_attempts(conn, &id, new_attempts)?;
+
         let success = match result {
             Ok(r) => {
                 *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-                if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
-                    let attempts = state.tasks.get(&id).map_or(0, |e| e.attempts);
-                    if let Err(e) = record_nit(&id, "implementer", attempts, suggestions).await {
-                        eprintln!("[ralph] failed to record nit: {e}");
-                    }
+                if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                    && let Err(e) = record_nit(conn, &id, "implementer", new_attempts, suggestions)
+                {
+                    eprintln!("[ralph] failed to record nit: {e}");
                 }
                 // Ingest any new tasks proposed by the implementer.
-                if let Err(e) = ingest_new_tasks(&r, tasks_path, &format!("implementer/{id}")).await
-                {
+                if let Err(e) = ingest_new_tasks(&r, conn, &format!("implementer/{id}")) {
                     eprintln!("[ralph] failed to ingest new tasks from implementer: {e}");
                 }
-                let exec = state.entry(&id);
                 match &r.status {
                     AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
-                        exec.phase = Phase::Testing;
-                        exec.last_error = None;
+                        db::update_phase(conn, &id, Phase::Testing, unix_now())?;
+                        db::update_last_error(conn, &id, None)?;
                         true
                     }
                     AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                        reset_or_fail(exec, config);
-                        exec.last_error = Some(reason.clone());
+                        let new_phase = reset_or_fail_phase(new_attempts, config);
+                        db::update_phase(conn, &id, new_phase, unix_now())?;
+                        db::update_last_error(conn, &id, Some(reason))?;
                         eprintln!("[ralph] {id} implement failed: {reason}");
                         false
                     }
                 }
             }
             Err(e) => {
-                let exec = state.entry(&id);
-                reset_or_fail(exec, config);
-                exec.last_error = Some(e.to_string());
+                let new_phase = reset_or_fail_phase(new_attempts, config);
+                db::update_phase(conn, &id, new_phase, unix_now())?;
+                db::update_last_error(conn, &id, Some(&e.to_string()))?;
                 eprintln!("[ralph] agent error for {id}: {e}");
                 false
             }
@@ -1257,10 +1224,12 @@ async fn run_group_with_workspaces(
         // Attribute files from the workspace, regardless of outcome.
         let rev = format!("ralph-{}@", outcome.id);
         let files = agent::jj_changed_files_for(&rev).await.unwrap_or_default();
-        let exec = state.entry(&outcome.id);
-        exec.files_changed.extend(files);
-        exec.files_changed.sort();
-        exec.files_changed.dedup();
+        let task = group.iter().find(|t| t.id == outcome.id);
+        let mut all_files = task.map(|t| t.files_changed.clone()).unwrap_or_default();
+        all_files.extend(files);
+        all_files.sort();
+        all_files.dedup();
+        db::update_files_changed(conn, &outcome.id, &all_files)?;
 
         if outcome.success {
             // Squash workspace changes into default working copy
@@ -1284,36 +1253,29 @@ async fn run_group_with_workspaces(
 /// (no workspace overhead).
 async fn run_group_singleton(
     group: &[&Task],
-    state: &mut ExecutionState,
+    conn: &Connection,
     config: &Config,
     registry: &ProcessRegistry,
     cumulative_cost: &mut f64,
-    tasks_path: &Path,
 ) -> Result<()> {
     let t = group[0];
     let pre_files = agent::jj_changed_files().await.unwrap_or_default();
 
-    {
-        let exec = state.entry(&t.id);
-        exec.phase = Phase::Implementing;
-        if exec.started_at.is_none() {
-            exec.started_at = Some(crate::state::unix_now());
-        }
-        exec.phase_entered_at = Some(crate::state::unix_now());
-    }
-    state.save(&PathBuf::from(STATE_PATH)).await?;
+    db::update_phase(conn, &t.id, Phase::Implementing, unix_now())?;
 
-    let (guidance, feedback_history, attempt) = state
-        .tasks
-        .get(&t.id)
-        .map(|e| {
-            let g = build_guidance(&e.guidance);
-            let g = if g.is_empty() { None } else { Some(g) };
-            let fb = build_feedback_history(&e.feedback, FEEDBACK_MAX_LEN);
-            let fb = if fb.is_empty() { None } else { Some(fb) };
-            (g, fb, e.attempts + 1)
-        })
-        .unwrap_or((None, None, 1));
+    let guidance = build_guidance(&t.guidance);
+    let guidance = if guidance.is_empty() {
+        None
+    } else {
+        Some(guidance)
+    };
+    let feedback_history = build_feedback_history(&t.feedback, FEEDBACK_MAX_LEN);
+    let feedback_history = if feedback_history.is_empty() {
+        None
+    } else {
+        Some(feedback_history)
+    };
+    let attempt = t.attempts + 1;
     let ctx = AgentContext::implement(
         &t.id,
         &t.title,
@@ -1331,41 +1293,37 @@ async fn run_group_singleton(
     )
     .await;
 
-    {
-        let exec = state.entry(&t.id);
-        exec.attempts += 1;
-    }
+    let new_attempts = t.attempts + 1;
+    db::update_attempts(conn, &t.id, new_attempts)?;
     match result {
         Ok(r) => {
             *cumulative_cost += r.cost_usd.unwrap_or(0.0);
-            if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status {
-                let attempts = state.tasks.get(&t.id).map_or(0, |e| e.attempts);
-                if let Err(e) = record_nit(&t.id, "implementer", attempts, suggestions).await {
-                    eprintln!("[ralph] failed to record nit: {e}");
-                }
+            if let AgentStatus::ApprovedWithNits { ref suggestions } = r.status
+                && let Err(e) = record_nit(conn, &t.id, "implementer", new_attempts, suggestions)
+            {
+                eprintln!("[ralph] failed to record nit: {e}");
             }
             // Ingest any new tasks proposed by the implementer.
-            if let Err(e) = ingest_new_tasks(&r, tasks_path, &format!("implementer/{}", t.id)).await
-            {
+            if let Err(e) = ingest_new_tasks(&r, conn, &format!("implementer/{}", t.id)) {
                 eprintln!("[ralph] failed to ingest new tasks from implementer: {e}");
             }
-            let exec = state.entry(&t.id);
             match &r.status {
                 AgentStatus::Success | AgentStatus::ApprovedWithNits { .. } => {
-                    exec.phase = Phase::Testing;
-                    exec.last_error = None;
+                    db::update_phase(conn, &t.id, Phase::Testing, unix_now())?;
+                    db::update_last_error(conn, &t.id, None)?;
                 }
                 AgentStatus::Failure { reason } | AgentStatus::NeedsRetry { reason } => {
-                    reset_or_fail(exec, config);
-                    exec.last_error = Some(reason.clone());
+                    let new_phase = reset_or_fail_phase(new_attempts, config);
+                    db::update_phase(conn, &t.id, new_phase, unix_now())?;
+                    db::update_last_error(conn, &t.id, Some(reason))?;
                     eprintln!("[ralph] {} implement failed: {reason}", t.id);
                 }
             }
         }
         Err(e) => {
-            let exec = state.entry(&t.id);
-            reset_or_fail(exec, config);
-            exec.last_error = Some(e.to_string());
+            let new_phase = reset_or_fail_phase(new_attempts, config);
+            db::update_phase(conn, &t.id, new_phase, unix_now())?;
+            db::update_last_error(conn, &t.id, Some(&e.to_string()))?;
             eprintln!("[ralph] agent error for {}: {e}", t.id);
         }
     }
@@ -1378,10 +1336,11 @@ async fn run_group_singleton(
             .into_iter()
             .filter(|f| !pre_files.contains(f))
             .collect();
-        let exec = state.entry(&t.id);
-        exec.files_changed.extend(new_files);
-        exec.files_changed.sort();
-        exec.files_changed.dedup();
+        let mut all_files = t.files_changed.clone();
+        all_files.extend(new_files);
+        all_files.sort();
+        all_files.dedup();
+        db::update_files_changed(conn, &t.id, &all_files)?;
     }
 
     Ok(())

@@ -27,7 +27,7 @@ Ralph commits progress to Jujutsu (`jj`) after each group of tasks.
                      └─────┬──────┘
                            │  writes
                            ▼
-                  .ralph/tasks.jsonl
+                  .ralph/ralph.db
                            │
                      ┌─────┴──────┐
                      │ ralph run  │
@@ -47,9 +47,9 @@ Ralph commits progress to Jujutsu (`jj`) after each group of tasks.
 
 | Module          | Purpose                                                |
 |-----------------|--------------------------------------------------------|
-| `main.rs`       | CLI: `init`, `plan`, `run`, `status`, `skip/fail/reset`, `archive/restore`|
+| `main.rs`       | CLI: `init`, `plan`, `run`, `status`, `skip/fail/reset`, `archive/restore`, `dump`, `import`|
 | `task.rs`       | Task model, JSONL parsing, validation                  |
-| `state.rs`      | Per-task execution state (phase, attempts, feedback)   |
+| `db.rs`         | SQLite persistence layer (WAL mode); unified task definition + execution state|
 | `config.rs`     | TOML configuration loading and defaults                |
 | `agent.rs`      | Agent invocation, process management, status parsing   |
 | `scheduler.rs`  | Dependency resolution, parallel partitioning           |
@@ -57,32 +57,39 @@ Ralph commits progress to Jujutsu (`jj`) after each group of tasks.
 
 ## Task format
 
-Tasks live in `.ralph/tasks.jsonl`, one JSON object per line. The Planner
-agent writes this file; Ralph never modifies it.
+Tasks are stored in `.ralph/ralph.db` (SQLite). The Planner agent writes
+tasks during `ralph plan`; Ralph manages all subsequent reads and writes.
 
-```json
-{"id":"T1","title":"Add foo function","description":"Create foo() in src/lib.rs ...","priority":1,"blocked_by":[]}
-{"id":"T2","title":"Add tests for foo","description":"...","priority":2,"blocked_by":["T1"]}
-```
+Each row in the `tasks` table combines the task definition with its
+execution state in a single unified record:
 
-| Field        | Type     | Required | Notes                                |
-|-------------|----------|----------|--------------------------------------|
-| `id`        | string   | yes      | Unique, no whitespace (e.g. "AUTH-1")|
-| `title`     | string   | yes      | Imperative one-liner                 |
-| `description`| string  | no       | What to change, where, and why       |
-| `priority`  | integer  | yes      | 1 = highest                          |
-| `blocked_by`| string[] | no       | IDs that must complete first         |
+| Field        | Type     | Notes                                |
+|-------------|----------|--------------------------------------|
+| `id`        | string   | Unique, no whitespace (e.g. "AUTH-1")|
+| `title`     | string   | Imperative one-liner                 |
+| `description`| string  | What to change, where, and why       |
+| `priority`  | integer  | 1 = highest                          |
+| `blocked_by`| string[] | IDs that must complete first         |
+| `phase`     | string   | Execution phase (see below)          |
+| `attempts`  | integer  | Number of implementation cycles      |
+| `files_changed`| string[] | Paths modified by the implementer |
+| `feedback`  | string   | Output from failed test/review runs  |
+| `last_error`| string   | Most recent failure reason           |
+| `started_at`, `completed_at`, `phase_entered_at` | timestamp | Lifecycle timestamps |
 
-All `blocked_by` references must point to an `id` in the same file or
-in the archive (`archive.jsonl`). Duplicate IDs, empty IDs, and IDs
+All `blocked_by` references must point to a task `id` in the same
+database (including archived tasks). Duplicate IDs, empty IDs, and IDs
 containing whitespace are rejected.
+
+Use `ralph dump` to inspect the database as Markdown or JSON, and
+`ralph import` to migrate from legacy flat files.
 
 ## Execution state
 
-Execution metadata lives separately in `.ralph/state.json` so the task
-file stays clean for human review. State is saved atomically (write to
-`.tmp`, then rename). Crash recovery promotes `.json.tmp` if the main
-file is missing.
+Execution state is stored together with task definitions in
+`.ralph/ralph.db`. SQLite WAL mode is enabled so CLI commands (e.g.
+`ralph status`, `ralph dump`) can read the database concurrently while
+the orchestrator is running without blocking each other.
 
 Each task tracks:
 
@@ -90,7 +97,7 @@ Each task tracks:
 - **attempts**: number of implementation cycles
 - **files_changed**: paths modified by the implementer
 - **feedback**: full agent output from failed test/review runs, forwarded
-  to the implementer on retry (truncated to 8 KB)
+  to the implementer on retry (truncated to 16 KB)
 - **timestamps**: `started_at`, `completed_at`, `phase_entered_at`
 - **last_error**: most recent failure reason
 
@@ -104,7 +111,7 @@ variables that Ralph fills in.
 
 - **Input**: the user's request text
 - **Job**: read the codebase, decompose the request into tasks
-- **Output**: write `.ralph/tasks.jsonl`
+- **Output**: write tasks to `.ralph/ralph.db`
 
 ### Implementer (`prompts/implementer.md`)
 
@@ -282,9 +289,12 @@ ralph status                  # Show task progress
 ralph skip <task_id>          # Mark a task Done (skip it)
 ralph fail <task_id>          # Mark a task Failed
 ralph reset <task_id>         # Reset a task to Pending
-ralph archive <task_id>       # Move a terminal task to archive.jsonl
+ralph archive <task_id>       # Mark a terminal task as archived
 ralph archive --done          # Archive all Done + Skipped tasks
-ralph restore <task_id>       # Restore a task from archive.jsonl
+ralph restore <task_id>       # Restore an archived task to active
+ralph dump                    # Print all tasks as Markdown (human-readable)
+ralph dump --json             # Print tasks + state as JSON
+ralph import <dir>            # Migrate legacy flat files to ralph.db
 ```
 
 ### Automated nit triage
@@ -309,8 +319,9 @@ If you are an AI agent being orchestrated by Ralph, follow these rules:
    `jj squash`, or any state-changing jj command. Ralph handles all VCS.
 2. **Do not change directories.** Stay in the working directory Ralph
    gives you. Ralph manages workspace paths.
-3. **Do not modify `.ralph/tasks.jsonl`.** This is the planner's output.
-   Ralph reads it but never writes to it after planning.
+3. **Do not modify `.ralph/ralph.db`.** This is managed exclusively by
+   Ralph. Use `ralph dump` to inspect state; never write to the database
+   directly.
 4. **Read before writing.** Always read relevant source files and
    CLAUDE.md before making changes. Understand existing patterns.
 5. **Minimal changes only.** Do what the task says. No unrelated
@@ -329,7 +340,7 @@ full agent output and stores it as feedback. On the next attempt, the
 feedback is injected into the implementer's prompt under a
 "Previous Attempt Feedback" heading. This gives the implementer
 actionable context about what went wrong, without requiring it to
-re-discover the problem from scratch. Feedback is truncated to 8 KB.
+re-discover the problem from scratch. Feedback is truncated to 16 KB.
 
 ## Cost tracking
 
@@ -362,9 +373,12 @@ repo) respect the orchestration protocol.
 ```
 .ralph/
   config.toml       # Orchestration settings
-  tasks.jsonl       # Task definitions (planner output, human-editable)
-  archive.jsonl     # Archived terminal tasks (same format as tasks.jsonl)
-  state.json        # Execution state (managed by Ralph, not hand-edited)
+  ralph.db          # SQLite database: tasks, execution state, archive, nits
   ws-<task_id>/     # Temporary jj workspaces (auto-cleaned)
   .gitignore        # Contains "*" — nothing in .ralph/ is committed
 ```
+
+The database uses WAL mode, allowing concurrent read access by CLI
+commands while the orchestrator is running. Use `ralph dump` to inspect
+contents and `ralph import` to migrate from legacy flat files
+(`tasks.jsonl`, `state.json`, `archive.jsonl`, etc.).
