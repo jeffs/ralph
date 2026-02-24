@@ -495,6 +495,16 @@ pub fn restore_task(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Archive all non-archived tasks in a terminal phase (Done or Skipped).
+/// Returns the number of rows affected.
+pub fn archive_done_tasks(conn: &Connection) -> Result<u64> {
+    let rows = conn.execute(
+        "UPDATE tasks SET archived = 1 WHERE archived = 0 AND phase IN ('Done', 'Skipped')",
+        [],
+    )?;
+    Ok(rows as u64)
+}
+
 /// Reset all non-archived Failed tasks back to Pending.
 ///
 /// Sets `phase = 'Pending'`, `phase_entered_at = now`, `attempts = 0`,
@@ -1324,6 +1334,64 @@ mod tests {
 
         let active = list_active_tasks(&conn).unwrap();
         assert_eq!(active.len(), 1);
+    }
+
+    // ── archive_done_tasks ──────────────────────────────────
+
+    #[test]
+    fn archive_done_tasks_archives_only_done_and_skipped() {
+        let conn = open_memory().unwrap();
+
+        let mut done = make_task("T1");
+        done.phase = Phase::Done;
+        insert_task(&conn, &done).unwrap();
+
+        let mut skipped = make_task("T2");
+        skipped.phase = Phase::Skipped;
+        insert_task(&conn, &skipped).unwrap();
+
+        let pending = make_task("T3"); // Phase::Pending by default
+        insert_task(&conn, &pending).unwrap();
+
+        let mut failed = make_task("T4");
+        failed.phase = Phase::Failed;
+        insert_task(&conn, &failed).unwrap();
+
+        let count = archive_done_tasks(&conn).unwrap();
+        assert_eq!(count, 2, "expected 2 tasks archived");
+
+        assert!(get_task(&conn, "T1").unwrap().unwrap().archived, "Done task should be archived");
+        assert!(get_task(&conn, "T2").unwrap().unwrap().archived, "Skipped task should be archived");
+        assert!(!get_task(&conn, "T3").unwrap().unwrap().archived, "Pending task should not be archived");
+        assert!(!get_task(&conn, "T4").unwrap().unwrap().archived, "Failed task should not be archived");
+    }
+
+    #[test]
+    fn archive_done_tasks_skips_already_archived() {
+        let conn = open_memory().unwrap();
+
+        // Already-archived Done task — should not be double-counted.
+        let mut already = make_task("T1");
+        already.phase = Phase::Done;
+        already.archived = true;
+        insert_task(&conn, &already).unwrap();
+
+        // Active Done task — should be archived.
+        let mut active = make_task("T2");
+        active.phase = Phase::Done;
+        insert_task(&conn, &active).unwrap();
+
+        let count = archive_done_tasks(&conn).unwrap();
+        assert_eq!(count, 1);
+        assert!(get_task(&conn, "T2").unwrap().unwrap().archived);
+    }
+
+    #[test]
+    fn archive_done_tasks_returns_zero_when_nothing_to_archive() {
+        let conn = open_memory().unwrap();
+        insert_task(&conn, &make_task("T1")).unwrap(); // Pending
+        let count = archive_done_tasks(&conn).unwrap();
+        assert_eq!(count, 0);
     }
 
     // ── reset_all_failed ────────────────────────────────────
