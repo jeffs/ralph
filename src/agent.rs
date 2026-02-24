@@ -427,6 +427,261 @@ struct ClaudeJsonOutput {
     total_cost_usd: Option<f64>,
 }
 
+/// JSONL event from `codex -q` output stream.
+#[derive(Deserialize)]
+struct CodexEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    item: Option<CodexItem>,
+}
+
+/// Content item within a Codex output event.
+#[derive(Deserialize)]
+struct CodexItem {
+    content: Option<Vec<CodexContent>>,
+}
+
+/// Text content element within a Codex item.
+#[derive(Deserialize)]
+struct CodexContent {
+    text: Option<String>,
+}
+
+/// JSON response envelope from `gemini`.
+#[derive(Deserialize)]
+struct GeminiJsonOutput {
+    candidates: Option<Vec<GeminiCandidate>>,
+}
+
+/// Candidate response from Gemini.
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: Option<GeminiContent>,
+}
+
+/// Content block within a Gemini candidate.
+#[derive(Deserialize)]
+struct GeminiContent {
+    parts: Option<Vec<GeminiPart>>,
+}
+
+/// A single content part from a Gemini response.
+#[derive(Deserialize)]
+struct GeminiPart {
+    text: Option<String>,
+}
+
+/// JSONL event from `opencode run` output stream.
+#[derive(Deserialize)]
+struct OpenCodeEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    part: Option<OpenCodePart>,
+    #[serde(rename = "totalCost")]
+    total_cost: Option<f64>,
+}
+
+/// Text part within an OpenCode output event.
+#[derive(Deserialize)]
+struct OpenCodePart {
+    text: Option<String>,
+}
+
+/// Translate a Ralph model string to the `provider/model` format used by OpenCode.
+fn opencode_model(model: &str) -> String {
+    match model {
+        "deepseek-chat" => "deepseek/deepseek-chat".to_string(),
+        "deepseek-reasoner" => "deepseek/deepseek-reasoner".to_string(),
+        _ if model.starts_with("deepseek-") => format!("deepseek/{model}"),
+        _ => model.to_string(),
+    }
+}
+
+/// Which backend CLI to invoke for a given model string.
+#[derive(Debug, PartialEq)]
+pub enum AgentBackend {
+    Claude,
+    Codex,
+    Gemini,
+    OpenCode,
+}
+
+impl AgentBackend {
+    /// Human-readable name for logs.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AgentBackend::Claude => "Claude",
+            AgentBackend::Codex => "Codex",
+            AgentBackend::Gemini => "Gemini",
+            AgentBackend::OpenCode => "OpenCode",
+        }
+    }
+
+    /// Executable name for spawning the backend process.
+    pub fn binary(&self) -> &'static str {
+        match self {
+            AgentBackend::Claude => "claude",
+            AgentBackend::Codex => "codex",
+            AgentBackend::Gemini => "gemini",
+            AgentBackend::OpenCode => "opencode",
+        }
+    }
+
+    /// Append backend-specific CLI arguments to `cmd`.
+    pub fn build_args(&self, cmd: &mut TokioCommand, prompt: &str, model: &str) {
+        match self {
+            AgentBackend::Claude => {
+                cmd.arg("-p")
+                    .arg(prompt)
+                    .arg("--output-format")
+                    .arg("json")
+                    .arg("--model")
+                    .arg(model)
+                    .arg("--dangerously-skip-permissions")
+                    .arg("--no-session-persistence")
+                    .arg("--strict-mcp-config")
+                    .arg("--mcp-config")
+                    .arg(r#"{"mcpServers":{}}"#)
+                    .arg("--settings")
+                    .arg(r#"{"enabledPlugins":{"rust-analyzer-lsp@claude-plugins-official":false,"typescript-lsp@claude-plugins-official":false,"pyright-lsp@claude-plugins-official":false}}"#);
+            }
+            AgentBackend::Codex => {
+                cmd.arg("--model").arg(model).arg("-q").arg(prompt);
+            }
+            AgentBackend::Gemini => {
+                cmd.arg("--model").arg(model).arg("-p").arg(prompt);
+            }
+            AgentBackend::OpenCode => {
+                cmd.arg("run")
+                    .arg("-m")
+                    .arg(opencode_model(model))
+                    .arg("-p")
+                    .arg(prompt);
+            }
+        }
+    }
+
+    /// Parse raw `stdout` bytes into `(response_text, cost_usd)`.
+    pub fn parse_output(&self, stdout: &[u8]) -> (String, Option<f64>) {
+        match self {
+            AgentBackend::Claude => {
+                let raw = String::from_utf8_lossy(stdout);
+                match serde_json::from_str::<ClaudeJsonOutput>(&raw) {
+                    Ok(parsed) => (parsed.result.unwrap_or_default(), parsed.total_cost_usd),
+                    Err(_) => (raw.into_owned(), None),
+                }
+            }
+            AgentBackend::Codex => {
+                let raw = String::from_utf8_lossy(stdout);
+                let mut text = String::new();
+                let mut found_json = false;
+                for line in raw.lines() {
+                    if let Ok(event) = serde_json::from_str::<CodexEvent>(line) {
+                        found_json = true;
+                        if event.event_type == "message" {
+                            if let Some(item) = event.item {
+                                for content in item.content.unwrap_or_default() {
+                                    if let Some(t) = content.text {
+                                        text.push_str(&t);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if found_json {
+                    (text, None)
+                } else {
+                    (raw.into_owned(), None)
+                }
+            }
+            AgentBackend::Gemini => {
+                let raw = String::from_utf8_lossy(stdout);
+                match serde_json::from_str::<GeminiJsonOutput>(&raw) {
+                    Ok(parsed) => {
+                        let text = parsed
+                            .candidates
+                            .unwrap_or_default()
+                            .into_iter()
+                            .flat_map(|c| c.content.into_iter())
+                            .flat_map(|c| c.parts.unwrap_or_default())
+                            .filter_map(|p| p.text)
+                            .collect::<Vec<_>>()
+                            .join("");
+                        (text, None)
+                    }
+                    Err(_) => (raw.into_owned(), None),
+                }
+            }
+            AgentBackend::OpenCode => {
+                let raw = String::from_utf8_lossy(stdout);
+                let mut text = String::new();
+                let mut cost: Option<f64> = None;
+                let mut found_json = false;
+                for line in raw.lines() {
+                    if let Ok(event) = serde_json::from_str::<OpenCodeEvent>(line) {
+                        found_json = true;
+                        match event.event_type.as_str() {
+                            "PartText" => {
+                                if let Some(part) = event.part {
+                                    if let Some(t) = part.text {
+                                        text.push_str(&t);
+                                    }
+                                }
+                            }
+                            "FinishMessage" => {
+                                cost = event.total_cost;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if found_json {
+                    (text, cost)
+                } else {
+                    (raw.into_owned(), None)
+                }
+            }
+        }
+    }
+}
+
+/// Select the appropriate [`AgentBackend`] for the given model string.
+///
+/// Uses two-tier matching:
+/// 1. Exact aliases: `opus`/`sonnet`/`haiku` → Claude; `o3`/`o3-pro`/`o3-mini`/`o4-mini` → Codex;
+///    `deepseek-chat`/`deepseek-reasoner` → OpenCode.
+/// 2. Vendor-prefix patterns: `claude-*` → Claude; `gpt-*`/`codex-*` → Codex;
+///    `gemini-*` → Gemini; `deepseek-*` → OpenCode.
+///
+/// Returns an error for unrecognized model strings.
+pub fn backend_for_model(model: &str) -> Result<AgentBackend> {
+    // Tier 1: exact aliases.
+    match model {
+        "opus" | "sonnet" | "haiku" => return Ok(AgentBackend::Claude),
+        "o3" | "o3-pro" | "o3-mini" | "o4-mini" => return Ok(AgentBackend::Codex),
+        "deepseek-chat" | "deepseek-reasoner" => return Ok(AgentBackend::OpenCode),
+        _ => {}
+    }
+    // Tier 2: vendor-prefix patterns.
+    if model.starts_with("claude-") {
+        return Ok(AgentBackend::Claude);
+    }
+    if model.starts_with("gpt-") || model.starts_with("codex-") {
+        return Ok(AgentBackend::Codex);
+    }
+    if model.starts_with("gemini-") {
+        return Ok(AgentBackend::Gemini);
+    }
+    if model.starts_with("deepseek-") {
+        return Ok(AgentBackend::OpenCode);
+    }
+    anyhow::bail!(
+        "unrecognized model {model:?}; recognized aliases: opus, sonnet, haiku, \
+         o3, o3-pro, o3-mini, o4-mini, deepseek-chat, deepseek-reasoner; \
+         recognized prefixes: claude-*, gpt-*, codex-*, gemini-*, deepseek-*"
+    )
+}
 
 /// Sample total CPU% for all processes in a process group via `ps`.
 /// Returns 0.0 if the process group no longer exists or ps fails.
@@ -683,14 +938,17 @@ pub async fn invoke_agent(
     let prompt = context.interpolate(&template);
 
     let model = config.model_for_attempt(role.label(), attempt);
+    let backend = backend_for_model(model)?;
     match context.task_id() {
         Some(id) => eprintln!(
-            "[ralph] {id} — invoking {} agent (model: {model})...",
-            role.label()
+            "[ralph] {id} — invoking {} agent (model: {model}, backend: {})...",
+            role.label(),
+            backend.name()
         ),
         None => eprintln!(
-            "[ralph] invoking {} agent (model: {model})...",
-            role.label()
+            "[ralph] invoking {} agent (model: {model}, backend: {})...",
+            role.label(),
+            backend.name()
         ),
     }
 
@@ -698,7 +956,7 @@ pub async fn invoke_agent(
     // processes (rust-analyzer, LSP servers, cargo) are
     // cleaned up when the agent finishes, rather than being
     // reparented to PID 1 as orphans.
-    let mut cmd = TokioCommand::new("claude");
+    let mut cmd = TokioCommand::new(backend.binary());
     cmd.env_clear();
     // Forward essential vars if present in the current environment.
     for key in &[
@@ -727,24 +985,14 @@ pub async fn invoke_agent(
     for (key, val) in &config.env.set {
         cmd.env(key, val);
     }
-    cmd.arg("-p")
-        .arg(&prompt)
-        .arg("--output-format")
-        .arg("json")
-        .arg("--model")
-        .arg(model)
-        .arg("--dangerously-skip-permissions")
-        .arg("--no-session-persistence")
-        .arg("--strict-mcp-config")
-        .arg("--mcp-config")
-        .arg(r#"{"mcpServers":{}}"#)
-        .arg("--settings")
-        .arg(r#"{"enabledPlugins":{"rust-analyzer-lsp@claude-plugins-official":false,"typescript-lsp@claude-plugins-official":false,"pyright-lsp@claude-plugins-official":false}}"#)
-        .stdin(Stdio::null())
+    backend.build_args(&mut cmd, &prompt, model);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.process_group(0);
-    let mut child = cmd.spawn().context("spawning claude process")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning {} process", backend.name()))?;
     let child_pid = child.id().expect("child has pid immediately after spawn");
 
     // Take stderr and stdout handles before passing the child to the monitor.
@@ -798,33 +1046,23 @@ pub async fn invoke_agent(
     let stdout_bytes = stdout_task.await.unwrap_or_default();
     let stderr_lines = stderr_task.await.unwrap_or_default();
 
-    /// Parse stdout bytes into (text, cost_usd) via the JSON envelope,
-    /// falling back to raw text if JSON parsing fails.
-    fn parse_stdout(bytes: &[u8]) -> (String, Option<f64>) {
-        let raw = String::from_utf8_lossy(bytes);
-        match serde_json::from_str::<ClaudeJsonOutput>(&raw) {
-            Ok(parsed) => (parsed.result.unwrap_or_default(), parsed.total_cost_usd),
-            Err(_) => (raw.into_owned(), None),
-        }
-    }
-
     let agent_result = match monitor_result {
         Ok(exit_status) => {
             kill_process_group(child_pid, 0).await;
             registry.deregister(child_pid);
 
             if !exit_status.success() {
-                let (text, cost_usd) = parse_stdout(&stdout_bytes);
+                let (text, cost_usd) = backend.parse_output(&stdout_bytes);
                 AgentResult {
                     text,
                     status: AgentStatus::Failure {
-                        reason: format!("claude exited with {}", exit_status),
+                        reason: format!("{} exited with {}", backend.name(), exit_status),
                     },
                     cost_usd,
                     stderr_lines,
                 }
             } else {
-                let (text, cost_usd) = parse_stdout(&stdout_bytes);
+                let (text, cost_usd) = backend.parse_output(&stdout_bytes);
                 if let Some(cost) = cost_usd {
                     eprintln!("[ralph] {} agent cost: ${cost:.4}", role.label());
                 }
@@ -843,7 +1081,7 @@ pub async fn invoke_agent(
             eprintln!("[ralph] {} agent stopped: {:?}", role.label(), status);
             registry.deregister(child_pid);
 
-            let (text, cost_usd) = parse_stdout(&stdout_bytes);
+            let (text, cost_usd) = backend.parse_output(&stdout_bytes);
             AgentResult {
                 text,
                 status,
@@ -1591,5 +1829,137 @@ STATUS: FAILURE: issues found"#;
         // Recent entries are still returned even though they exceed budget.
         assert!(result.contains(&recent1));
         assert!(result.contains(&recent2));
+    }
+
+    // --- backend_for_model ---
+
+    #[test]
+    fn backend_for_model_exact_aliases_claude() {
+        assert_eq!(backend_for_model("opus").unwrap(), AgentBackend::Claude);
+        assert_eq!(backend_for_model("sonnet").unwrap(), AgentBackend::Claude);
+        assert_eq!(backend_for_model("haiku").unwrap(), AgentBackend::Claude);
+    }
+
+    #[test]
+    fn backend_for_model_exact_aliases_codex() {
+        assert_eq!(backend_for_model("o3").unwrap(), AgentBackend::Codex);
+        assert_eq!(backend_for_model("o3-pro").unwrap(), AgentBackend::Codex);
+        assert_eq!(backend_for_model("o3-mini").unwrap(), AgentBackend::Codex);
+        assert_eq!(backend_for_model("o4-mini").unwrap(), AgentBackend::Codex);
+    }
+
+    #[test]
+    fn backend_for_model_exact_aliases_opencode() {
+        assert_eq!(
+            backend_for_model("deepseek-chat").unwrap(),
+            AgentBackend::OpenCode
+        );
+        assert_eq!(
+            backend_for_model("deepseek-reasoner").unwrap(),
+            AgentBackend::OpenCode
+        );
+    }
+
+    #[test]
+    fn backend_for_model_vendor_prefix_claude() {
+        assert_eq!(
+            backend_for_model("claude-sonnet-4-6").unwrap(),
+            AgentBackend::Claude
+        );
+    }
+
+    #[test]
+    fn backend_for_model_vendor_prefix_codex() {
+        assert_eq!(
+            backend_for_model("gpt-5.1-codex-max").unwrap(),
+            AgentBackend::Codex
+        );
+        assert_eq!(
+            backend_for_model("codex-mini-latest").unwrap(),
+            AgentBackend::Codex
+        );
+    }
+
+    #[test]
+    fn backend_for_model_vendor_prefix_gemini() {
+        assert_eq!(
+            backend_for_model("gemini-2.5-pro").unwrap(),
+            AgentBackend::Gemini
+        );
+        assert_eq!(
+            backend_for_model("gemini-2.5-flash-preview-04-17").unwrap(),
+            AgentBackend::Gemini
+        );
+    }
+
+    #[test]
+    fn backend_for_model_unknown_returns_err() {
+        assert!(backend_for_model("unknown-thing").is_err());
+        assert!(backend_for_model("mistral-large").is_err());
+    }
+
+    // --- AgentBackend::Codex parse_output ---
+
+    #[test]
+    fn codex_parse_output_structured_jsonl() {
+        // thread.started and turn.completed are ignored; only the message
+        // event (item.completed / agent_message) contributes to the output.
+        let jsonl = concat!(
+            "{\"type\":\"thread.started\"}\n",
+            "{\"type\":\"message\",\"item\":{\"content\":[{\"text\":\"Hello from Codex\"}]}}\n",
+            "{\"type\":\"turn.completed\"}\n",
+        );
+        let (text, cost) = AgentBackend::Codex.parse_output(jsonl.as_bytes());
+        assert_eq!(text, "Hello from Codex");
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn codex_parse_output_fallback_plain_text() {
+        let input = "plain text output, not JSONL";
+        let (text, cost) = AgentBackend::Codex.parse_output(input.as_bytes());
+        assert_eq!(text, input);
+        assert_eq!(cost, None);
+    }
+
+    // --- AgentBackend::Gemini parse_output ---
+
+    #[test]
+    fn gemini_parse_output_structured_json() {
+        let json = r#"{"candidates":[{"content":{"parts":[{"text":"some text"}]}}]}"#;
+        let (text, cost) = AgentBackend::Gemini.parse_output(json.as_bytes());
+        assert_eq!(text, "some text");
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn gemini_parse_output_fallback_plain_text() {
+        let input = "plain text output, not JSON";
+        let (text, cost) = AgentBackend::Gemini.parse_output(input.as_bytes());
+        assert_eq!(text, input);
+        assert_eq!(cost, None);
+    }
+
+    // --- AgentBackend::OpenCode parse_output ---
+
+    #[test]
+    fn opencode_parse_output_structured_jsonl() {
+        // SessionStarted is ignored; PartText events contribute their text.
+        let jsonl = concat!(
+            "{\"type\":\"SessionStarted\"}\n",
+            "{\"type\":\"PartText\",\"part\":{\"text\":\"Hello from OpenCode\"}}\n",
+            "{\"type\":\"StepFinish\"}\n",
+        );
+        let (text, cost) = AgentBackend::OpenCode.parse_output(jsonl.as_bytes());
+        assert_eq!(text, "Hello from OpenCode");
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn opencode_parse_output_fallback_plain_text() {
+        let input = "plain text output, not JSONL";
+        let (text, cost) = AgentBackend::OpenCode.parse_output(input.as_bytes());
+        assert_eq!(text, input);
+        assert_eq!(cost, None);
     }
 }
