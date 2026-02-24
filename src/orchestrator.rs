@@ -196,11 +196,12 @@ fn materialize_proposed_tasks(
     let existing_titles: HashSet<&str> = existing.iter().map(|t| t.title.as_str()).collect();
     let max_priority = existing.iter().map(|t| t.priority).max().unwrap_or(0);
 
-    let mut gen_counter = existing
-        .iter()
-        .filter_map(|t| t.id.strip_prefix("GEN-")?.parse::<u32>().ok())
-        .max()
-        .unwrap_or(0);
+    let gen_id_str = db::next_generated_id(conn)?;
+    let mut gen_counter: u32 = gen_id_str
+        .strip_prefix("GEN-")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        - 1;
 
     let mut new_tasks = Vec::new();
     let mut new_ids: HashSet<String> = HashSet::new();

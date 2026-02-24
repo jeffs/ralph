@@ -791,7 +791,6 @@ pub fn id_ranges_summary(conn: &Connection) -> Result<String> {
 }
 
 /// Return the next available GEN-N ID.
-#[allow(dead_code)]
 pub fn next_generated_id(conn: &Connection) -> Result<String> {
     let max: Option<i64> = conn.query_row(
         "SELECT MAX(CAST(SUBSTR(id, 5) AS INTEGER)) FROM tasks WHERE id LIKE 'GEN-%'",
