@@ -661,6 +661,47 @@ pub fn list_nits(conn: &Connection, include_all: bool) -> Result<Vec<Nit>> {
         .collect()
 }
 
+/// Fetch a single nit by ID. Returns `None` if not found.
+pub fn get_nit(conn: &Connection, id: &str) -> Result<Option<Nit>> {
+    let row = conn
+        .query_row(
+            "SELECT id, source_task, source_role, attempt, content, summary, \
+                    status, promoted_to, created_at \
+             FROM nits WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((id, source_task, source_role, attempt, content, summary, status_str, promoted_to, created_at)) = row else {
+        return Ok(None);
+    };
+
+    Ok(Some(Nit {
+        id,
+        source_task,
+        source_role,
+        attempt: attempt as u32,
+        content,
+        summary,
+        status: nit_status_from_str(&status_str)?,
+        promoted_to,
+        created_at: created_at as u64,
+    }))
+}
+
 pub fn update_nit_status(
     conn: &Connection,
     id: &str,
@@ -1417,6 +1458,41 @@ mod tests {
         assert_eq!(nits.len(), 1);
         assert_eq!(nits[0].status, NitStatus::Dismissed);
         assert_eq!(nits[0].content, "updated content");
+    }
+
+    #[test]
+    fn get_nit_returns_correct_fields() {
+        let conn = open_memory().unwrap();
+        let nit = Nit {
+            id: "NIT-1".to_string(),
+            source_task: "T1".to_string(),
+            source_role: "reviewer".to_string(),
+            attempt: 2,
+            content: "fix the docs".to_string(),
+            summary: "Doc fix".to_string(),
+            status: NitStatus::Open,
+            promoted_to: None,
+            created_at: 7777,
+        };
+        insert_nit(&conn, &nit).unwrap();
+
+        let got = get_nit(&conn, "NIT-1").unwrap().unwrap();
+        assert_eq!(got.id, "NIT-1");
+        assert_eq!(got.source_task, "T1");
+        assert_eq!(got.source_role, "reviewer");
+        assert_eq!(got.attempt, 2);
+        assert_eq!(got.content, "fix the docs");
+        assert_eq!(got.summary, "Doc fix");
+        assert_eq!(got.status, NitStatus::Open);
+        assert!(got.promoted_to.is_none());
+        assert_eq!(got.created_at, 7777);
+    }
+
+    #[test]
+    fn get_nit_missing_id_returns_none() {
+        let conn = open_memory().unwrap();
+        let result = get_nit(&conn, "NIT-999").unwrap();
+        assert!(result.is_none());
     }
 
     // ── ID helpers ──────────────────────────────────────────
