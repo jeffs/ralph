@@ -495,6 +495,26 @@ pub fn restore_task(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reset all non-archived Failed tasks back to Pending.
+///
+/// Sets `phase = 'Pending'`, `phase_entered_at = now`, `attempts = 0`,
+/// `last_error = NULL`, and `feedback = '[]'`. Guidance is preserved.
+/// Returns the number of rows affected.
+pub fn reset_all_failed(conn: &Connection) -> Result<u64> {
+    let now = crate::task::unix_now() as i64;
+    let rows = conn.execute(
+        "UPDATE tasks SET
+            phase            = 'Pending',
+            phase_entered_at = ?1,
+            attempts         = 0,
+            last_error       = NULL,
+            feedback         = '[]'
+         WHERE archived = 0 AND phase = 'Failed'",
+        params![now],
+    )?;
+    Ok(rows as u64)
+}
+
 // ── Dependency queries ────────────────────────────────────────
 
 /// Return the set of all task IDs (active + archived).
@@ -1304,6 +1324,87 @@ mod tests {
 
         let active = list_active_tasks(&conn).unwrap();
         assert_eq!(active.len(), 1);
+    }
+
+    // ── reset_all_failed ────────────────────────────────────
+
+    #[test]
+    fn reset_all_failed_resets_only_failed_tasks() {
+        let conn = open_memory().unwrap();
+
+        // Failed task with error, feedback, and guidance
+        let mut failed = make_task("T1");
+        failed.phase = Phase::Failed;
+        failed.attempts = 3;
+        failed.last_error = Some("compile error".to_string());
+        failed.feedback = vec!["reviewer: nope".to_string()];
+        failed.guidance = vec!["use bun".to_string()];
+        insert_task(&conn, &failed).unwrap();
+
+        // Another failed task
+        let mut failed2 = make_task("T2");
+        failed2.phase = Phase::Failed;
+        failed2.attempts = 1;
+        failed2.last_error = Some("test failed".to_string());
+        insert_task(&conn, &failed2).unwrap();
+
+        // Pending task — should not be touched
+        let pending = make_task("T3");
+        insert_task(&conn, &pending).unwrap();
+
+        // Done task — should not be touched
+        let mut done = make_task("T4");
+        done.phase = Phase::Done;
+        done.attempts = 2;
+        insert_task(&conn, &done).unwrap();
+
+        // Archived failed task — should not be touched
+        let mut archived_failed = make_task("T5");
+        archived_failed.phase = Phase::Failed;
+        archived_failed.archived = true;
+        archived_failed.attempts = 5;
+        insert_task(&conn, &archived_failed).unwrap();
+
+        let count = reset_all_failed(&conn).unwrap();
+        assert_eq!(count, 2, "expected 2 failed tasks reset");
+
+        // T1: reset to Pending with cleared error/feedback, guidance preserved
+        let t1 = get_task(&conn, "T1").unwrap().unwrap();
+        assert_eq!(t1.phase, Phase::Pending);
+        assert_eq!(t1.attempts, 0);
+        assert!(t1.last_error.is_none());
+        assert!(t1.feedback.is_empty());
+        assert_eq!(t1.guidance, vec!["use bun"], "guidance should be preserved");
+        assert!(t1.phase_entered_at.is_some(), "phase_entered_at should be set");
+
+        // T2: also reset
+        let t2 = get_task(&conn, "T2").unwrap().unwrap();
+        assert_eq!(t2.phase, Phase::Pending);
+        assert_eq!(t2.attempts, 0);
+        assert!(t2.last_error.is_none());
+
+        // T3: Pending unchanged
+        let t3 = get_task(&conn, "T3").unwrap().unwrap();
+        assert_eq!(t3.phase, Phase::Pending);
+        assert_eq!(t3.attempts, 0);
+
+        // T4: Done unchanged
+        let t4 = get_task(&conn, "T4").unwrap().unwrap();
+        assert_eq!(t4.phase, Phase::Done);
+        assert_eq!(t4.attempts, 2);
+
+        // T5: archived Failed unchanged
+        let t5 = get_task(&conn, "T5").unwrap().unwrap();
+        assert_eq!(t5.phase, Phase::Failed);
+        assert_eq!(t5.attempts, 5);
+    }
+
+    #[test]
+    fn reset_all_failed_returns_zero_when_no_failed_tasks() {
+        let conn = open_memory().unwrap();
+        insert_task(&conn, &make_task("T1")).unwrap();
+        let count = reset_all_failed(&conn).unwrap();
+        assert_eq!(count, 0);
     }
 
     // ── Dependency queries ──────────────────────────────────
