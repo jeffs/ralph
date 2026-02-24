@@ -372,6 +372,16 @@ pub fn count_archived(conn: &Connection) -> Result<u64> {
     Ok(count as u64)
 }
 
+/// Return the maximum priority among non-archived tasks, or `None` if there are none.
+pub fn max_priority(conn: &Connection) -> Result<Option<u32>> {
+    let max: Option<i64> = conn.query_row(
+        "SELECT MAX(priority) FROM tasks WHERE archived = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(max.map(|v| v as u32))
+}
+
 /// Update phase and related timestamps.
 ///
 /// - Always sets `phase_entered_at` to `now`.
@@ -977,6 +987,54 @@ mod tests {
         archive_task(&conn, "T3").unwrap();
 
         assert_eq!(count_archived(&conn).unwrap(), 2);
+    }
+
+    // ── max_priority ────────────────────────────────────────
+
+    #[test]
+    fn max_priority_empty_db_returns_none() {
+        let conn = open_memory().unwrap();
+        assert_eq!(max_priority(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn max_priority_single_task_returns_its_priority() {
+        let conn = open_memory().unwrap();
+        let mut t = make_task("T1");
+        t.priority = 7;
+        insert_task(&conn, &t).unwrap();
+        assert_eq!(max_priority(&conn).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn max_priority_multiple_tasks_returns_max() {
+        let conn = open_memory().unwrap();
+        let mut t1 = make_task("T1");
+        t1.priority = 3;
+        let mut t2 = make_task("T2");
+        t2.priority = 10;
+        let mut t3 = make_task("T3");
+        t3.priority = 1;
+        insert_tasks(&conn, &[t1, t2, t3]).unwrap();
+        assert_eq!(max_priority(&conn).unwrap(), Some(10));
+    }
+
+    #[test]
+    fn max_priority_excludes_archived_tasks() {
+        let conn = open_memory().unwrap();
+        let mut archived = make_task("T1");
+        archived.priority = 99;
+        archived.archived = true;
+        insert_task(&conn, &archived).unwrap();
+
+        // No active tasks — should return None even though archived task exists.
+        assert_eq!(max_priority(&conn).unwrap(), None);
+
+        // Add an active task with lower priority.
+        let mut active = make_task("T2");
+        active.priority = 5;
+        insert_task(&conn, &active).unwrap();
+        assert_eq!(max_priority(&conn).unwrap(), Some(5));
     }
 
     // ── update_phase ────────────────────────────────────────
