@@ -47,32 +47,6 @@ fn reset_or_fail_phase(attempts: u32, config: &Config) -> Phase {
     }
 }
 
-/// Decide whether a failure is worth retrying based on its
-/// classification. Timeouts and unknown errors are retryable;
-/// build errors and test failures are retryable (the implementer
-/// gets feedback). Review rejections are always retryable.
-fn should_retry(kind: agent::FailureKind) -> bool {
-    match kind {
-        agent::FailureKind::Timeout => true,
-        agent::FailureKind::BuildError => true,
-        agent::FailureKind::TestFailure => true,
-        agent::FailureKind::ReviewRejection => true,
-        agent::FailureKind::Unknown => true,
-    }
-}
-
-/// Like `reset_or_fail_phase` but consults failure classification.
-/// Non-retryable failures go straight to Failed regardless of
-/// attempt count.
-#[allow(dead_code)]
-fn reset_or_fail_classified_phase(attempts: u32, config: &Config, reason: &str) -> Phase {
-    let kind = agent::classify_failure(reason);
-    if !should_retry(kind) || attempts >= config.max_attempts {
-        Phase::Failed
-    } else {
-        Phase::Pending
-    }
-}
 
 /// Format guidance entries as a bullet list for prompt injection.
 fn build_guidance(entries: &[String]) -> String {
