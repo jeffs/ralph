@@ -191,20 +191,6 @@ fn partial_into_task(p: PartialTask, blocked_by: Vec<String>) -> Result<Task> {
     })
 }
 
-/// Build a task_id → dep_ids map from all rows in task_deps.
-fn all_deps(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
-    let mut stmt =
-        conn.prepare("SELECT task_id, dep_id FROM task_deps ORDER BY task_id, dep_id")?;
-    let pairs: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for (task_id, dep_id) in pairs {
-        map.entry(task_id).or_default().push(dep_id);
-    }
-    Ok(map)
-}
-
 /// Upsert a single task without starting a new transaction.
 /// Use within an already-open transaction for batch imports.
 pub fn upsert_task_no_tx(conn: &Connection, task: &Task) -> Result<()> {
@@ -284,7 +270,20 @@ fn list_tasks_where(conn: &Connection, filter: &str) -> Result<Vec<Task>> {
         .query_map([], row_to_partial)?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut deps = all_deps(conn)?;
+    let deps_sql = format!(
+        "SELECT task_id, dep_id FROM task_deps \
+         WHERE task_id IN (SELECT id FROM tasks {filter}) \
+         ORDER BY task_id, dep_id"
+    );
+    let mut deps_stmt = conn.prepare(&deps_sql)?;
+    let pairs: Vec<(String, String)> = deps_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+    for (task_id, dep_id) in pairs {
+        deps.entry(task_id).or_default().push(dep_id);
+    }
+
     partials
         .into_iter()
         .map(|p| {
