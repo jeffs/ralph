@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::nit::{Nit, NitStatus};
-use crate::task::{Directive, DirectiveAction, Phase, Task};
+use crate::task::{Phase, Task};
 
 /// Default path to the SQLite database.
 pub fn db_path() -> PathBuf {
@@ -61,12 +61,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (task_id, dep_id)
         );
 
-        CREATE TABLE IF NOT EXISTS directives (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id TEXT NOT NULL,
-            action  TEXT NOT NULL
-        );
-
         CREATE TABLE IF NOT EXISTS nits (
             id          TEXT    PRIMARY KEY,
             source_task TEXT    NOT NULL,
@@ -114,23 +108,6 @@ fn phase_from_str(s: &str) -> Result<Phase> {
         "Failed" => Ok(Phase::Failed),
         "Skipped" => Ok(Phase::Skipped),
         _ => anyhow::bail!("unknown phase: {s}"),
-    }
-}
-
-fn directive_action_to_str(action: DirectiveAction) -> &'static str {
-    match action {
-        DirectiveAction::Skip => "Skip",
-        DirectiveAction::Fail => "Fail",
-        DirectiveAction::Reset => "Reset",
-    }
-}
-
-fn directive_action_from_str(s: &str) -> Result<DirectiveAction> {
-    match s {
-        "Skip" => Ok(DirectiveAction::Skip),
-        "Fail" => Ok(DirectiveAction::Fail),
-        "Reset" => Ok(DirectiveAction::Reset),
-        _ => anyhow::bail!("unknown directive action: {s}"),
     }
 }
 
@@ -574,65 +551,6 @@ pub fn validate_deps(conn: &Connection) -> Result<()> {
     }
 }
 
-// ── Directive CRUD ────────────────────────────────────────────
-
-pub fn insert_directive(
-    conn: &Connection,
-    task_id: &str,
-    action: DirectiveAction,
-) -> Result<()> {
-    let action_str = directive_action_to_str(action);
-    conn.execute(
-        "INSERT INTO directives (task_id, action) VALUES (?1, ?2)",
-        params![task_id, action_str],
-    )?;
-    Ok(())
-}
-
-/// SELECT all directives then DELETE them, atomically.
-pub fn drain_directives(conn: &Connection) -> Result<Vec<Directive>> {
-    let tx = conn.unchecked_transaction()?;
-
-    let raw: Vec<(String, String)> = {
-        let mut stmt =
-            tx.prepare("SELECT task_id, action FROM directives ORDER BY id")?;
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?
-    };
-
-    let directives = raw
-        .into_iter()
-        .map(|(task_id, action_str)| -> Result<Directive> {
-            Ok(Directive {
-                task_id,
-                action: directive_action_from_str(&action_str)?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    tx.execute("DELETE FROM directives", [])?;
-    tx.commit()?;
-    Ok(directives)
-}
-
-/// SELECT directives without deleting them.
-pub fn peek_directives(conn: &Connection) -> Result<Vec<Directive>> {
-    let mut stmt =
-        conn.prepare("SELECT task_id, action FROM directives ORDER BY id")?;
-    let raw: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-
-    raw.into_iter()
-        .map(|(task_id, action_str)| -> Result<Directive> {
-            Ok(Directive {
-                task_id,
-                action: directive_action_from_str(&action_str)?,
-            })
-        })
-        .collect()
-}
-
 // ── Nit CRUD ──────────────────────────────────────────────────
 
 pub fn insert_nit(conn: &Connection, nit: &Nit) -> Result<()> {
@@ -807,12 +725,12 @@ mod tests {
         let table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
-                 ('tasks','task_deps','directives','nits','meta')",
+                 ('tasks','task_deps','nits','meta')",
                 [],
                 |row| row.get(0),
             )
             .expect("sqlite_master query failed");
-        assert_eq!(table_count, 5, "expected 5 tables, found {table_count}");
+        assert_eq!(table_count, 4, "expected 4 tables, found {table_count}");
 
         let version: String = conn
             .query_row(
@@ -1266,70 +1184,6 @@ mod tests {
             "error should name the cycle participants: {err}"
         );
         assert!(msg.contains("cycle"), "error should mention 'cycle': {err}");
-    }
-
-    // ── Directive CRUD ──────────────────────────────────────
-
-    #[test]
-    fn insert_and_peek_directives() {
-        let conn = open_memory().unwrap();
-        insert_directive(&conn, "T1", DirectiveAction::Skip).unwrap();
-        insert_directive(&conn, "T2", DirectiveAction::Fail).unwrap();
-
-        let peeked = peek_directives(&conn).unwrap();
-        assert_eq!(peeked.len(), 2);
-        assert_eq!(peeked[0].task_id, "T1");
-        assert_eq!(peeked[0].action, DirectiveAction::Skip);
-        assert_eq!(peeked[1].task_id, "T2");
-        assert_eq!(peeked[1].action, DirectiveAction::Fail);
-    }
-
-    #[test]
-    fn drain_directives_returns_and_deletes() {
-        let conn = open_memory().unwrap();
-        insert_directive(&conn, "T1", DirectiveAction::Reset).unwrap();
-        insert_directive(&conn, "T2", DirectiveAction::Skip).unwrap();
-
-        let drained = drain_directives(&conn).unwrap();
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].task_id, "T1");
-        assert_eq!(drained[0].action, DirectiveAction::Reset);
-
-        // Table should be empty now
-        let after = peek_directives(&conn).unwrap();
-        assert!(after.is_empty());
-    }
-
-    #[test]
-    fn drain_directives_on_empty_table() {
-        let conn = open_memory().unwrap();
-        let result = drain_directives(&conn).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn peek_directives_does_not_delete() {
-        let conn = open_memory().unwrap();
-        insert_directive(&conn, "T1", DirectiveAction::Fail).unwrap();
-
-        peek_directives(&conn).unwrap();
-        peek_directives(&conn).unwrap();
-
-        let still_there = peek_directives(&conn).unwrap();
-        assert_eq!(still_there.len(), 1);
-    }
-
-    #[test]
-    fn all_three_directive_actions_roundtrip() {
-        let conn = open_memory().unwrap();
-        insert_directive(&conn, "A", DirectiveAction::Skip).unwrap();
-        insert_directive(&conn, "B", DirectiveAction::Fail).unwrap();
-        insert_directive(&conn, "C", DirectiveAction::Reset).unwrap();
-
-        let peeked = peek_directives(&conn).unwrap();
-        assert_eq!(peeked[0].action, DirectiveAction::Skip);
-        assert_eq!(peeked[1].action, DirectiveAction::Fail);
-        assert_eq!(peeked[2].action, DirectiveAction::Reset);
     }
 
     // ── Nit CRUD ────────────────────────────────────────────

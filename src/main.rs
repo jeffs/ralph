@@ -88,7 +88,7 @@ enum Command {
         /// Task ID to restore
         task_id: String,
     },
-    /// Dump full project state (tasks, directives, nits)
+    /// Dump full project state (tasks, nits)
     Dump {
         /// Output as JSON
         #[arg(long)]
@@ -314,15 +314,25 @@ async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
         );
     }
 
-    let directive_action = match action {
-        "skip" => task::DirectiveAction::Skip,
-        "fail" => task::DirectiveAction::Fail,
-        "reset" => task::DirectiveAction::Reset,
+    let now = task::unix_now();
+    match action {
+        "skip" => {
+            db::update_phase(&conn, task_id, task::Phase::Skipped, now)?;
+        }
+        "fail" => {
+            db::update_phase(&conn, task_id, task::Phase::Failed, now)?;
+            db::update_last_error(&conn, task_id, Some("manually failed via `ralph fail`"))?;
+        }
+        "reset" => {
+            db::update_phase(&conn, task_id, task::Phase::Pending, now)?;
+            db::update_attempts(&conn, task_id, 0)?;
+            db::update_last_error(&conn, task_id, None)?;
+            db::clear_feedback(&conn, task_id)?;
+            // guidance is intentionally preserved
+        }
         _ => unreachable!(),
-    };
-
-    db::insert_directive(&conn, task_id, directive_action)?;
-    eprintln!("Queued {action} for {task_id}");
+    }
+    eprintln!("Applied {action} to {task_id}");
     Ok(())
 }
 
@@ -347,10 +357,14 @@ async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
                 eprintln!("No failed tasks to reset.");
                 return Ok(());
             }
+            let now = task::unix_now();
             for id in &failed_ids {
-                db::insert_directive(&conn, id, task::DirectiveAction::Reset)?;
+                db::update_phase(&conn, id, task::Phase::Pending, now)?;
+                db::update_attempts(&conn, id, 0)?;
+                db::update_last_error(&conn, id, None)?;
+                db::clear_feedback(&conn, id)?;
             }
-            eprintln!("Queued reset for {} task(s): {}", failed_ids.len(), failed_ids.join(", "));
+            eprintln!("Reset {} task(s): {}", failed_ids.len(), failed_ids.join(", "));
             Ok(())
         }
         (Some(_), true) => anyhow::bail!("Provide either a task ID or --failed, not both"),
@@ -416,11 +430,6 @@ async fn cmd_status(json: bool) -> Result<()> {
         "Summary: {} done, {} skipped, {} failed, {} in-progress, {} pending",
         done, skipped, failed, in_progress, pending
     );
-
-    let directives = db::peek_directives(&conn)?;
-    if !directives.is_empty() {
-        println!("Pending directives: {}", directives.len());
-    }
 
     let all_tasks = db::list_all_tasks(&conn)?;
     let archived_count = all_tasks.iter().filter(|t| t.archived).count();
@@ -682,7 +691,6 @@ fn format_task_md(out: &mut String, t: &task::Task) {
 
 fn cmd_dump_markdown(
     tasks: &[task::Task],
-    directives: &[task::Directive],
     nits: &[nit::Nit],
     all: bool,
 ) -> Result<()> {
@@ -711,18 +719,6 @@ fn cmd_dump_markdown(
         }
     }
 
-    if !directives.is_empty() {
-        out.push_str("\n## Directives (pending)\n");
-        for d in directives {
-            let action = match d.action {
-                task::DirectiveAction::Skip => "Skip",
-                task::DirectiveAction::Fail => "Fail",
-                task::DirectiveAction::Reset => "Reset",
-            };
-            out.push_str(&format!("- {action} {}\n", d.task_id));
-        }
-    }
-
     if !nits.is_empty() {
         out.push_str("\n## Open Nits\n");
         for n in nits {
@@ -741,7 +737,6 @@ fn cmd_dump_markdown(
 
 fn cmd_dump_json(
     tasks: &[task::Task],
-    directives: &[task::Directive],
     nits: &[nit::Nit],
 ) -> Result<()> {
     #[derive(serde::Serialize)]
@@ -765,15 +760,8 @@ fn cmd_dump_json(
     }
 
     #[derive(serde::Serialize)]
-    struct DumpDirective<'a> {
-        task_id: &'a str,
-        action: &'a task::DirectiveAction,
-    }
-
-    #[derive(serde::Serialize)]
     struct Dump<'a> {
         tasks: Vec<DumpTask<'a>>,
-        directives: Vec<DumpDirective<'a>>,
         nits: &'a [nit::Nit],
     }
 
@@ -799,13 +787,6 @@ fn cmd_dump_json(
                 archived: t.archived,
             })
             .collect(),
-        directives: directives
-            .iter()
-            .map(|d| DumpDirective {
-                task_id: &d.task_id,
-                action: &d.action,
-            })
-            .collect(),
         nits,
     };
 
@@ -818,7 +799,7 @@ async fn cmd_dump(json: bool, all: bool) -> Result<()> {
     let db_path = db::db_path();
     if !db_path.exists() {
         if json {
-            println!(r#"{{"tasks":[],"directives":[],"nits":[]}}"#);
+            println!(r#"{{"tasks":[],"nits":[]}}"#);
         } else {
             println!("No tasks found. Run `ralph plan` first.");
         }
@@ -831,14 +812,13 @@ async fn cmd_dump(json: bool, all: bool) -> Result<()> {
     } else {
         db::list_active_tasks(&conn)?
     };
-    let directives = db::peek_directives(&conn)?;
     // Markdown shows open nits; JSON shows all nits for a complete snapshot.
     let nits = db::list_nits(&conn, json)?;
 
     if json {
-        cmd_dump_json(&tasks, &directives, &nits)
+        cmd_dump_json(&tasks, &nits)
     } else {
-        cmd_dump_markdown(&tasks, &directives, &nits, all)
+        cmd_dump_markdown(&tasks, &nits, all)
     }
 }
 
@@ -900,25 +880,7 @@ async fn cmd_import(dir: PathBuf) -> Result<()> {
         Vec::new()
     };
 
-    // ── Step 4: directives.json → Vec<Directive> (JSONL) ──────
-    let directives_path = dir.join("directives.json");
-    let directives_list: Vec<task::Directive> = if directives_path.exists() {
-        let contents = tokio::fs::read_to_string(&directives_path).await?;
-        contents
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .enumerate()
-            .map(|(i, line)| {
-                serde_json::from_str::<task::Directive>(line).map_err(|e| {
-                    anyhow::anyhow!("parsing directive on line {}: {e}", i + 1)
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
-
-    // ── Step 5: nits.jsonl → Vec<Nit> ────────────────────────
+    // ── Step 4: nits.jsonl → Vec<Nit> ─────────────────────────
     let nits_path = dir.join("nits.jsonl");
     let nits_list: Vec<nit::Nit> = if nits_path.exists() {
         let contents = tokio::fs::read_to_string(&nits_path).await?;
@@ -977,9 +939,6 @@ async fn cmd_import(dir: PathBuf) -> Result<()> {
     for t in active_tasks.iter().chain(archived_tasks.iter()) {
         db::upsert_task_no_tx(&tx, t)?;
     }
-    for d in &directives_list {
-        db::insert_directive(&tx, &d.task_id, d.action)?;
-    }
     for n in &nits_list {
         db::insert_nit(&tx, n)?;
     }
@@ -989,10 +948,9 @@ async fn cmd_import(dir: PathBuf) -> Result<()> {
     let archived_count = archived_tasks.len();
     let total_tasks = active_tasks.len() + archived_count;
     println!(
-        "Imported {} tasks ({} archived), {} directives, {} nits.",
+        "Imported {} tasks ({} archived), {} nits.",
         total_tasks,
         archived_count,
-        directives_list.len(),
         nits_list.len()
     );
     Ok(())

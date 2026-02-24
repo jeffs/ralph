@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::db;
 use crate::nit::truncate_with_ellipsis;
 use crate::scheduler;
-use crate::task::{DirectiveAction, Phase, Task, TaskDef, unix_now};
+use crate::task::{Phase, Task, TaskDef, unix_now};
 
 /// Install a background task that listens for SIGINT and SIGTERM,
 /// kills all registered process groups, then exits.
@@ -268,47 +268,10 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
 
         registry.audit_and_kill_orphans().await;
 
-        let mut tasks = db::list_active_tasks(conn)?;
+        // CLI commands (skip/fail/reset) mutate the DB directly,
+        // so a fresh load picks up any changes.
+        let tasks = db::list_active_tasks(conn)?;
         db::validate_deps(conn)?;
-
-        // Drain sideband directives (from ralph skip/fail/reset)
-        let directives = db::drain_directives(conn)?;
-        if !directives.is_empty() {
-            let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-            for d in &directives {
-                eprintln!("[ralph] applying directive: {:?} {}", d.action, d.task_id);
-                if !task_ids.contains(d.task_id.as_str()) {
-                    eprintln!(
-                        "[ralph] directive for unknown task '{}', skipping",
-                        d.task_id
-                    );
-                    continue;
-                }
-                let now = unix_now();
-                match d.action {
-                    DirectiveAction::Skip => {
-                        db::update_phase(conn, &d.task_id, Phase::Skipped, now)?;
-                    }
-                    DirectiveAction::Fail => {
-                        db::update_phase(conn, &d.task_id, Phase::Failed, now)?;
-                        db::update_last_error(
-                            conn,
-                            &d.task_id,
-                            Some("manually failed via `ralph fail`"),
-                        )?;
-                    }
-                    DirectiveAction::Reset => {
-                        db::update_phase(conn, &d.task_id, Phase::Pending, now)?;
-                        db::update_attempts(conn, &d.task_id, 0)?;
-                        db::update_last_error(conn, &d.task_id, None)?;
-                        db::clear_feedback(conn, &d.task_id)?;
-                        // guidance is intentionally preserved
-                    }
-                }
-            }
-            // Reload tasks since phases changed
-            tasks = db::list_active_tasks(conn)?;
-        }
 
         // Check convergence: all done → final review
         if tasks.iter().all(|t| t.phase.satisfies_dep()) {

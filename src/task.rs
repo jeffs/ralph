@@ -43,21 +43,6 @@ pub fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// A sideband override written by `ralph skip/fail/reset` and
-/// drained atomically by the orchestrator each iteration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Directive {
-    pub task_id: String,
-    pub action: DirectiveAction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DirectiveAction {
-    Skip,
-    Fail,
-    Reset,
-}
-
 /// Lightweight task definition as produced by the planner (JSONL).
 /// Execution metadata lives in the unified `Task` struct, persisted
 /// via `db.rs`.
