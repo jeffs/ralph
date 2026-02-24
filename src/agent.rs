@@ -623,6 +623,46 @@ async fn monitor_agent(
     }
 }
 
+/// Write the agent's response and stderr to a log file under `.ralph/logs/`.
+///
+/// Filename: `{task_id}-{role}-{attempt}.md` for task-scoped invocations,
+/// or `{role}-{attempt}.md` for global ones (plan, triage, final review).
+/// Errors are logged to stderr and swallowed — logging must never break
+/// the orchestration loop.
+async fn write_agent_log(
+    task_id: Option<&str>,
+    role: &str,
+    attempt: u32,
+    result: &AgentResult,
+) {
+    let logs_dir = Path::new(".ralph").join("logs");
+    if let Err(e) = tokio::fs::create_dir_all(&logs_dir).await {
+        eprintln!("[ralph] failed to create logs dir: {e}");
+        return;
+    }
+
+    let stem = match task_id {
+        Some(id) => format!("{id}-{role}-{attempt}"),
+        None => format!("{role}-{attempt}"),
+    };
+    let path = logs_dir.join(format!("{stem}.md"));
+
+    let mut content = String::new();
+    content.push_str(&result.text);
+    if !result.stderr_lines.is_empty() {
+        content.push_str("\n\n---\n## stderr\n```\n");
+        for line in &result.stderr_lines {
+            content.push_str(line);
+            content.push('\n');
+        }
+        content.push_str("```\n");
+    }
+
+    if let Err(e) = tokio::fs::write(&path, &content).await {
+        eprintln!("[ralph] failed to write agent log {}: {e}", path.display());
+    }
+}
+
 /// Invoke a claude agent with the given role and context.
 /// When `working_dir` is `Some`, the subprocess runs in that directory.
 ///
@@ -782,35 +822,35 @@ pub async fn invoke_agent(
         }
     }
 
-    match monitor_result {
+    let agent_result = match monitor_result {
         Ok(exit_status) => {
             kill_process_group(child_pid, 0).await;
             registry.deregister(child_pid);
 
             if !exit_status.success() {
                 let (text, cost_usd) = parse_stdout(&stdout_bytes);
-                return Ok(AgentResult {
+                AgentResult {
                     text,
                     status: AgentStatus::Failure {
                         reason: format!("claude exited with {}", exit_status),
                     },
                     cost_usd,
                     stderr_lines,
-                });
-            }
+                }
+            } else {
+                let (text, cost_usd) = parse_stdout(&stdout_bytes);
+                if let Some(cost) = cost_usd {
+                    eprintln!("[ralph] {} agent cost: ${cost:.4}", role.label());
+                }
 
-            let (text, cost_usd) = parse_stdout(&stdout_bytes);
-            if let Some(cost) = cost_usd {
-                eprintln!("[ralph] {} agent cost: ${cost:.4}", role.label());
+                let status = parse_agent_status(&text);
+                AgentResult {
+                    text,
+                    status,
+                    cost_usd,
+                    stderr_lines,
+                }
             }
-
-            let status = parse_agent_status(&text);
-            Ok(AgentResult {
-                text,
-                status,
-                cost_usd,
-                stderr_lines,
-            })
         }
         Err(status) => {
             // kill already happened in monitor_agent
@@ -818,14 +858,17 @@ pub async fn invoke_agent(
             registry.deregister(child_pid);
 
             let (text, cost_usd) = parse_stdout(&stdout_bytes);
-            Ok(AgentResult {
+            AgentResult {
                 text,
                 status,
                 cost_usd,
                 stderr_lines,
-            })
+            }
         }
-    }
+    };
+
+    write_agent_log(context.task_id(), role.label(), attempt, &agent_result).await;
+    Ok(agent_result)
 }
 
 /// Parse a numbered-list failure reason into individual proposed tasks.
