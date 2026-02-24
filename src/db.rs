@@ -21,7 +21,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 /// Open an in-memory database with the same schema. Used in tests.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn open_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     init_conn(&conn)?;
@@ -296,7 +296,7 @@ fn list_tasks_where(conn: &Connection, filter: &str) -> Result<Vec<Task>> {
 // ── Task CRUD ─────────────────────────────────────────────────
 
 /// Upsert a task row and replace its deps atomically.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn insert_task(conn: &Connection, task: &Task) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     upsert_task_in(&tx, task)?;
@@ -469,7 +469,7 @@ pub fn set_guidance(conn: &Connection, id: &str, guidance: &[String]) -> Result<
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn update_postmortem(conn: &Connection, id: &str, text: Option<&str>) -> Result<()> {
     conn.execute(
         "UPDATE tasks SET postmortem = ?1 WHERE id = ?2",
