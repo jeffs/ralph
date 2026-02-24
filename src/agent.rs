@@ -572,9 +572,12 @@ impl AgentBackend {
                 }
             }
             AgentBackend::Codex => {
+                let raw = String::from_utf8_lossy(stdout);
                 let mut text = String::new();
-                for line in String::from_utf8_lossy(stdout).lines() {
+                let mut found_json = false;
+                for line in raw.lines() {
                     if let Ok(event) = serde_json::from_str::<CodexEvent>(line) {
+                        found_json = true;
                         if event.event_type == "message" {
                             if let Some(item) = event.item {
                                 for content in item.content.unwrap_or_default() {
@@ -586,7 +589,11 @@ impl AgentBackend {
                         }
                     }
                 }
-                (text, None)
+                if found_json {
+                    (text, None)
+                } else {
+                    (raw.into_owned(), None)
+                }
             }
             AgentBackend::Gemini => {
                 let raw = String::from_utf8_lossy(stdout);
@@ -1882,5 +1889,29 @@ STATUS: FAILURE: issues found"#;
     fn backend_for_model_unknown_returns_err() {
         assert!(backend_for_model("unknown-thing").is_err());
         assert!(backend_for_model("mistral-large").is_err());
+    }
+
+    // --- AgentBackend::Codex parse_output ---
+
+    #[test]
+    fn codex_parse_output_structured_jsonl() {
+        // thread.started and turn.completed are ignored; only the message
+        // event (item.completed / agent_message) contributes to the output.
+        let jsonl = concat!(
+            "{\"type\":\"thread.started\"}\n",
+            "{\"type\":\"message\",\"item\":{\"content\":[{\"text\":\"Hello from Codex\"}]}}\n",
+            "{\"type\":\"turn.completed\"}\n",
+        );
+        let (text, cost) = AgentBackend::Codex.parse_output(jsonl.as_bytes());
+        assert_eq!(text, "Hello from Codex");
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn codex_parse_output_fallback_plain_text() {
+        let input = "plain text output, not JSONL";
+        let (text, cost) = AgentBackend::Codex.parse_output(input.as_bytes());
+        assert_eq!(text, input);
+        assert_eq!(cost, None);
     }
 }
