@@ -1914,4 +1914,22 @@ STATUS: FAILURE: issues found"#;
         assert_eq!(text, input);
         assert_eq!(cost, None);
     }
+
+    // --- AgentBackend::Gemini parse_output ---
+
+    #[test]
+    fn gemini_parse_output_structured_json() {
+        let json = r#"{"candidates":[{"content":{"parts":[{"text":"some text"}]}}]}"#;
+        let (text, cost) = AgentBackend::Gemini.parse_output(json.as_bytes());
+        assert_eq!(text, "some text");
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn gemini_parse_output_fallback_plain_text() {
+        let input = "plain text output, not JSON";
+        let (text, cost) = AgentBackend::Gemini.parse_output(input.as_bytes());
+        assert_eq!(text, input);
+        assert_eq!(cost, None);
+    }
 }
