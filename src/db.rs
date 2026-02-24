@@ -352,6 +352,16 @@ pub fn list_all_tasks(conn: &Connection) -> Result<Vec<Task>> {
     list_tasks_where(conn, "")
 }
 
+/// Count non-archived tasks that are not in a terminal phase (Done or Skipped).
+pub fn count_non_terminal(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE archived = 0 AND phase NOT IN ('Done', 'Skipped')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
 /// Update phase and related timestamps.
 ///
 /// - Always sets `phase_entered_at` to `now`.
@@ -907,6 +917,40 @@ mod tests {
         let tasks = list_all_tasks(&conn).unwrap();
         let b_task = tasks.iter().find(|t| t.id == "B").unwrap();
         assert_eq!(b_task.blocked_by, vec!["A"]);
+    }
+
+    #[test]
+    fn count_non_terminal_excludes_done_and_skipped() {
+        let conn = open_memory().unwrap();
+
+        let mut t1 = make_task("T1");
+        t1.phase = Phase::Pending;
+        insert_task(&conn, &t1).unwrap();
+
+        let mut t2 = make_task("T2");
+        t2.phase = Phase::Implementing;
+        insert_task(&conn, &t2).unwrap();
+
+        let mut t3 = make_task("T3");
+        t3.phase = Phase::Done;
+        insert_task(&conn, &t3).unwrap();
+
+        let mut t4 = make_task("T4");
+        t4.phase = Phase::Skipped;
+        insert_task(&conn, &t4).unwrap();
+
+        let mut t5 = make_task("T5");
+        t5.phase = Phase::Failed;
+        insert_task(&conn, &t5).unwrap();
+
+        // Archived task in a non-terminal phase should not be counted
+        let mut t6 = make_task("T6");
+        t6.phase = Phase::Pending;
+        t6.archived = true;
+        insert_task(&conn, &t6).unwrap();
+
+        let count = count_non_terminal(&conn).unwrap();
+        assert_eq!(count, 3); // Pending, Implementing, Failed
     }
 
     // ── update_phase ────────────────────────────────────────
