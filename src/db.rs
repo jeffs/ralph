@@ -361,6 +361,16 @@ pub fn count_non_terminal(conn: &Connection) -> Result<u64> {
     Ok(count as u64)
 }
 
+/// Count archived tasks.
+pub fn count_archived(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE archived = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
 /// Return the maximum priority among non-archived tasks, or `None` if there are none.
 pub fn max_priority(conn: &Connection) -> Result<Option<u32>> {
     let max: Option<i64> = conn.query_row(

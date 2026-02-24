@@ -431,8 +431,7 @@ async fn cmd_status(json: bool) -> Result<()> {
         done, skipped, failed, in_progress, pending
     );
 
-    let all_tasks = db::list_all_tasks(&conn)?;
-    let archived_count = all_tasks.iter().filter(|t| t.archived).count();
+    let archived_count = db::count_archived(&conn)?;
     if archived_count > 0 {
         println!("Archived: {} task(s)", archived_count);
     }
