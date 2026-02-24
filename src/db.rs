@@ -21,7 +21,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 /// Open an in-memory database with the same schema. Used in tests.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn open_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     init_conn(&conn)?;
@@ -191,20 +191,6 @@ fn partial_into_task(p: PartialTask, blocked_by: Vec<String>) -> Result<Task> {
     })
 }
 
-/// Build a task_id → dep_ids map from all rows in task_deps.
-fn all_deps(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
-    let mut stmt =
-        conn.prepare("SELECT task_id, dep_id FROM task_deps ORDER BY task_id, dep_id")?;
-    let pairs: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for (task_id, dep_id) in pairs {
-        map.entry(task_id).or_default().push(dep_id);
-    }
-    Ok(map)
-}
-
 /// Upsert a single task without starting a new transaction.
 /// Use within an already-open transaction for batch imports.
 pub fn upsert_task_no_tx(conn: &Connection, task: &Task) -> Result<()> {
@@ -284,7 +270,20 @@ fn list_tasks_where(conn: &Connection, filter: &str) -> Result<Vec<Task>> {
         .query_map([], row_to_partial)?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut deps = all_deps(conn)?;
+    let deps_sql = format!(
+        "SELECT task_id, dep_id FROM task_deps \
+         WHERE task_id IN (SELECT id FROM tasks {filter}) \
+         ORDER BY task_id, dep_id"
+    );
+    let mut deps_stmt = conn.prepare(&deps_sql)?;
+    let pairs: Vec<(String, String)> = deps_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+    for (task_id, dep_id) in pairs {
+        deps.entry(task_id).or_default().push(dep_id);
+    }
+
     partials
         .into_iter()
         .map(|p| {
@@ -297,7 +296,7 @@ fn list_tasks_where(conn: &Connection, filter: &str) -> Result<Vec<Task>> {
 // ── Task CRUD ─────────────────────────────────────────────────
 
 /// Upsert a task row and replace its deps atomically.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn insert_task(conn: &Connection, task: &Task) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     upsert_task_in(&tx, task)?;
@@ -350,6 +349,36 @@ pub fn list_active_tasks(conn: &Connection) -> Result<Vec<Task>> {
 /// List all tasks including archived, ordered by priority.
 pub fn list_all_tasks(conn: &Connection) -> Result<Vec<Task>> {
     list_tasks_where(conn, "")
+}
+
+/// Count non-archived tasks that are not in a terminal phase (Done or Skipped).
+pub fn count_non_terminal(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE archived = 0 AND phase NOT IN ('Done', 'Skipped')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
+/// Count archived tasks.
+pub fn count_archived(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE archived = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
+/// Return the maximum priority among non-archived tasks, or `None` if there are none.
+pub fn max_priority(conn: &Connection) -> Result<Option<u32>> {
+    let max: Option<i64> = conn.query_row(
+        "SELECT MAX(priority) FROM tasks WHERE archived = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(max.map(|v| v as u32))
 }
 
 /// Update phase and related timestamps.
@@ -440,7 +469,7 @@ pub fn set_guidance(conn: &Connection, id: &str, guidance: &[String]) -> Result<
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn update_postmortem(conn: &Connection, id: &str, text: Option<&str>) -> Result<()> {
     conn.execute(
         "UPDATE tasks SET postmortem = ?1 WHERE id = ?2",
@@ -463,6 +492,36 @@ pub fn restore_task(conn: &Connection, id: &str) -> Result<()> {
         params![id],
     )?;
     Ok(())
+}
+
+/// Archive all non-archived tasks in a terminal phase (Done or Skipped).
+/// Returns the number of rows affected.
+pub fn archive_done_tasks(conn: &Connection) -> Result<u64> {
+    let rows = conn.execute(
+        "UPDATE tasks SET archived = 1 WHERE archived = 0 AND phase IN ('Done', 'Skipped')",
+        [],
+    )?;
+    Ok(rows as u64)
+}
+
+/// Reset all non-archived Failed tasks back to Pending.
+///
+/// Sets `phase = 'Pending'`, `phase_entered_at = now`, `attempts = 0`,
+/// `last_error = NULL`, and `feedback = '[]'`. Guidance is preserved.
+/// Returns the number of rows affected.
+pub fn reset_all_failed(conn: &Connection) -> Result<u64> {
+    let now = crate::task::unix_now() as i64;
+    let rows = conn.execute(
+        "UPDATE tasks SET
+            phase            = 'Pending',
+            phase_entered_at = ?1,
+            attempts         = 0,
+            last_error       = NULL,
+            feedback         = '[]'
+         WHERE archived = 0 AND phase = 'Failed'",
+        params![now],
+    )?;
+    Ok(rows as u64)
 }
 
 // ── Dependency queries ────────────────────────────────────────
@@ -553,6 +612,13 @@ pub fn validate_deps(conn: &Connection) -> Result<()> {
 
 // ── Nit CRUD ──────────────────────────────────────────────────
 
+/// Counts of nits grouped by status.
+pub struct NitCounts {
+    pub open: u64,
+    pub promoted: u64,
+    pub dismissed: u64,
+}
+
 pub fn insert_nit(conn: &Connection, nit: &Nit) -> Result<()> {
     let status_str = nit_status_to_str(&nit.status);
     conn.execute(
@@ -631,6 +697,47 @@ pub fn list_nits(conn: &Connection, include_all: bool) -> Result<Vec<Nit>> {
         .collect()
 }
 
+/// Fetch a single nit by ID. Returns `None` if not found.
+pub fn get_nit(conn: &Connection, id: &str) -> Result<Option<Nit>> {
+    let row = conn
+        .query_row(
+            "SELECT id, source_task, source_role, attempt, content, summary, \
+                    status, promoted_to, created_at \
+             FROM nits WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((id, source_task, source_role, attempt, content, summary, status_str, promoted_to, created_at)) = row else {
+        return Ok(None);
+    };
+
+    Ok(Some(Nit {
+        id,
+        source_task,
+        source_role,
+        attempt: attempt as u32,
+        content,
+        summary,
+        status: nit_status_from_str(&status_str)?,
+        promoted_to,
+        created_at: created_at as u64,
+    }))
+}
+
 pub fn update_nit_status(
     conn: &Connection,
     id: &str,
@@ -643,6 +750,25 @@ pub fn update_nit_status(
         params![status_str, promoted_to, id],
     )?;
     Ok(())
+}
+
+/// Return counts of nits for each status. Missing statuses default to 0.
+pub fn nit_status_counts(conn: &Connection) -> Result<NitCounts> {
+    let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM nits GROUP BY status")?;
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut counts = NitCounts { open: 0, promoted: 0, dismissed: 0 };
+    for (status, count) in rows {
+        match status.as_str() {
+            "Open" => counts.open = count as u64,
+            "Promoted" => counts.promoted = count as u64,
+            "Dismissed" => counts.dismissed = count as u64,
+            _ => {}
+        }
+    }
+    Ok(counts)
 }
 
 /// Return the next available NIT-N ID.
@@ -665,7 +791,6 @@ pub fn id_ranges_summary(conn: &Connection) -> Result<String> {
 }
 
 /// Return the next available GEN-N ID.
-#[allow(dead_code)]
 pub fn next_generated_id(conn: &Connection) -> Result<String> {
     let max: Option<i64> = conn.query_row(
         "SELECT MAX(CAST(SUBSTR(id, 5) AS INTEGER)) FROM tasks WHERE id LIKE 'GEN-%'",
@@ -909,6 +1034,108 @@ mod tests {
         assert_eq!(b_task.blocked_by, vec!["A"]);
     }
 
+    #[test]
+    fn count_non_terminal_excludes_done_and_skipped() {
+        let conn = open_memory().unwrap();
+
+        let mut t1 = make_task("T1");
+        t1.phase = Phase::Pending;
+        insert_task(&conn, &t1).unwrap();
+
+        let mut t2 = make_task("T2");
+        t2.phase = Phase::Implementing;
+        insert_task(&conn, &t2).unwrap();
+
+        let mut t3 = make_task("T3");
+        t3.phase = Phase::Done;
+        insert_task(&conn, &t3).unwrap();
+
+        let mut t4 = make_task("T4");
+        t4.phase = Phase::Skipped;
+        insert_task(&conn, &t4).unwrap();
+
+        let mut t5 = make_task("T5");
+        t5.phase = Phase::Failed;
+        insert_task(&conn, &t5).unwrap();
+
+        // Archived task in a non-terminal phase should not be counted
+        let mut t6 = make_task("T6");
+        t6.phase = Phase::Pending;
+        t6.archived = true;
+        insert_task(&conn, &t6).unwrap();
+
+        let count = count_non_terminal(&conn).unwrap();
+        assert_eq!(count, 3); // Pending, Implementing, Failed
+    }
+
+    #[test]
+    fn count_archived_counts_only_archived_tasks() {
+        let conn = open_memory().unwrap();
+
+        let mut t1 = make_task("T1");
+        t1.archived = false;
+        insert_task(&conn, &t1).unwrap();
+
+        let mut t2 = make_task("T2");
+        t2.archived = true;
+        insert_task(&conn, &t2).unwrap();
+
+        let mut t3 = make_task("T3");
+        t3.archived = true;
+        insert_task(&conn, &t3).unwrap();
+
+        let count = count_archived(&conn).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // ── max_priority ────────────────────────────────────────
+
+    #[test]
+    fn max_priority_empty_db_returns_none() {
+        let conn = open_memory().unwrap();
+        assert_eq!(max_priority(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn max_priority_single_task_returns_its_priority() {
+        let conn = open_memory().unwrap();
+        let mut t = make_task("T1");
+        t.priority = 7;
+        insert_task(&conn, &t).unwrap();
+        assert_eq!(max_priority(&conn).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn max_priority_multiple_tasks_returns_max() {
+        let conn = open_memory().unwrap();
+        let mut t1 = make_task("T1");
+        t1.priority = 3;
+        let mut t2 = make_task("T2");
+        t2.priority = 10;
+        let mut t3 = make_task("T3");
+        t3.priority = 1;
+        insert_tasks(&conn, &[t1, t2, t3]).unwrap();
+        assert_eq!(max_priority(&conn).unwrap(), Some(10));
+    }
+
+    #[test]
+    fn max_priority_excludes_archived_tasks() {
+        let conn = open_memory().unwrap();
+        let mut archived = make_task("T1");
+        archived.priority = 99;
+        archived.archived = true;
+        insert_task(&conn, &archived).unwrap();
+
+        // No active tasks — should return None even though archived task exists.
+        assert_eq!(max_priority(&conn).unwrap(), None);
+
+        // Add an active task with lower priority.
+        let mut active = make_task("T2");
+        active.priority = 5;
+        insert_task(&conn, &active).unwrap();
+        assert_eq!(max_priority(&conn).unwrap(), Some(5));
+    }
+
     // ── update_phase ────────────────────────────────────────
 
     #[test]
@@ -1111,6 +1338,145 @@ mod tests {
         assert_eq!(active.len(), 1);
     }
 
+    // ── archive_done_tasks ──────────────────────────────────
+
+    #[test]
+    fn archive_done_tasks_archives_only_done_and_skipped() {
+        let conn = open_memory().unwrap();
+
+        let mut done = make_task("T1");
+        done.phase = Phase::Done;
+        insert_task(&conn, &done).unwrap();
+
+        let mut skipped = make_task("T2");
+        skipped.phase = Phase::Skipped;
+        insert_task(&conn, &skipped).unwrap();
+
+        let pending = make_task("T3"); // Phase::Pending by default
+        insert_task(&conn, &pending).unwrap();
+
+        let mut failed = make_task("T4");
+        failed.phase = Phase::Failed;
+        insert_task(&conn, &failed).unwrap();
+
+        let count = archive_done_tasks(&conn).unwrap();
+        assert_eq!(count, 2, "expected 2 tasks archived");
+
+        assert!(get_task(&conn, "T1").unwrap().unwrap().archived, "Done task should be archived");
+        assert!(get_task(&conn, "T2").unwrap().unwrap().archived, "Skipped task should be archived");
+        assert!(!get_task(&conn, "T3").unwrap().unwrap().archived, "Pending task should not be archived");
+        assert!(!get_task(&conn, "T4").unwrap().unwrap().archived, "Failed task should not be archived");
+    }
+
+    #[test]
+    fn archive_done_tasks_skips_already_archived() {
+        let conn = open_memory().unwrap();
+
+        // Already-archived Done task — should not be double-counted.
+        let mut already = make_task("T1");
+        already.phase = Phase::Done;
+        already.archived = true;
+        insert_task(&conn, &already).unwrap();
+
+        // Active Done task — should be archived.
+        let mut active = make_task("T2");
+        active.phase = Phase::Done;
+        insert_task(&conn, &active).unwrap();
+
+        let count = archive_done_tasks(&conn).unwrap();
+        assert_eq!(count, 1);
+        assert!(get_task(&conn, "T2").unwrap().unwrap().archived);
+    }
+
+    #[test]
+    fn archive_done_tasks_returns_zero_when_nothing_to_archive() {
+        let conn = open_memory().unwrap();
+        insert_task(&conn, &make_task("T1")).unwrap(); // Pending
+        let count = archive_done_tasks(&conn).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ── reset_all_failed ────────────────────────────────────
+
+    #[test]
+    fn reset_all_failed_resets_only_failed_tasks() {
+        let conn = open_memory().unwrap();
+
+        // Failed task with error, feedback, and guidance
+        let mut failed = make_task("T1");
+        failed.phase = Phase::Failed;
+        failed.attempts = 3;
+        failed.last_error = Some("compile error".to_string());
+        failed.feedback = vec!["reviewer: nope".to_string()];
+        failed.guidance = vec!["use bun".to_string()];
+        insert_task(&conn, &failed).unwrap();
+
+        // Another failed task
+        let mut failed2 = make_task("T2");
+        failed2.phase = Phase::Failed;
+        failed2.attempts = 1;
+        failed2.last_error = Some("test failed".to_string());
+        insert_task(&conn, &failed2).unwrap();
+
+        // Pending task — should not be touched
+        let pending = make_task("T3");
+        insert_task(&conn, &pending).unwrap();
+
+        // Done task — should not be touched
+        let mut done = make_task("T4");
+        done.phase = Phase::Done;
+        done.attempts = 2;
+        insert_task(&conn, &done).unwrap();
+
+        // Archived failed task — should not be touched
+        let mut archived_failed = make_task("T5");
+        archived_failed.phase = Phase::Failed;
+        archived_failed.archived = true;
+        archived_failed.attempts = 5;
+        insert_task(&conn, &archived_failed).unwrap();
+
+        let count = reset_all_failed(&conn).unwrap();
+        assert_eq!(count, 2, "expected 2 failed tasks reset");
+
+        // T1: reset to Pending with cleared error/feedback, guidance preserved
+        let t1 = get_task(&conn, "T1").unwrap().unwrap();
+        assert_eq!(t1.phase, Phase::Pending);
+        assert_eq!(t1.attempts, 0);
+        assert!(t1.last_error.is_none());
+        assert!(t1.feedback.is_empty());
+        assert_eq!(t1.guidance, vec!["use bun"], "guidance should be preserved");
+        assert!(t1.phase_entered_at.is_some(), "phase_entered_at should be set");
+
+        // T2: also reset
+        let t2 = get_task(&conn, "T2").unwrap().unwrap();
+        assert_eq!(t2.phase, Phase::Pending);
+        assert_eq!(t2.attempts, 0);
+        assert!(t2.last_error.is_none());
+
+        // T3: Pending unchanged
+        let t3 = get_task(&conn, "T3").unwrap().unwrap();
+        assert_eq!(t3.phase, Phase::Pending);
+        assert_eq!(t3.attempts, 0);
+
+        // T4: Done unchanged
+        let t4 = get_task(&conn, "T4").unwrap().unwrap();
+        assert_eq!(t4.phase, Phase::Done);
+        assert_eq!(t4.attempts, 2);
+
+        // T5: archived Failed unchanged
+        let t5 = get_task(&conn, "T5").unwrap().unwrap();
+        assert_eq!(t5.phase, Phase::Failed);
+        assert_eq!(t5.attempts, 5);
+    }
+
+    #[test]
+    fn reset_all_failed_returns_zero_when_no_failed_tasks() {
+        let conn = open_memory().unwrap();
+        insert_task(&conn, &make_task("T1")).unwrap();
+        let count = reset_all_failed(&conn).unwrap();
+        assert_eq!(count, 0);
+    }
+
     // ── Dependency queries ──────────────────────────────────
 
     #[test]
@@ -1289,6 +1655,62 @@ mod tests {
         assert_eq!(nits.len(), 1);
         assert_eq!(nits[0].status, NitStatus::Dismissed);
         assert_eq!(nits[0].content, "updated content");
+    }
+
+    #[test]
+    fn get_nit_returns_correct_fields() {
+        let conn = open_memory().unwrap();
+        let nit = Nit {
+            id: "NIT-1".to_string(),
+            source_task: "T1".to_string(),
+            source_role: "reviewer".to_string(),
+            attempt: 2,
+            content: "fix the docs".to_string(),
+            summary: "Doc fix".to_string(),
+            status: NitStatus::Open,
+            promoted_to: None,
+            created_at: 7777,
+        };
+        insert_nit(&conn, &nit).unwrap();
+
+        let got = get_nit(&conn, "NIT-1").unwrap().unwrap();
+        assert_eq!(got.id, "NIT-1");
+        assert_eq!(got.source_task, "T1");
+        assert_eq!(got.source_role, "reviewer");
+        assert_eq!(got.attempt, 2);
+        assert_eq!(got.content, "fix the docs");
+        assert_eq!(got.summary, "Doc fix");
+        assert_eq!(got.status, NitStatus::Open);
+        assert!(got.promoted_to.is_none());
+        assert_eq!(got.created_at, 7777);
+    }
+
+    #[test]
+    fn get_nit_missing_id_returns_none() {
+        let conn = open_memory().unwrap();
+        let result = get_nit(&conn, "NIT-999").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn nit_status_counts_returns_correct_counts() {
+        let conn = open_memory().unwrap();
+
+        // Empty table — all counts should be 0.
+        let counts = nit_status_counts(&conn).unwrap();
+        assert_eq!(counts.open, 0);
+        assert_eq!(counts.promoted, 0);
+        assert_eq!(counts.dismissed, 0);
+
+        insert_nit(&conn, &make_nit("NIT-1", NitStatus::Open)).unwrap();
+        insert_nit(&conn, &make_nit("NIT-2", NitStatus::Open)).unwrap();
+        insert_nit(&conn, &make_nit("NIT-3", NitStatus::Promoted)).unwrap();
+        // No Dismissed nits inserted — dismissed should remain 0.
+
+        let counts = nit_status_counts(&conn).unwrap();
+        assert_eq!(counts.open, 2);
+        assert_eq!(counts.promoted, 1);
+        assert_eq!(counts.dismissed, 0);
     }
 
     // ── ID helpers ──────────────────────────────────────────

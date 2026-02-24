@@ -347,24 +347,12 @@ async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
             }
             std::fs::create_dir_all(".ralph")?;
             let conn = db::open(&db_path)?;
-            let tasks = db::list_active_tasks(&conn)?;
-            let failed_ids: Vec<String> = tasks
-                .iter()
-                .filter(|t| matches!(t.phase, task::Phase::Failed))
-                .map(|t| t.id.clone())
-                .collect();
-            if failed_ids.is_empty() {
+            let count = db::reset_all_failed(&conn)?;
+            if count == 0 {
                 eprintln!("No failed tasks to reset.");
-                return Ok(());
+            } else {
+                eprintln!("Reset {count} failed task(s).");
             }
-            let now = task::unix_now();
-            for id in &failed_ids {
-                db::update_phase(&conn, id, task::Phase::Pending, now)?;
-                db::update_attempts(&conn, id, 0)?;
-                db::update_last_error(&conn, id, None)?;
-                db::clear_feedback(&conn, id)?;
-            }
-            eprintln!("Reset {} task(s): {}", failed_ids.len(), failed_ids.join(", "));
             Ok(())
         }
         (Some(_), true) => anyhow::bail!("Provide either a task ID or --failed, not both"),
@@ -431,8 +419,7 @@ async fn cmd_status(json: bool) -> Result<()> {
         done, skipped, failed, in_progress, pending
     );
 
-    let all_tasks = db::list_all_tasks(&conn)?;
-    let archived_count = all_tasks.iter().filter(|t| t.archived).count();
+    let archived_count = db::count_archived(&conn)?;
     if archived_count > 0 {
         println!("Archived: {} task(s)", archived_count);
     }
@@ -566,23 +553,12 @@ async fn cmd_archive(task_id: Option<String>, done: bool) -> Result<()> {
             }
         }
     } else if done {
-        let tasks = db::list_active_tasks(&conn)?;
-        let to_archive: Vec<String> = tasks
-            .iter()
-            .filter(|t| matches!(t.phase, task::Phase::Done | task::Phase::Skipped))
-            .map(|t| t.id.clone())
-            .collect();
-
-        if to_archive.is_empty() {
+        let count = db::archive_done_tasks(&conn)?;
+        if count == 0 {
             eprintln!("No tasks to archive.");
-            return Ok(());
+        } else {
+            eprintln!("Archived {} task(s)", count);
         }
-
-        let count = to_archive.len();
-        for id in &to_archive {
-            db::archive_task(&conn, id)?;
-        }
-        eprintln!("Archived {} task(s)", count);
     } else {
         anyhow::bail!("Provide a task ID or use --done to archive all completed tasks");
     }
@@ -960,28 +936,15 @@ async fn cmd_nits_list(all: bool) -> Result<()> {
     check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
-    // Load all nits for accurate counts; filter display based on `all`.
-    let nits = db::list_nits(&conn, true)?;
 
-    let open = nits
-        .iter()
-        .filter(|n| n.status == nit::NitStatus::Open)
-        .count();
-    let dismissed = nits
-        .iter()
-        .filter(|n| n.status == nit::NitStatus::Dismissed)
-        .count();
-    let promoted = nits
-        .iter()
-        .filter(|n| n.status == nit::NitStatus::Promoted)
-        .count();
+    let counts = db::nit_status_counts(&conn)?;
+    println!(
+        "Nits: {} open, {} dismissed, {} promoted",
+        counts.open, counts.dismissed, counts.promoted
+    );
 
-    println!("Nits: {open} open, {dismissed} dismissed, {promoted} promoted");
-
+    let nits = db::list_nits(&conn, all)?;
     for n in &nits {
-        if !all && n.status != nit::NitStatus::Open {
-            continue;
-        }
         let content_preview = if !n.summary.is_empty() {
             n.summary.clone()
         } else {
@@ -1010,10 +973,7 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
-    let nits = db::list_nits(&conn, true)?;
-    let nit_entry = nits
-        .iter()
-        .find(|n| n.id == nit_id)
+    let nit_entry = db::get_nit(&conn, nit_id)?
         .ok_or_else(|| anyhow::anyhow!("nit '{nit_id}' not found"))?;
 
     if nit_entry.status != nit::NitStatus::Open {
@@ -1025,8 +985,7 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
         anyhow::bail!("nit '{nit_id}' is already {status_name}");
     }
 
-    let active_tasks = db::list_active_tasks(&conn)?;
-    let max_priority = active_tasks.iter().map(|t| t.priority).max().unwrap_or(0);
+    let max_priority = db::max_priority(&conn)?.unwrap_or(0);
     let task_id = nit_id.replace('-', "");
 
     if db::get_task(&conn, &task_id)?.is_some() {
@@ -1065,10 +1024,7 @@ async fn cmd_nits_dismiss(nit_id: &str) -> Result<()> {
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
-    let nits = db::list_nits(&conn, true)?;
-    let nit_entry = nits
-        .iter()
-        .find(|n| n.id == nit_id)
+    let nit_entry = db::get_nit(&conn, nit_id)?
         .ok_or_else(|| anyhow::anyhow!("nit '{nit_id}' not found"))?;
 
     if nit_entry.status != nit::NitStatus::Open {

@@ -427,44 +427,6 @@ struct ClaudeJsonOutput {
     total_cost_usd: Option<f64>,
 }
 
-/// Classification of failure types for smarter retry decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureKind {
-    /// Agent exceeded wall-clock or idle timeout.
-    Timeout,
-    /// Compilation or build error in the output.
-    BuildError,
-    /// Tests failed.
-    TestFailure,
-    /// Reviewer rejected the implementation.
-    ReviewRejection,
-    /// Unclassified failure.
-    Unknown,
-}
-
-/// Classify a failure reason into a FailureKind for retry decisions.
-pub fn classify_failure(reason: &str) -> FailureKind {
-    let lower = reason.to_lowercase();
-    if lower.contains("timed out") || lower.contains("idle for") || lower.contains("stuck on") {
-        FailureKind::Timeout
-    } else if lower.contains("compile error")
-        || lower.contains("build failed")
-        || lower.contains("error[e")
-        || lower.contains("cannot find")
-    {
-        FailureKind::BuildError
-    } else if lower.contains("test failed")
-        || lower.contains("tests failed")
-        || lower.contains("assertion failed")
-        || lower.contains("test failure")
-    {
-        FailureKind::TestFailure
-    } else if lower.contains("review") || lower.contains("issues found") {
-        FailureKind::ReviewRejection
-    } else {
-        FailureKind::Unknown
-    }
-}
 
 /// Sample total CPU% for all processes in a process group via `ps`.
 /// Returns 0.0 if the process group no longer exists or ps fails.
@@ -1434,61 +1396,6 @@ Done!"#
         }
     }
 
-    #[test]
-    fn classify_timeout() {
-        assert_eq!(
-            classify_failure("agent timed out after 1800s"),
-            FailureKind::Timeout
-        );
-        assert_eq!(
-            classify_failure("agent idle for 180s (possible deadlock)"),
-            FailureKind::Timeout
-        );
-        assert_eq!(
-            classify_failure("agent stuck on file lock for 60s"),
-            FailureKind::Timeout
-        );
-    }
-
-    #[test]
-    fn classify_build_error() {
-        assert_eq!(
-            classify_failure("compile error in src/main.rs"),
-            FailureKind::BuildError
-        );
-        assert_eq!(
-            classify_failure("error[E0308]: mismatched types"),
-            FailureKind::BuildError
-        );
-    }
-
-    #[test]
-    fn classify_test_failure() {
-        assert_eq!(
-            classify_failure("tests failed: 2 passed, 1 failed"),
-            FailureKind::TestFailure
-        );
-        assert_eq!(
-            classify_failure("assertion failed: expected 3, got 4"),
-            FailureKind::TestFailure
-        );
-    }
-
-    #[test]
-    fn classify_review_rejection() {
-        assert_eq!(
-            classify_failure("review: issues found in implementation"),
-            FailureKind::ReviewRejection
-        );
-    }
-
-    #[test]
-    fn classify_unknown() {
-        assert_eq!(
-            classify_failure("something unexpected happened"),
-            FailureKind::Unknown
-        );
-    }
 
     #[test]
     fn parse_new_tasks_basic() {
