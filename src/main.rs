@@ -1001,8 +1001,7 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
         anyhow::bail!("nit '{nit_id}' is already {status_name}");
     }
 
-    let active_tasks = db::list_active_tasks(&conn)?;
-    let max_priority = active_tasks.iter().map(|t| t.priority).max().unwrap_or(0);
+    let max_priority = db::max_priority(&conn)?.unwrap_or(0);
     let task_id = nit_id.replace('-', "");
 
     if db::get_task(&conn, &task_id)?.is_some() {
