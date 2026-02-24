@@ -347,24 +347,12 @@ async fn cmd_reset(task_id: Option<String>, failed: bool) -> Result<()> {
             }
             std::fs::create_dir_all(".ralph")?;
             let conn = db::open(&db_path)?;
-            let tasks = db::list_active_tasks(&conn)?;
-            let failed_ids: Vec<String> = tasks
-                .iter()
-                .filter(|t| matches!(t.phase, task::Phase::Failed))
-                .map(|t| t.id.clone())
-                .collect();
-            if failed_ids.is_empty() {
+            let count = db::reset_all_failed(&conn)?;
+            if count == 0 {
                 eprintln!("No failed tasks to reset.");
-                return Ok(());
+            } else {
+                eprintln!("Reset {count} failed task(s).");
             }
-            let now = task::unix_now();
-            for id in &failed_ids {
-                db::update_phase(&conn, id, task::Phase::Pending, now)?;
-                db::update_attempts(&conn, id, 0)?;
-                db::update_last_error(&conn, id, None)?;
-                db::clear_feedback(&conn, id)?;
-            }
-            eprintln!("Reset {} task(s): {}", failed_ids.len(), failed_ids.join(", "));
             Ok(())
         }
         (Some(_), true) => anyhow::bail!("Provide either a task ID or --failed, not both"),
