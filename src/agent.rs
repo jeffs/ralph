@@ -471,31 +471,26 @@ struct GeminiPart {
     text: Option<String>,
 }
 
-/// JSONL event from `opencode run` output stream.
+/// JSONL event from `opencode run --format json` output stream.
 #[derive(Deserialize)]
 struct OpenCodeEvent {
     #[serde(rename = "type")]
     event_type: String,
+    #[serde(default)]
     part: Option<OpenCodePart>,
-    #[serde(rename = "totalCost")]
-    total_cost: Option<f64>,
 }
 
-/// Text part within an OpenCode output event.
+/// Part payload within an OpenCode event.
+/// For `"text"` events, `text` holds the assistant's response.
+/// For `"step_finish"` events, `cost` holds the invocation cost.
 #[derive(Deserialize)]
 struct OpenCodePart {
+    #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    cost: Option<f64>,
 }
 
-/// Translate a Ralph model string to the `provider/model` format used by OpenCode.
-fn opencode_model(model: &str) -> String {
-    match model {
-        "deepseek-chat" => "deepseek/deepseek-chat".to_string(),
-        "deepseek-reasoner" => "deepseek/deepseek-reasoner".to_string(),
-        _ if model.starts_with("deepseek-") => format!("deepseek/{model}"),
-        _ => model.to_string(),
-    }
-}
 
 /// Which backend CLI to invoke for a given model string.
 #[derive(Debug, PartialEq)]
@@ -554,8 +549,9 @@ impl AgentBackend {
             AgentBackend::OpenCode => {
                 cmd.arg("run")
                     .arg("-m")
-                    .arg(opencode_model(model))
-                    .arg("-p")
+                    .arg(model)
+                    .arg("--format")
+                    .arg("json")
                     .arg(prompt);
             }
         }
@@ -622,15 +618,21 @@ impl AgentBackend {
                     if let Ok(event) = serde_json::from_str::<OpenCodeEvent>(line) {
                         found_json = true;
                         match event.event_type.as_str() {
-                            "PartText" => {
+                            "text" => {
                                 if let Some(part) = event.part {
                                     if let Some(t) = part.text {
                                         text.push_str(&t);
                                     }
                                 }
                             }
-                            "FinishMessage" => {
-                                cost = event.total_cost;
+                            "step_finish" => {
+                                if let Some(part) = &event.part {
+                                    if cost.is_none() {
+                                        cost = part.cost;
+                                    } else if let Some(c) = part.cost {
+                                        cost = Some(cost.unwrap() + c);
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -648,11 +650,13 @@ impl AgentBackend {
 
 /// Select the appropriate [`AgentBackend`] for the given model string.
 ///
-/// Uses two-tier matching:
-/// 1. Exact aliases: `opus`/`sonnet`/`haiku` → Claude; `o3`/`o3-pro`/`o3-mini`/`o4-mini` → Codex;
-///    `deepseek-chat`/`deepseek-reasoner` → OpenCode.
+/// Matching rules:
+/// 1. Exact aliases: `opus`/`sonnet`/`haiku` → Claude; `o3`/`o3-pro`/`o3-mini`/`o4-mini` → Codex.
 /// 2. Vendor-prefix patterns: `claude-*` → Claude; `gpt-*`/`codex-*` → Codex;
-///    `gemini-*` → Gemini; `deepseek-*` → OpenCode.
+///    `gemini-*` → Gemini.
+/// 3. Any model containing `/` → OpenCode (pass-through to `opencode run -m`).
+///    This covers all OpenCode provider/model pairs (e.g. `deepseek/deepseek-reasoner`,
+///    `opencode/kimi-k2`, `groq/llama-4`).
 ///
 /// Returns an error for unrecognized model strings.
 pub fn backend_for_model(model: &str) -> Result<AgentBackend> {
@@ -660,7 +664,6 @@ pub fn backend_for_model(model: &str) -> Result<AgentBackend> {
     match model {
         "opus" | "sonnet" | "haiku" => return Ok(AgentBackend::Claude),
         "o3" | "o3-pro" | "o3-mini" | "o4-mini" => return Ok(AgentBackend::Codex),
-        "deepseek-chat" | "deepseek-reasoner" => return Ok(AgentBackend::OpenCode),
         _ => {}
     }
     // Tier 2: vendor-prefix patterns.
@@ -673,13 +676,15 @@ pub fn backend_for_model(model: &str) -> Result<AgentBackend> {
     if model.starts_with("gemini-") {
         return Ok(AgentBackend::Gemini);
     }
-    if model.starts_with("deepseek-") {
+    // Tier 3: anything with a `/` is an OpenCode provider/model pair.
+    if model.contains('/') {
         return Ok(AgentBackend::OpenCode);
     }
     anyhow::bail!(
         "unrecognized model {model:?}; recognized aliases: opus, sonnet, haiku, \
-         o3, o3-pro, o3-mini, o4-mini, deepseek-chat, deepseek-reasoner; \
-         recognized prefixes: claude-*, gpt-*, codex-*, gemini-*, deepseek-*"
+         o3, o3-pro, o3-mini, o4-mini; \
+         recognized prefixes: claude-*, gpt-*, codex-*, gemini-*; \
+         or use provider/model for OpenCode (e.g. deepseek/deepseek-reasoner)"
     )
 }
 
@@ -1849,13 +1854,17 @@ STATUS: FAILURE: issues found"#;
     }
 
     #[test]
-    fn backend_for_model_exact_aliases_opencode() {
+    fn backend_for_model_opencode_slash() {
         assert_eq!(
-            backend_for_model("deepseek-chat").unwrap(),
+            backend_for_model("opencode/kimi-k2").unwrap(),
             AgentBackend::OpenCode
         );
         assert_eq!(
-            backend_for_model("deepseek-reasoner").unwrap(),
+            backend_for_model("deepseek/deepseek-reasoner").unwrap(),
+            AgentBackend::OpenCode
+        );
+        assert_eq!(
+            backend_for_model("groq/llama-4").unwrap(),
             AgentBackend::OpenCode
         );
     }
@@ -1944,15 +1953,14 @@ STATUS: FAILURE: issues found"#;
 
     #[test]
     fn opencode_parse_output_structured_jsonl() {
-        // SessionStarted is ignored; PartText events contribute their text.
         let jsonl = concat!(
-            "{\"type\":\"SessionStarted\"}\n",
-            "{\"type\":\"PartText\",\"part\":{\"text\":\"Hello from OpenCode\"}}\n",
-            "{\"type\":\"StepFinish\"}\n",
+            "{\"type\":\"step_start\",\"part\":{}}\n",
+            "{\"type\":\"text\",\"part\":{\"text\":\"Hello from OpenCode\"}}\n",
+            "{\"type\":\"step_finish\",\"part\":{\"cost\":0.0027}}\n",
         );
         let (text, cost) = AgentBackend::OpenCode.parse_output(jsonl.as_bytes());
         assert_eq!(text, "Hello from OpenCode");
-        assert_eq!(cost, None);
+        assert!((cost.unwrap() - 0.0027).abs() < 1e-9);
     }
 
     #[test]
