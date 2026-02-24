@@ -936,28 +936,15 @@ async fn cmd_nits_list(all: bool) -> Result<()> {
     check_legacy_files()?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
-    // Load all nits for accurate counts; filter display based on `all`.
-    let nits = db::list_nits(&conn, true)?;
 
-    let open = nits
-        .iter()
-        .filter(|n| n.status == nit::NitStatus::Open)
-        .count();
-    let dismissed = nits
-        .iter()
-        .filter(|n| n.status == nit::NitStatus::Dismissed)
-        .count();
-    let promoted = nits
-        .iter()
-        .filter(|n| n.status == nit::NitStatus::Promoted)
-        .count();
+    let counts = db::nit_status_counts(&conn)?;
+    println!(
+        "Nits: {} open, {} dismissed, {} promoted",
+        counts.open, counts.dismissed, counts.promoted
+    );
 
-    println!("Nits: {open} open, {dismissed} dismissed, {promoted} promoted");
-
+    let nits = db::list_nits(&conn, all)?;
     for n in &nits {
-        if !all && n.status != nit::NitStatus::Open {
-            continue;
-        }
         let content_preview = if !n.summary.is_empty() {
             n.summary.clone()
         } else {
