@@ -973,10 +973,7 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
-    let nits = db::list_nits(&conn, true)?;
-    let nit_entry = nits
-        .iter()
-        .find(|n| n.id == nit_id)
+    let nit_entry = db::get_nit(&conn, nit_id)?
         .ok_or_else(|| anyhow::anyhow!("nit '{nit_id}' not found"))?;
 
     if nit_entry.status != nit::NitStatus::Open {
@@ -1027,10 +1024,7 @@ async fn cmd_nits_dismiss(nit_id: &str) -> Result<()> {
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
 
-    let nits = db::list_nits(&conn, true)?;
-    let nit_entry = nits
-        .iter()
-        .find(|n| n.id == nit_id)
+    let nit_entry = db::get_nit(&conn, nit_id)?
         .ok_or_else(|| anyhow::anyhow!("nit '{nit_id}' not found"))?;
 
     if nit_entry.status != nit::NitStatus::Open {
