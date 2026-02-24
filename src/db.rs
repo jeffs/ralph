@@ -1068,6 +1068,26 @@ mod tests {
         assert_eq!(count, 3); // Pending, Implementing, Failed
     }
 
+    #[test]
+    fn count_archived_counts_only_archived_tasks() {
+        let conn = open_memory().unwrap();
+
+        let mut t1 = make_task("T1");
+        t1.archived = false;
+        insert_task(&conn, &t1).unwrap();
+
+        let mut t2 = make_task("T2");
+        t2.archived = true;
+        insert_task(&conn, &t2).unwrap();
+
+        let mut t3 = make_task("T3");
+        t3.archived = true;
+        insert_task(&conn, &t3).unwrap();
+
+        let count = count_archived(&conn).unwrap();
+        assert_eq!(count, 2);
+    }
+
     // ── max_priority ────────────────────────────────────────
 
     #[test]
