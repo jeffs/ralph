@@ -243,13 +243,9 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
 
         registry.audit_and_kill_orphans().await;
 
-        // CLI commands (skip/fail/reset) mutate the DB directly,
-        // so a fresh load picks up any changes.
-        let tasks = db::list_active_tasks(conn)?;
-        db::validate_deps(conn)?;
-
-        // Check convergence: all done → final review
-        if tasks.iter().all(|t| t.phase.satisfies_dep()) {
+        // Fast-path convergence check: if no non-terminal tasks remain,
+        // skip the full task deserialisation and go straight to final review.
+        if db::count_non_terminal(conn)? == 0 {
             eprintln!("[ralph] all tasks done, final review...");
             let final_diff = agent::jj_diff_git().await.unwrap_or_default();
             let final_summary = agent::jj_changed_files()
@@ -367,6 +363,11 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
                 }
             }
         }
+
+        // CLI commands (skip/fail/reset) mutate the DB directly,
+        // so a fresh load picks up any changes.
+        let tasks = db::list_active_tasks(conn)?;
+        db::validate_deps(conn)?;
 
         // Resume interrupted in-flight tasks before
         // scheduling new work.
