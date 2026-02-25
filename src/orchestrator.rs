@@ -806,7 +806,7 @@ async fn run_task(
 
     let files = all_files;
     let ctx = AgentContext::test(&t.id, &t.title, &t.description, files.clone());
-    let test_result = agent::invoke_agent(AgentRole::Tester, &ctx, config, registry, 0).await;
+    let test_result = agent::invoke_agent(AgentRole::Tester, &ctx, config, registry, new_attempts).await;
 
     let test_ok = match test_result {
         Ok(r) => {

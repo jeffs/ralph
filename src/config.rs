@@ -20,7 +20,7 @@ impl Default for ModelConfig {
         Self {
             planner: "opus".to_string(),
             implementer: "sonnet".to_string(),
-            tester: "sonnet".to_string(),
+            tester: "haiku".to_string(),
             reviewer: "opus".to_string(),
             triager: "opus".to_string(),
         }
@@ -189,6 +189,12 @@ impl Config {
             }
             return self.model_for("reviewer");
         }
+        if role == "tester" && attempt > self.escalation_after {
+            if let Some(ref m) = self.escalation_model {
+                return m;
+            }
+            return "sonnet";
+        }
         self.model_for(role)
     }
 
@@ -213,7 +219,7 @@ mod tests {
 [models]
 planner = "opus"
 implementer = "sonnet"
-tester = "sonnet"
+tester = "haiku"
 reviewer = "opus"
 triager = "opus"
 "#;
@@ -223,7 +229,7 @@ triager = "opus"
         let config = Config::default();
         assert_eq!(config.model_for("planner"), "opus");
         assert_eq!(config.model_for("implementer"), "sonnet");
-        assert_eq!(config.model_for("tester"), "sonnet");
+        assert_eq!(config.model_for("tester"), "haiku");
         assert_eq!(config.model_for("reviewer"), "opus");
         assert_eq!(config.model_for("triager"), "opus");
     }
@@ -400,10 +406,26 @@ BAZ = "qux"
     }
 
     #[test]
-    fn model_for_attempt_ignores_non_implementer() {
+    fn model_for_attempt_escalates_tester_to_sonnet() {
         let config = Config::default();
-        // Non-implementer roles are not affected by escalation.
-        assert_eq!(config.model_for_attempt("tester", 5), "sonnet");
+        assert_eq!(config.model_for_attempt("tester", 1), "haiku");
+        assert_eq!(config.model_for_attempt("tester", 2), "haiku");
+        // Attempt 3 exceeds threshold → escalates to sonnet.
+        assert_eq!(config.model_for_attempt("tester", 3), "sonnet");
+    }
+
+    #[test]
+    fn model_for_attempt_tester_uses_explicit_escalation_model() {
+        let toml_str = format!("escalation_model = \"opus\"\n{MODELS_TOML}");
+        let config: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.model_for_attempt("tester", 2), "haiku");
+        assert_eq!(config.model_for_attempt("tester", 3), "opus");
+    }
+
+    #[test]
+    fn model_for_attempt_ignores_non_implementer_non_tester() {
+        let config = Config::default();
+        // Reviewer is not affected by escalation.
         assert_eq!(config.model_for_attempt("reviewer", 5), "opus");
     }
 }
