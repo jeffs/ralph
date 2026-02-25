@@ -36,7 +36,7 @@ Ralph commits progress to Jujutsu (`jj`) after each task.
               ┌────────────┼────────────┐
               ▼            ▼            ▼
          Implementer    Tester      Reviewer
-         (claude -p)  (claude -p)  (claude -p)
+           (agent)     (agent)      (agent)
               │            │            │
               └────────────┼────────────┘
                            │
@@ -47,12 +47,13 @@ Ralph commits progress to Jujutsu (`jj`) after each task.
 
 | Module          | Purpose                                                |
 |-----------------|--------------------------------------------------------|
-| `main.rs`       | CLI: `init`, `plan`, `run`, `status`, `skip/fail/reset`, `archive/restore`, `dump`, `import`|
+| `main.rs`       | CLI: `init`, `plan`, `run`, `status`, `skip/fail/reset`, `hint/unhint`, `archive/restore`, `nits`, `dump`, `import`|
 | `task.rs`       | Task model, JSONL parsing, validation                  |
+| `nit.rs`        | Nit model, capture, triage, and persistence            |
 | `db.rs`         | SQLite persistence layer (WAL mode); unified task definition + execution state|
 | `config.rs`     | TOML configuration loading and defaults                |
-| `agent.rs`      | Agent invocation, process management, status parsing   |
-| `scheduler.rs`  | Dependency resolution, parallel partitioning           |
+| `agent.rs`      | Agent invocation, multi-backend dispatch, status parsing|
+| `scheduler.rs`  | Dependency resolution, task scheduling                 |
 | `orchestrator.rs`| Main loop, checkpointing                              |
 
 ## Task format
@@ -75,6 +76,8 @@ execution state in a single unified record:
 | `files_changed`| string[] | Paths modified by the implementer |
 | `feedback`  | string   | Output from failed test/review runs  |
 | `last_error`| string   | Most recent failure reason           |
+| `guidance`  | string[] | Accumulated guidance from `ralph hint`|
+| `postmortem`| string   | Post-task notes or root cause analysis|
 | `started_at`, `completed_at`, `phase_entered_at` | timestamp | Lifecycle timestamps |
 
 All `blocked_by` references must point to a task `id` in the same
@@ -100,10 +103,14 @@ Each task tracks:
   to the implementer on retry (truncated to 16 KB)
 - **timestamps**: `started_at`, `completed_at`, `phase_entered_at`
 - **last_error**: most recent failure reason
+- **guidance**: accumulated entries from `ralph hint`, forwarded to the implementer
+- **postmortem**: post-task notes or root cause analysis
 
 ## Agent roles
 
-Ralph spawns agents by invoking `claude -p <prompt> --output-format json`.
+Ralph selects a backend based on the model string configured for each role:
+Claude Code (`opus`/`sonnet`/`haiku`/`claude-*`), Codex (`o3`/`o4-mini`/`gpt-*`/`codex-*`),
+Gemini CLI (`gemini-*`), or OpenCode (any `provider/model` pair containing `/`).
 Each role has a prompt template in `prompts/` with `{{PLACEHOLDER}}`
 variables that Ralph fills in.
 
@@ -207,7 +214,7 @@ Ralph uses **Jujutsu (`jj`)** exclusively — never Git commands.
 [models]
 planner = "opus"
 implementer = "sonnet"
-tester = "sonnet"
+tester = "haiku"
 reviewer = "opus"
 triager = "opus"
 
@@ -224,12 +231,19 @@ kill_grace_secs = 5
 # Budget limit (stop if exceeded)
 max_cost_usd = 10.0
 
+# Escalate to a stronger model after N failed attempts (default: 2)
+escalation_after = 2
+escalation_model = "opus"
+
 # Automatically triage open nits after final review
 auto_triage = true
 max_triage_rounds = 3
 
 # Directory containing prompt templates
 prompts_dir = "prompts"
+
+# Stderr patterns that indicate the agent is stuck
+stuck_patterns = ["Blocking waiting for file lock", "waiting for lock"]
 
 # Environment variables forwarded to agents
 [env]
@@ -265,14 +279,20 @@ ralph plan <description>      # Decompose request into tasks
 ralph plan --spec <file>      # Read request from a file
 ralph plan --stdin            # Read request from stdin
 ralph run                     # Execute the orchestration loop
-ralph run --max-iterations 20 # Limit iteration count
+ralph run --max-iterations 20 # Limit iteration count (default: 50)
 ralph status                  # Show task progress
 ralph skip <task_id>          # Mark a task Done (skip it)
 ralph fail <task_id>          # Mark a task Failed
 ralph reset <task_id>         # Reset a task to Pending
+ralph hint <task_id> <text>   # Add guidance for implementer
+ralph unhint <task_id>        # Clear all guidance for a task
 ralph archive <task_id>       # Mark a terminal task as archived
 ralph archive --done          # Archive all Done + Skipped tasks
 ralph restore <task_id>       # Restore an archived task to active
+ralph nits                    # Show open nits
+ralph nits promote <nit_id>   # Create a task from a nit
+ralph nits dismiss <nit_id>   # Mark nit as dismissed
+ralph nits triage             # Run triager agent on open nits
 ralph dump                    # Print all tasks as Markdown (human-readable)
 ralph dump --json             # Print tasks + state as JSON
 ralph import <dir>            # Migrate legacy flat files to ralph.db
@@ -325,10 +345,10 @@ re-discover the problem from scratch. Feedback is truncated to 16 KB.
 
 ## Cost tracking
 
-The `claude` CLI reports `total_cost_usd` in its JSON output. Ralph
-accumulates this across all agent invocations and logs it each iteration.
-If `max_cost_usd` is configured, Ralph stops execution when the budget
-is exceeded.
+Agent backends report cost in their output (e.g. `total_cost_usd` in
+Claude's JSON). Ralph accumulates this across all agent invocations and
+logs it each iteration. If `max_cost_usd` is configured, Ralph stops
+execution when the budget is exceeded.
 
 ## Project integration
 
