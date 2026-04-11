@@ -111,6 +111,7 @@ mod tests {
             completed_at: None,
             postmortem: None,
             archived: false,
+            manual: false,
         }
     }
 
@@ -164,6 +165,35 @@ mod tests {
         let ready = ready_tasks(&tasks, &default_config());
         let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["A", "C", "B"]);
+    }
+
+    #[test]
+    fn ready_includes_manual_task() {
+        // A manual task is still "ready" — the orchestrator
+        // partitions it out instead of spawning. Returning it
+        // here is what causes downstream deps to remain blocked.
+        let tasks = vec![
+            Task { manual: true, ..task("A", 1, vec![]) },
+            task("B", 2, vec!["A"]),
+        ];
+        let ready = ready_tasks(&tasks, &default_config());
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "A");
+        assert!(ready[0].manual);
+    }
+
+    #[test]
+    fn manual_task_blocks_downstream() {
+        // Pending manual task A → downstream B should remain
+        // blocked. B only becomes ready once A is Done.
+        let tasks = vec![
+            Task { manual: true, ..task("A", 1, vec![]) },
+            task("B", 2, vec!["A"]),
+        ];
+        let ready = ready_tasks(&tasks, &default_config());
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["A"]);
+        assert!(!ids.contains(&"B"));
     }
 
     #[test]

@@ -36,6 +36,10 @@ enum Command {
         /// Max iterations before stopping
         #[arg(long, default_value_t = 50)]
         max_iterations: usize,
+        /// Abort the run as soon as a manual task is ready,
+        /// instead of skipping it and continuing with other work.
+        #[arg(long)]
+        halt_on_manual: bool,
     },
     /// Initialize .ralph/ in current directory
     Init,
@@ -111,6 +115,28 @@ enum Command {
         #[command(subcommand)]
         action: Option<NitsAction>,
     },
+    /// Mark a human-gated (`manual`) task as Done
+    MarkDone {
+        /// Task ID (e.g. "VERIFY-1")
+        task_id: String,
+        /// Notes attached to the completed task (recorded
+        /// as a postmortem).
+        #[arg(long)]
+        notes: Option<String>,
+        /// Also forward the notes as a hint to another task.
+        #[arg(long = "hint-to")]
+        hint_to: Option<String>,
+    },
+    /// Toggle one or more tasks to `manual = true`
+    MarkManual {
+        /// Task IDs
+        task_ids: Vec<String>,
+    },
+    /// Toggle one or more tasks to `manual = false`
+    MarkAutomatic {
+        /// Task IDs
+        task_ids: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -139,7 +165,10 @@ async fn main() -> Result<()> {
             spec,
             stdin,
         } => cmd_plan(description, spec, stdin).await,
-        Command::Run { max_iterations } => cmd_run(max_iterations).await,
+        Command::Run {
+            max_iterations,
+            halt_on_manual,
+        } => cmd_run(max_iterations, halt_on_manual).await,
         Command::Status { json } => cmd_status(json).await,
         Command::Skip { task_id } => cmd_override_task(&task_id, "skip").await,
         Command::Fail { task_id } => cmd_override_task(&task_id, "fail").await,
@@ -156,6 +185,13 @@ async fn main() -> Result<()> {
             Some(NitsAction::Dismiss { nit_id }) => cmd_nits_dismiss(&nit_id).await,
             Some(NitsAction::Triage) => cmd_nits_triage().await,
         },
+        Command::MarkDone {
+            task_id,
+            notes,
+            hint_to,
+        } => cmd_mark_done(&task_id, notes.as_deref(), hint_to.as_deref()).await,
+        Command::MarkManual { task_ids } => cmd_mark_manual(&task_ids, true).await,
+        Command::MarkAutomatic { task_ids } => cmd_mark_manual(&task_ids, false).await,
     }
 }
 
@@ -290,12 +326,96 @@ async fn cmd_plan(description: Option<String>, spec: Option<PathBuf>, stdin: boo
     Ok(())
 }
 
-async fn cmd_run(max_iterations: usize) -> Result<()> {
+async fn cmd_run(max_iterations: usize, halt_on_manual: bool) -> Result<()> {
     check_legacy_files()?;
     let config = config::Config::load().await?;
     std::fs::create_dir_all(".ralph")?;
     let conn = db::open(&db::db_path())?;
-    orchestrator::run_loop(&conn, max_iterations, &config).await
+    orchestrator::run_loop(&conn, max_iterations, &config, halt_on_manual).await
+}
+
+/// Mark a manual task as Done. Errors if the task isn't flagged
+/// `manual = true` (use `ralph skip` for non-manual tasks).
+/// Optional `notes` are stored as a postmortem; `hint_to` forwards
+/// those notes as a new guidance entry on a downstream task.
+fn mark_done_with_conn(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    notes: Option<&str>,
+    hint_to: Option<&str>,
+) -> Result<()> {
+    let t = db::get_task(conn, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("Unknown task ID '{task_id}'"))?;
+
+    if !t.manual {
+        anyhow::bail!(
+            "Task '{task_id}' is not a manual task — use `ralph skip` for non-manual tasks"
+        );
+    }
+
+    let now = task::unix_now();
+    db::update_phase(conn, task_id, task::Phase::Done, now)?;
+    db::update_last_error(conn, task_id, None)?;
+
+    if let Some(text) = notes {
+        let combined = match t.postmortem {
+            Some(prev) if !prev.is_empty() => format!("{prev}\n---\n{text}"),
+            _ => text.to_string(),
+        };
+        conn.execute(
+            "UPDATE tasks SET postmortem = ?1 WHERE id = ?2",
+            rusqlite::params![combined, task_id],
+        )?;
+    }
+
+    if let Some(other_id) = hint_to {
+        let Some(other) = db::get_task(conn, other_id)? else {
+            anyhow::bail!("--hint-to target '{other_id}' not found");
+        };
+        let Some(text) = notes else {
+            anyhow::bail!("--hint-to requires --notes");
+        };
+        let mut guidance = other.guidance;
+        guidance.push(format!("from {task_id}: {text}"));
+        db::set_guidance(conn, other_id, &guidance)?;
+        eprintln!("Added hint from {task_id} to {other_id}");
+    }
+
+    eprintln!("Marked {task_id} done");
+    Ok(())
+}
+
+async fn cmd_mark_done(
+    task_id: &str,
+    notes: Option<&str>,
+    hint_to: Option<&str>,
+) -> Result<()> {
+    check_legacy_files()?;
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
+    mark_done_with_conn(&conn, task_id, notes, hint_to)
+}
+
+/// Toggle tasks to `manual = value`. Used by both `mark-manual`
+/// and `mark-automatic`.
+async fn cmd_mark_manual(task_ids: &[String], value: bool) -> Result<()> {
+    check_legacy_files()?;
+    if task_ids.is_empty() {
+        anyhow::bail!("Provide at least one task ID");
+    }
+    std::fs::create_dir_all(".ralph")?;
+    let conn = db::open(&db::db_path())?;
+
+    for id in task_ids {
+        if db::get_task(&conn, id)?.is_none() {
+            anyhow::bail!("Unknown task ID '{id}'");
+        }
+        db::update_manual(&conn, id, value)?;
+    }
+
+    let label = if value { "manual" } else { "automatic" };
+    eprintln!("Marked {} task(s) {label}: {}", task_ids.len(), task_ids.join(", "));
+    Ok(())
 }
 
 async fn cmd_override_task(task_id: &str, action: &str) -> Result<()> {
@@ -411,7 +531,8 @@ async fn cmd_status(json: bool) -> Result<()> {
             })
             .unwrap_or_default();
         let info = format!("{:?} attempts={}{duration}{error}", t.phase, t.attempts);
-        println!("  [{}] {} — {}", t.id, t.title, info);
+        let manual_tag = if t.manual { "[M] " } else { "" };
+        println!("  {manual_tag}[{}] {} — {}", t.id, t.title, info);
     }
     println!(
         "Summary: {} done, {} skipped, {} failed, {} in-progress, {} pending",
@@ -609,9 +730,10 @@ fn fmt_rfc3339_utc(ts: u64) -> String {
 fn format_task_md(out: &mut String, t: &task::Task) {
     let phase_name = format!("{:?}", t.phase);
     let attempt_word = if t.attempts == 1 { "attempt" } else { "attempts" };
+    let manual_tag = if t.manual { "[M] " } else { "" };
     out.push_str(&format!(
-        "\n### [{}] {} ({}, {} {})\n",
-        t.id, t.title, phase_name, t.attempts, attempt_word
+        "\n### {}[{}] {} ({}, {} {})\n",
+        manual_tag, t.id, t.title, phase_name, t.attempts, attempt_word
     ));
 
     let mut meta = format!("Priority: {}", t.priority);
@@ -732,6 +854,8 @@ fn cmd_dump_json(
         completed_at: Option<u64>,
         postmortem: Option<&'a str>,
         archived: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        manual: bool,
     }
 
     #[derive(serde::Serialize)]
@@ -760,6 +884,7 @@ fn cmd_dump_json(
                 completed_at: t.completed_at,
                 postmortem: t.postmortem.as_deref(),
                 archived: t.archived,
+                manual: t.manual,
             })
             .collect(),
         nits,
@@ -1008,6 +1133,7 @@ async fn cmd_nits_promote(nit_id: &str) -> Result<()> {
         description: nit_entry.content.clone(),
         priority: max_priority + 1,
         blocked_by: vec![],
+            manual: false,
     };
     let new_task = task::Task::from_def(&def);
     db::insert_tasks(&conn, &[new_task])?;
@@ -1057,4 +1183,113 @@ async fn cmd_nits_triage() -> Result<()> {
         eprintln!("No nits promoted.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_task(id: &str, manual: bool) -> task::Task {
+        task::Task {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            description: String::new(),
+            priority: 1,
+            blocked_by: Vec::new(),
+            phase: task::Phase::Pending,
+            attempts: 0,
+            last_error: None,
+            files_changed: Vec::new(),
+            feedback: Vec::new(),
+            guidance: Vec::new(),
+            phase_entered_at: None,
+            started_at: None,
+            completed_at: None,
+            postmortem: None,
+            archived: false,
+            manual,
+        }
+    }
+
+    #[test]
+    fn mark_done_happy_path_sets_done_and_records_notes() {
+        let conn = db::open_memory().unwrap();
+        let t = make_task("M-1", true);
+        db::upsert_task_no_tx(&conn, &t).unwrap();
+
+        mark_done_with_conn(&conn, "M-1", Some("provisioned via vault"), None).unwrap();
+
+        let after = db::get_task(&conn, "M-1").unwrap().unwrap();
+        assert_eq!(after.phase, task::Phase::Done);
+        assert_eq!(after.postmortem.as_deref(), Some("provisioned via vault"));
+    }
+
+    #[test]
+    fn mark_done_appends_notes_to_existing_postmortem() {
+        let conn = db::open_memory().unwrap();
+        let mut t = make_task("M-2", true);
+        t.postmortem = Some("earlier note".to_string());
+        db::upsert_task_no_tx(&conn, &t).unwrap();
+
+        mark_done_with_conn(&conn, "M-2", Some("second note"), None).unwrap();
+
+        let after = db::get_task(&conn, "M-2").unwrap().unwrap();
+        assert_eq!(
+            after.postmortem.as_deref(),
+            Some("earlier note\n---\nsecond note")
+        );
+    }
+
+    #[test]
+    fn mark_done_errors_on_non_manual_task() {
+        let conn = db::open_memory().unwrap();
+        let t = make_task("A-1", false);
+        db::upsert_task_no_tx(&conn, &t).unwrap();
+
+        let err = mark_done_with_conn(&conn, "A-1", None, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a manual task"),
+            "unexpected error: {msg}"
+        );
+
+        // Phase must be unchanged.
+        let after = db::get_task(&conn, "A-1").unwrap().unwrap();
+        assert_eq!(after.phase, task::Phase::Pending);
+    }
+
+    #[test]
+    fn mark_done_errors_on_unknown_task() {
+        let conn = db::open_memory().unwrap();
+        let err = mark_done_with_conn(&conn, "ghost", None, None).unwrap_err();
+        assert!(format!("{err}").contains("Unknown task ID"));
+    }
+
+    #[test]
+    fn mark_done_hint_to_forwards_notes_as_guidance() {
+        let conn = db::open_memory().unwrap();
+        let m = make_task("M-3", true);
+        let downstream = make_task("D-1", false);
+        db::upsert_task_no_tx(&conn, &m).unwrap();
+        db::upsert_task_no_tx(&conn, &downstream).unwrap();
+
+        mark_done_with_conn(&conn, "M-3", Some("use the new endpoint"), Some("D-1")).unwrap();
+
+        let after = db::get_task(&conn, "D-1").unwrap().unwrap();
+        assert_eq!(after.guidance.len(), 1);
+        assert!(after.guidance[0].contains("from M-3"));
+        assert!(after.guidance[0].contains("use the new endpoint"));
+    }
+
+    #[test]
+    fn mark_done_hint_to_requires_notes() {
+        let conn = db::open_memory().unwrap();
+        let m = make_task("M-4", true);
+        let downstream = make_task("D-2", false);
+        db::upsert_task_no_tx(&conn, &m).unwrap();
+        db::upsert_task_no_tx(&conn, &downstream).unwrap();
+
+        let err = mark_done_with_conn(&conn, "M-4", None, Some("D-2")).unwrap_err();
+        assert!(format!("{err}").contains("--hint-to requires --notes"));
+    }
 }

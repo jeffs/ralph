@@ -31,6 +31,25 @@ pub fn open_memory() -> Result<Connection> {
 fn init_conn(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
     create_schema(conn)?;
+    migrate(conn)?;
+    Ok(())
+}
+
+/// Apply incremental schema migrations for existing databases.
+/// Idempotent: each step checks the current schema before running.
+fn migrate(conn: &Connection) -> Result<()> {
+    // Manual tasks (human-gated): add `manual` column if missing.
+    let has_manual: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'manual'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_manual == 0 {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN manual INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -52,7 +71,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
             started_at       INTEGER,
             completed_at     INTEGER,
             postmortem       TEXT,
-            archived         INTEGER NOT NULL DEFAULT 0
+            archived         INTEGER NOT NULL DEFAULT 0,
+            manual           INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS task_deps (
@@ -145,6 +165,7 @@ struct PartialTask {
     completed_at: Option<u64>,
     postmortem: Option<String>,
     archived: bool,
+    manual: bool,
 }
 
 fn row_to_partial(row: &rusqlite::Row) -> rusqlite::Result<PartialTask> {
@@ -164,6 +185,7 @@ fn row_to_partial(row: &rusqlite::Row) -> rusqlite::Result<PartialTask> {
         completed_at: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
         postmortem: row.get(13)?,
         archived: row.get::<_, i64>(14)? != 0,
+        manual: row.get::<_, i64>(15)? != 0,
     })
 }
 
@@ -188,6 +210,7 @@ fn partial_into_task(p: PartialTask, blocked_by: Vec<String>) -> Result<Task> {
         completed_at: p.completed_at,
         postmortem: p.postmortem,
         archived: p.archived,
+        manual: p.manual,
     })
 }
 
@@ -208,8 +231,8 @@ fn upsert_task_in(conn: &Connection, task: &Task) -> Result<()> {
     conn.execute(
         "INSERT INTO tasks (id, title, description, priority, phase, attempts,
          last_error, files_changed, feedback, guidance, phase_entered_at,
-         started_at, completed_at, postmortem, archived)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         started_at, completed_at, postmortem, archived, manual)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(id) DO UPDATE SET
            title            = excluded.title,
            description      = excluded.description,
@@ -224,7 +247,8 @@ fn upsert_task_in(conn: &Connection, task: &Task) -> Result<()> {
            started_at       = excluded.started_at,
            completed_at     = excluded.completed_at,
            postmortem       = excluded.postmortem,
-           archived         = excluded.archived",
+           archived         = excluded.archived,
+           manual           = excluded.manual",
         params![
             &task.id,
             &task.title,
@@ -240,7 +264,8 @@ fn upsert_task_in(conn: &Connection, task: &Task) -> Result<()> {
             task.started_at.map(|v| v as i64),
             task.completed_at.map(|v| v as i64),
             &task.postmortem,
-            task.archived as i32
+            task.archived as i32,
+            task.manual as i32
         ],
     )?;
 
@@ -262,7 +287,7 @@ fn list_tasks_where(conn: &Connection, filter: &str) -> Result<Vec<Task>> {
     let sql = format!(
         "SELECT id, title, description, priority, phase, attempts, last_error, \
                 files_changed, feedback, guidance, phase_entered_at, started_at, \
-                completed_at, postmortem, archived \
+                completed_at, postmortem, archived, manual \
          FROM tasks {filter} ORDER BY priority"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -320,7 +345,7 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
         .query_row(
             "SELECT id, title, description, priority, phase, attempts, last_error, \
                     files_changed, feedback, guidance, phase_entered_at, started_at, \
-                    completed_at, postmortem, archived \
+                    completed_at, postmortem, archived, manual \
              FROM tasks WHERE id = ?1",
             params![id],
             row_to_partial,
@@ -474,6 +499,15 @@ pub fn update_postmortem(conn: &Connection, id: &str, text: Option<&str>) -> Res
     conn.execute(
         "UPDATE tasks SET postmortem = ?1 WHERE id = ?2",
         params![text, id],
+    )?;
+    Ok(())
+}
+
+/// Flip a task's `manual` flag.
+pub fn update_manual(conn: &Connection, id: &str, manual: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET manual = ?1 WHERE id = ?2",
+        params![manual as i32, id],
     )?;
     Ok(())
 }
@@ -824,6 +858,7 @@ mod tests {
             completed_at: None,
             postmortem: None,
             archived: false,
+            manual: false,
         }
     }
 

@@ -216,6 +216,7 @@ fn materialize_proposed_tasks(
             description: p.description.clone(),
             priority: p.priority.unwrap_or(max_priority + 1),
             blocked_by: p.blocked_by.clone(),
+                    manual: false,
         }));
     }
 
@@ -231,10 +232,28 @@ fn materialize_proposed_tasks(
     Ok(result_ids)
 }
 
+/// Print the human-blocked halt summary for a set of manual task IDs.
+fn log_awaiting_human(ids: &[&str]) {
+    eprintln!(
+        "[ralph] {} task(s) blocked awaiting human: {}",
+        ids.len(),
+        ids.join(", ")
+    );
+    eprintln!("[ralph] run 'ralph mark-done <id>' to proceed");
+}
+
 /// Main orchestration loop. Iterates until convergence
 /// (all tasks done + reviewer approves), stagnation
 /// (max attempts exceeded), or iteration cap.
-pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config) -> Result<()> {
+///
+/// `halt_on_manual`: when true, the first ready manual task
+/// aborts the run immediately instead of being skipped.
+pub async fn run_loop(
+    conn: &Connection,
+    max_iterations: usize,
+    config: &Config,
+    halt_on_manual: bool,
+) -> Result<()> {
     let registry = ProcessRegistry::new(config.kill_grace_secs);
     spawn_signal_handler(registry.clone());
     isolate_dirty_tree().await;
@@ -408,7 +427,31 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
 
         // Find ready tasks (Pending phase only)
         let ready = scheduler::ready_tasks(&tasks, config);
-        if ready.is_empty() {
+
+        // Partition ready work: tasks marked manual are human-gated
+        // and must not have agents spawned against them.
+        let (manual_ready, auto_ready): (Vec<&Task>, Vec<&Task>) =
+            ready.into_iter().partition(|t| t.manual);
+
+        if !manual_ready.is_empty() && halt_on_manual {
+            let ids: Vec<&str> = manual_ready.iter().map(|t| t.id.as_str()).collect();
+            log_awaiting_human(&ids);
+            return Ok(());
+        }
+
+        for t in &manual_ready {
+            eprintln!(
+                "[ralph] {} requires human; use 'ralph mark-done {} [--notes <text>]' to proceed",
+                t.id, t.id
+            );
+        }
+
+        if auto_ready.is_empty() {
+            if !manual_ready.is_empty() {
+                let ids: Vec<&str> = manual_ready.iter().map(|t| t.id.as_str()).collect();
+                log_awaiting_human(&ids);
+                return Ok(());
+            }
             if stagnant.is_empty() {
                 eprintln!(
                     "[ralph] no ready tasks and no \
@@ -420,12 +463,12 @@ pub async fn run_loop(conn: &Connection, max_iterations: usize, config: &Config)
             break;
         }
 
-        eprintln!("[ralph] {} task(s) ready", ready.len());
+        eprintln!("[ralph] {} task(s) ready", auto_ready.len());
 
         // Run each task through its full lifecycle serially.
         // Each task completes implement → test → review before
         // the next one starts, so later tasks build on verified work.
-        for task in &ready {
+        for task in &auto_ready {
             run_task(
                 task,
                 conn,

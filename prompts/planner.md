@@ -37,6 +37,7 @@ Do NOT write any files.
 | `description`| string    | no       | What to change, where, and why           |
 | `priority`  | integer    | yes      | 1 = highest                              |
 | `blocked_by`| string[]   | no       | IDs that must complete first             |
+| `manual`    | boolean    | no       | If true, requires a human to mark done   |
 
 ### Rules
 
@@ -45,11 +46,25 @@ Do NOT write any files.
 - No duplicate `id` values.
 - `id` must not contain whitespace.
 
+### Manual tasks
+
+Set `manual: true` for work that an automated agent cannot
+complete on its own — human decisions, external coordination,
+credentials, deploys, account creation, design approvals, or
+anything requiring out-of-band action. Manual tasks block their
+downstream dependencies normally but Ralph never spawns an
+agent for them; a human runs `ralph mark-done <id>` (optionally
+with `--notes` and `--hint-to <other_id>`) to unblock the queue.
+
+Default to `false`. Only mark a task manual when an agent
+genuinely cannot do it.
+
 ### Example
 
 ```
 {"id":"T1","title":"Add foo function","description":"...","priority":1,"blocked_by":[]}
 {"id":"T2","title":"Add tests for foo","description":"...","priority":2,"blocked_by":["T1"]}
+{"id":"T3","title":"Provision API key in vault","description":"...","priority":2,"blocked_by":[],"manual":true}
 ```
 
 {{EXISTING_IDS}}

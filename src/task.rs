@@ -55,6 +55,15 @@ pub struct TaskDef {
     pub priority: u32,
     #[serde(default)]
     pub blocked_by: Vec<String>,
+    /// Human-gated task: scheduler refuses to spawn an agent.
+    /// Only emitted in JSONL output when `true`, to keep the
+    /// default compact.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manual: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Unified task: definition fields merged with execution state.
@@ -76,6 +85,9 @@ pub struct Task {
     pub completed_at: Option<u64>,
     pub postmortem: Option<String>,
     pub archived: bool,
+    /// Human-gated task: the orchestrator must not spawn any
+    /// agent. The user drives it to Done via `ralph mark-done`.
+    pub manual: bool,
 }
 
 impl Task {
@@ -97,6 +109,7 @@ impl Task {
             completed_at: None,
             postmortem: None,
             archived: false,
+            manual: def.manual,
         }
     }
 }
@@ -399,6 +412,7 @@ mod tests {
                 description: "desc".into(),
                 priority: 1,
                 blocked_by: vec![],
+                            manual: false,
             },
             TaskDef {
                 id: "B".into(),
@@ -406,6 +420,7 @@ mod tests {
                 description: String::new(),
                 priority: 2,
                 blocked_by: vec!["A".into()],
+                            manual: false,
             },
         ];
         let mut buf = String::new();
@@ -428,6 +443,7 @@ mod tests {
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec![],
+                            manual: false,
             },
             TaskDef {
                 id: "B".into(),
@@ -435,6 +451,7 @@ mod tests {
                 description: String::new(),
                 priority: 2,
                 blocked_by: vec!["A".into()],
+                            manual: false,
             },
         ];
         let empty = std::collections::HashSet::new();
@@ -476,6 +493,7 @@ mod tests {
             description: String::new(),
             priority: 1,
             blocked_by: vec![],
+                    manual: false,
         }];
         let renames = renumber_collisions(&mut tasks, &taken);
         assert!(renames.is_empty());
@@ -496,6 +514,7 @@ mod tests {
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec![],
+                            manual: false,
             },
             TaskDef {
                 id: "GEN-2".into(),
@@ -503,6 +522,7 @@ mod tests {
                 description: String::new(),
                 priority: 2,
                 blocked_by: vec!["GEN-1".into()],
+                            manual: false,
             },
         ];
         let renames = renumber_collisions(&mut tasks, &taken);
@@ -523,6 +543,7 @@ mod tests {
             description: String::new(),
             priority: 1,
             blocked_by: vec![],
+                    manual: false,
         }];
         let renames = renumber_collisions(&mut tasks, &taken);
         assert_eq!(renames.len(), 1);
@@ -537,6 +558,7 @@ mod tests {
             description: String::new(),
             priority: 1,
             blocked_by: vec!["NONEXISTENT".into()],
+                    manual: false,
         }];
         let empty = std::collections::HashSet::new();
         let err = validate_deps(&tasks, &empty).unwrap_err();
@@ -555,6 +577,7 @@ mod tests {
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec!["B".into()],
+                            manual: false,
             },
             TaskDef {
                 id: "B".into(),
@@ -562,6 +585,7 @@ mod tests {
                 description: String::new(),
                 priority: 2,
                 blocked_by: vec!["A".into()],
+                            manual: false,
             },
         ];
         let empty = std::collections::HashSet::new();
@@ -583,6 +607,7 @@ mod tests {
                 description: String::new(),
                 priority: 1,
                 blocked_by: vec!["Z".into()],
+                            manual: false,
             },
             TaskDef {
                 id: "Y".into(),
@@ -590,6 +615,7 @@ mod tests {
                 description: String::new(),
                 priority: 2,
                 blocked_by: vec!["X".into()],
+                            manual: false,
             },
             TaskDef {
                 id: "Z".into(),
@@ -597,6 +623,7 @@ mod tests {
                 description: String::new(),
                 priority: 3,
                 blocked_by: vec!["Y".into()],
+                            manual: false,
             },
         ];
         let empty = std::collections::HashSet::new();
@@ -664,6 +691,7 @@ mod tests {
             description: String::new(),
             priority: 1,
             blocked_by: vec!["ARCHIVED-1".into()],
+                    manual: false,
         }];
         let mut extra = std::collections::HashSet::new();
         extra.insert("ARCHIVED-1");
